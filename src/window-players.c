@@ -1,4 +1,5 @@
 #include "window-players.h"
+#include "player-protocol.h"
 
 #include <glib/gstdio.h>
 #include <time.h>
@@ -172,6 +173,9 @@ ensure_player_state(PumpkinWindow *self, const char *uuid, const char *name, gbo
     return NULL;
   }
 
+  if (uuid != NULL && !g_uuid_string_is_valid(uuid)) uuid = NULL;
+  if (name != NULL && !pumpkin_player_name_is_valid(name)) name = NULL;
+
   g_autofree char *uuid_key = normalized_key(uuid);
   g_autofree char *name_key = normalized_key(name);
   if (self->deleted_player_keys != NULL) {
@@ -195,10 +199,14 @@ ensure_player_state(PumpkinWindow *self, const char *uuid, const char *name, gbo
   PlayerState *state = NULL;
   if (state_by_uuid != NULL) {
     state = state_by_uuid;
-    if (state_by_name != NULL && state_by_name != state_by_uuid) {
+    if (state_by_name != NULL && state_by_name != state_by_uuid &&
+        (state_by_name->uuid == NULL || *state_by_name->uuid == '\0')) {
       merge_player_states(self, state, state_by_name);
     }
-  } else if (state_by_name != NULL) {
+  } else if (state_by_name != NULL &&
+             (uuid_key == NULL || state_by_name->uuid == NULL ||
+              *state_by_name->uuid == '\0' ||
+              g_ascii_strcasecmp(uuid_key, state_by_name->uuid) == 0)) {
     state = state_by_name;
   } else if (create) {
     const char *key = uuid_key != NULL ? uuid_key : name_key;
@@ -226,8 +234,16 @@ ensure_player_state(PumpkinWindow *self, const char *uuid, const char *name, gbo
 
   if (state != NULL && name != NULL && *name != '\0') {
     if (state->name == NULL || g_strcmp0(state->name, name) != 0) {
+      g_autofree char *previous_name = normalized_key(state->name);
+      if (previous_name != NULL &&
+          g_hash_table_lookup(self->player_states_by_name, previous_name) == state)
+        g_hash_table_remove(self->player_states_by_name, previous_name);
+      if (state->online && state->name != NULL)
+        g_hash_table_remove(self->live_player_names, state->name);
       g_free(state->name);
       state->name = g_strdup(name);
+      if (state->online)
+        g_hash_table_replace(self->live_player_names, g_strdup(name), g_strdup(name));
       player_states_set_dirty(self);
     }
     if (name_key != NULL && self->player_states_by_name != NULL) {
@@ -416,8 +432,19 @@ player_states_load(PumpkinWindow *self, PumpkinServer *server)
     state->key = g_strdup(group);
     state->name = g_key_file_get_string(key_file, group, "name", NULL);
     state->uuid = g_key_file_get_string(key_file, group, "uuid", NULL);
+    if (state->name != NULL && !pumpkin_player_name_is_valid(state->name)) {
+      if (state->uuid == NULL || !g_uuid_string_is_valid(state->uuid)) {
+        player_state_free(state);
+        continue;
+      }
+      g_clear_pointer(&state->name, g_free);
+    }
     state->last_ip = g_key_file_get_string(key_file, group, "last_ip", NULL);
     state->platform = (PlayerPlatform)g_key_file_get_integer(key_file, group, "platform", NULL);
+    /* Older versions guessed Java and assigned editions from unrelated
+     * pending connections. Treat those guesses as unverified on migration. */
+    if (!g_key_file_get_boolean(key_file, group, "edition_verified", NULL))
+      state->platform = platform_guess_from_uuid(state->uuid);
     if (state->platform < PLAYER_PLATFORM_UNKNOWN || state->platform > PLAYER_PLATFORM_BEDROCK) {
       state->platform = PLAYER_PLATFORM_UNKNOWN;
     }
@@ -471,6 +498,8 @@ player_states_save(PumpkinWindow *self, PumpkinServer *server)
       g_key_file_set_string(key_file, section, "last_ip", state->last_ip);
     }
     g_key_file_set_integer(key_file, section, "platform", (int)state->platform);
+    g_key_file_set_boolean(key_file, section, "edition_verified",
+                           state->platform != PLAYER_PLATFORM_UNKNOWN);
     g_key_file_set_int64(key_file, section, "first_joined_unix", state->first_joined_unix);
     g_key_file_set_int64(key_file, section, "last_online_unix", state->last_online_unix);
     g_key_file_set_int64(key_file, section, "playtime_seconds",
@@ -516,13 +545,12 @@ platform_from_line(const char *line)
     return PLAYER_PLATFORM_UNKNOWN;
   }
   g_autofree char *lower = g_ascii_strdown(line, -1);
-  if (strstr(lower, "bedrock") != NULL ||
-      strstr(lower, "floodgate") != NULL ||
-      strstr(lower, "geyser") != NULL ||
-      strstr(lower, "raknet") != NULL) {
+  if (strstr(lower, "::bedrock::") != NULL || strstr(lower, "::bedrock]") != NULL ||
+      strstr(lower, "::bedrock: ") != NULL) {
     return PLAYER_PLATFORM_BEDROCK;
   }
-  if (strstr(lower, "java") != NULL || strstr(lower, "java edition") != NULL) {
+  if (strstr(lower, "::java::") != NULL || strstr(lower, "::java]") != NULL ||
+      strstr(lower, "::java: ") != NULL) {
     return PLAYER_PLATFORM_JAVA;
   }
   return PLAYER_PLATFORM_UNKNOWN;
@@ -597,6 +625,8 @@ remember_platform_hint_for_ip(PumpkinWindow *self, const char *ip, PlayerPlatfor
   if (ip_key == NULL || *ip_key == '\0') {
     return;
   }
+  if (g_hash_table_size(self->platform_hint_by_ip) >= 4096)
+    g_hash_table_remove_all(self->platform_hint_by_ip);
   g_hash_table_replace(self->platform_hint_by_ip, g_strdup(ip_key), GINT_TO_POINTER((int)platform));
 }
 
@@ -616,21 +646,4 @@ platform_hint_for_ip(PumpkinWindow *self, const char *ip)
     return PLAYER_PLATFORM_UNKNOWN;
   }
   return (PlayerPlatform)value;
-}
-
-PlayerPlatform
-take_pending_platform_hint(PumpkinWindow *self)
-{
-  if (self == NULL) {
-    return PLAYER_PLATFORM_UNKNOWN;
-  }
-  if (self->pending_bedrock_platform_hints > 0) {
-    self->pending_bedrock_platform_hints--;
-    return PLAYER_PLATFORM_BEDROCK;
-  }
-  if (self->pending_java_platform_hints > 0) {
-    self->pending_java_platform_hints--;
-    return PLAYER_PLATFORM_JAVA;
-  }
-  return PLAYER_PLATFORM_UNKNOWN;
 }

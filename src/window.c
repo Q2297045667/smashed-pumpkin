@@ -2,13 +2,30 @@
 #include "app.h"
 
 #include "download.h"
+#include "refresh-button.h"
+#include "server-maintenance.h"
+#include "window-worlds.h"
+#include "window-minimap.h"
+#include "minimap-store.h"
+#include "server-command-tracker.h"
+#include "player-protocol.h"
+#include "marketplace-credentials.h"
+#include "marketplace-auth.h"
+#include "marketplace-request.h"
+#include "plugin-store.h"
+#include "vendor/cjson/cJSON.h"
 #include "window-console.h"
 #include "window-lifecycle.h"
+#include "window-server-actions.h"
 #include "window-networks.h"
 #include "window-player-data.h"
 #include "window-players.h"
+#include "player-heads.h"
 #include "window-parse.h"
 #include "window-protocol.h"
+#include "window-startup.h"
+#include "window-dialogs.h"
+#include "platform.h"
 
 #include <gio/gio.h>
 #include <gdk-pixbuf/gdk-pixbuf.h>
@@ -35,6 +52,8 @@
 #endif
 #include <time.h>
 
+G_DEFINE_AUTOPTR_CLEANUP_FUNC(cJSON, cJSON_Delete)
+
 #if defined(G_OS_WIN32)
 G_DEFINE_FINAL_TYPE(PumpkinWindow, pumpkin_window, GTK_TYPE_APPLICATION_WINDOW)
 #else
@@ -48,6 +67,65 @@ typedef struct {
   char *dest_path;
 } PluginOverwriteContext;
 
+typedef struct {
+  gint64 id;
+  char *public_id;
+  char *name;
+  char *name_key;
+  char *version;
+  char *category;
+  char *type;
+  double price;
+  gint64 downloads;
+  gint64 views;
+  char *dev_name;
+  char *preview_url;
+  char *created_at;
+  char *updated_at;
+} MarketPlugin;
+
+typedef struct {
+  PumpkinWindow *self;
+  gboolean update_cache;
+  guint generation;
+} MarketFetchContext;
+
+typedef struct {
+  PumpkinWindow *self;
+  GtkPicture *picture;
+  char *cache_key;
+  char *cache_path;
+} MarketPreviewDownloadContext;
+
+typedef struct {
+  char *summary;
+  char *detail;
+} PluginRuntimeIssue;
+
+typedef struct {
+  PumpkinWindow *self;
+  PumpkinServer *server;
+  MarketPlugin *plugin;
+  GtkButton *button;
+  char *dest_path;
+  char *tmp_path;
+  char *metadata_path;
+  char *destination_etag;
+} MarketInstallContext;
+
+typedef struct {
+  PumpkinWindow *self;
+  guint generation;
+} MarketplaceCredentialContext;
+
+typedef struct {
+  PumpkinWindow *self;
+  SoupSession *session;
+  SoupMessage *message;
+  char *token;
+  guint generation;
+} MarketplaceKeyValidationContext;
+
 typedef struct DownloadContext {
   PumpkinWindow *self;
   PumpkinServer *server;
@@ -59,7 +137,16 @@ typedef struct DownloadContext {
   char *server_bin;
   gboolean use_cache;
   gboolean restart_after_download;
+  gboolean maintenance_acquired;
 } DownloadContext;
+
+static const char *ANDROID_PREVIEW_TITLE = "Android preview";
+static const char *ANDROID_PREVIEW_BODY =
+  "This first Android port currently focuses on GTK UI bring-up. "
+  "Local Pumpkin hosting, server installs and server imports are intentionally disabled for now.";
+static const char *MARKETPLACE_API_PLUGINS_URL = "https://market.pumpkinmc.org/api/v1/rest/plugins";
+static const char *MARKETPLACE_API_DOWNLOAD_URL = "https://market.pumpkinmc.org/api/v1/rest/plugins";
+static const gint64 MARKET_CACHE_STALE_USEC = 10 * G_USEC_PER_SEC;
 
 
 static void start_download_for_server(PumpkinWindow *self,
@@ -110,11 +197,17 @@ static void on_import_server_done(GObject *source, GAsyncResult *res, gpointer u
 static void on_details_back(GtkButton *button, PumpkinWindow *self);
 static void on_network_details_back(GtkButton *button, PumpkinWindow *self);
 static void on_download_progress(goffset current, goffset total, gpointer user_data);
+static void apply_downloaded_binary(DownloadContext *ctx);
+static void apply_cached_binary(PumpkinWindow *self, PumpkinServer *server,
+                                 const char *path, const char *url,
+                                 const char *build_id, const char *build_label,
+                                 gboolean restart_after_download);
 static void on_details_install(GtkButton *button, PumpkinWindow *self);
 static void on_details_update(GtkButton *button, PumpkinWindow *self);
 static void on_details_check_updates(GtkButton *button, PumpkinWindow *self);
 static void command_history_reset_navigation(PumpkinWindow *self);
 static void trigger_latest_resolve(PumpkinWindow *self);
+static gboolean apply_release_channel_selection(PumpkinWindow *self);
 static gboolean poll_latest_release_tick(gpointer data);
 static void update_check_updates_badge(PumpkinWindow *self);
 void update_settings_form(PumpkinWindow *self);
@@ -133,7 +226,6 @@ static void on_save_general_settings(GtkButton *button, PumpkinWindow *self);
 static void on_reset_general_settings(GtkButton *button, PumpkinWindow *self);
 static void on_reset_server_settings(GtkButton *button, PumpkinWindow *self);
 static void mark_settings_dirty(PumpkinWindow *self);
-static void set_details_status(PumpkinWindow *self, const char *message, guint timeout_seconds);
 static void on_clear_cache(GtkButton *button, PumpkinWindow *self);
 static char *cache_dir_for_config(PumpkinWindow *self);
 static char *cache_path_for_download(PumpkinWindow *self, const char *url, const char *build_identity);
@@ -161,9 +253,37 @@ static void maybe_trigger_auto_update(PumpkinWindow *self);
 static void on_choose_icon(GtkButton *button, PumpkinWindow *self);
 static void on_reset_icon(GtkButton *button, PumpkinWindow *self);
 static void on_plugin_delete_clicked(GtkButton *button, PumpkinWindow *self);
+static void on_open_plugins(GtkButton *button, PumpkinWindow *self);
+static void on_import_plugin_clicked(GtkButton *button, PumpkinWindow *self);
+static void on_import_plugin_done(GObject *source, GAsyncResult *res, gpointer user_data);
+static void on_plugins_marketplace_clicked(GtkButton *button, PumpkinWindow *self);
+static void on_plugin_market_clicked(GtkButton *button, PumpkinWindow *self);
+static void on_plugin_issue_clicked(GtkButton *button, PumpkinWindow *self);
+static void on_marketplace_close_clicked(GtkButton *button, AdwDialog *dialog);
+static void on_marketplace_account_clicked(GtkButton *button, PumpkinWindow *self);
+static void on_marketplace_account_response(GObject *dialog, GAsyncResult *res, gpointer user_data);
+static void on_marketplace_credentials_loaded(GObject *source, GAsyncResult *res, gpointer user_data);
+static void on_marketplace_credentials_stored(GObject *source, GAsyncResult *res, gpointer user_data);
+static void on_marketplace_credentials_cleared(GObject *source, GAsyncResult *res, gpointer user_data);
+static void marketplace_validate_access_token_async(PumpkinWindow *self, const char *token);
+static void on_market_install_clicked(GtkButton *button, PumpkinWindow *self);
+static void on_marketplace_preview_clicked(GtkButton *button, PumpkinWindow *self);
+static void show_marketplace_page(PumpkinWindow *self, const char *initial_query, gboolean force_refresh);
+static void open_marketplace_details_dialog(PumpkinWindow *self, const MarketPlugin *plugin);
+static void refresh_marketplace_view(PumpkinWindow *self);
+static void refresh_marketplace_install_buttons(PumpkinWindow *self);
+static void on_marketplace_sort_changed(GObject *object, GParamSpec *pspec, PumpkinWindow *self);
+static void on_marketplace_sort_order_toggled(GtkToggleButton *button, PumpkinWindow *self);
+static void on_plugins_stack_visible_child_changed(GObject *object, GParamSpec *pspec, PumpkinWindow *self);
+static void request_market_plugin_cache(PumpkinWindow *self, gboolean force);
+static GPtrArray *market_parse_plugins_json(const char *json);
+static void set_marketplace_preview_picture(PumpkinWindow *self, GtkPicture *picture,
+                                            const MarketPlugin *plugin);
+static char *plugin_version_label(const char *plugins_dir, const char *file_name);
 static void on_plugin_delete_confirmed(GObject *dialog, GAsyncResult *res, gpointer user_data);
 static void on_plugin_overwrite_confirmed(GObject *dialog, GAsyncResult *res, gpointer user_data);
 static void select_server(PumpkinWindow *self, PumpkinServer *server);
+static void on_server_selected(GtkListBox *box, GtkListBoxRow *row, PumpkinWindow *self);
 static void refresh_overview_list(PumpkinWindow *self);
 static void queue_log_file_scroll_to_end(PumpkinWindow *self);
 static void refresh_overview_network_list(PumpkinWindow *self);
@@ -176,19 +296,15 @@ static GtkWidget *create_server_row(PumpkinWindow *self, PumpkinServer *server);
 static GtkWidget *create_server_icon_widget(PumpkinServer *server);
 static void update_details(PumpkinWindow *self);
 static void refresh_plugin_list(PumpkinWindow *self);
-static void on_world_delete_clicked(GtkButton *button, PumpkinWindow *self);
-static void on_world_delete_confirmed(GObject *dialog, GAsyncResult *res, gpointer user_data);
-static void refresh_world_list(PumpkinWindow *self);
+static GHashTable *collect_plugin_runtime_issues(PumpkinWindow *self);
 static void refresh_player_list(PumpkinWindow *self);
-static void refresh_whitelist_list(PumpkinWindow *self);
-static void refresh_banned_list(PumpkinWindow *self);
+static void set_player_list_placeholder(GtkListBox *list, const char *title, const char *description);
 static gboolean refresh_players_tick(gpointer user_data);
 static gboolean delete_player_tracking(PumpkinWindow *self,
                                        const char *state_key,
                                        const char *name,
                                        const char *uuid);
 static void on_player_row_activated(GtkListBox *box, GtkListBoxRow *row, PumpkinWindow *self);
-static void on_player_action_confirmed(GObject *dialog, GAsyncResult *res, gpointer user_data);
 static void on_player_ban_reason_confirmed(GObject *dialog, GAsyncResult *res, gpointer user_data);
 static void on_player_pardon_ip_manual_confirmed(GObject *dialog, GAsyncResult *res, gpointer user_data);
 static void update_live_player_names(PumpkinWindow *self, const char *line);
@@ -234,21 +350,10 @@ static void on_clear_all_logs(GtkButton *button, PumpkinWindow *self);
 static char *build_label_from_binary_path(PumpkinWindow *self, const char *bin_path);
 gboolean start_after_delay(gpointer data);
 static gboolean on_plugins_drop(GtkDropTarget *target, const GValue *value, double x, double y, PumpkinWindow *self);
-static gboolean on_worlds_drop(GtkDropTarget *target, const GValue *value, double x, double y, PumpkinWindow *self);
-static gboolean install_server_from_binary_path(PumpkinWindow *self,
-                                                PumpkinServer *server,
-                                                const char *src_binary_path,
-                                                const char *installed_url,
-                                                const char *build_id,
-                                                const char *build_label,
-                                                const char *success_log,
-                                                const char *success_status);
 static void cache_wait_context_free(CacheWaitContext *ctx);
 static gboolean on_wait_for_shared_cache_tick(gpointer data);
 static GdkDragAction on_plugins_drop_enter(GtkDropTarget *target, double x, double y, PumpkinWindow *self);
 static void on_plugins_drop_leave(GtkDropTarget *target, PumpkinWindow *self);
-static GdkDragAction on_worlds_drop_enter(GtkDropTarget *target, double x, double y, PumpkinWindow *self);
-static void on_worlds_drop_leave(GtkDropTarget *target, PumpkinWindow *self);
 static void set_hover_delete_button_visible(GtkWidget *button, gboolean visible);
 static void on_hover_delete_row_enter(GtkEventControllerMotion *controller, double x, double y, GtkWidget *button);
 static void on_hover_delete_row_leave(GtkEventControllerMotion *controller, GtkWidget *button);
@@ -256,12 +361,14 @@ static void attach_hover_delete_button(GtkWidget *row, GtkWidget *button);
 static void on_sponsor_button_enter(GtkEventControllerMotion *controller, double x, double y, PumpkinWindow *self);
 static void on_sponsor_button_leave(GtkEventControllerMotion *controller, PumpkinWindow *self);
 static gboolean remove_widget_on_idle(gpointer data);
+static gboolean ensure_local_hosting_supported(PumpkinWindow *self);
+static GtkWidget *create_android_preview_notice(void);
+static void apply_android_runtime_mode(PumpkinWindow *self);
 static void on_overview_embedded_server_pressed(GtkGestureClick *gesture,
                                                 int n_press,
                                                 double x,
                                                 double y,
                                                 PumpkinWindow *self);
-static gboolean hide_status_cb(gpointer data);
 static gboolean update_stats_tick(gpointer data);
 static void reset_stats_history(PumpkinWindow *self);
 static void set_stats_graphs_disabled(PumpkinWindow *self, gboolean disabled);
@@ -277,8 +384,6 @@ static const char *platform_label(PlayerPlatform platform);
 static GPtrArray *build_ip_unban_candidates(const char *raw_ip);
 static gboolean refresh_player_list_deferred(gpointer data);
 static gboolean send_pardon_ip_for_player(PumpkinWindow *self, const char *raw_ip, const char *state_key);
-static void set_player_head_image(PumpkinWindow *self, GtkImage *image, const char *uuid);
-static void on_player_head_download_done(GObject *source, GAsyncResult *res, gpointer user_data);
 static char *command_history_file(PumpkinServer *server);
 static void command_history_load(PumpkinWindow *self, PumpkinServer *server);
 static gboolean server_download_active(PumpkinWindow *self, PumpkinServer *server);
@@ -353,48 +458,42 @@ on_windows_window_realize(GtkWidget *widget, gpointer user_data)
 void
 set_details_error(PumpkinWindow *self, const char *message)
 {
-  if (self->details_error == NULL) {
+  if (self == NULL || self->notifications_overlay == NULL) {
     return;
   }
+  if (self->details_error_toast != NULL) {
+    adw_toast_dismiss(self->details_error_toast);
+    g_clear_object(&self->details_error_toast);
+  }
   if (message == NULL || *message == '\0') {
-    gtk_label_set_text(self->details_error, "");
-    if (self->details_error_revealer != NULL) {
-      gtk_revealer_set_reveal_child(self->details_error_revealer, FALSE);
-    }
     return;
   }
 
-  gtk_label_set_text(self->details_error, message);
-  if (self->details_error_revealer != NULL) {
-    gtk_revealer_set_reveal_child(self->details_error_revealer, TRUE);
-  }
+  AdwToast *toast = adw_toast_new(message);
+  adw_toast_set_priority(toast, ADW_TOAST_PRIORITY_HIGH);
+  adw_toast_set_timeout(toast, 8);
+  self->details_error_toast = g_object_ref(toast);
+  adw_toast_overlay_add_toast(self->notifications_overlay, toast);
 }
 
-static void
+void
 set_details_status(PumpkinWindow *self, const char *message, guint timeout_seconds)
 {
-  if (self->details_status == NULL) {
+  if (self == NULL || self->notifications_overlay == NULL) {
     return;
   }
-  if (self->status_timeout_id != 0) {
-    g_source_remove(self->status_timeout_id);
-    self->status_timeout_id = 0;
+  if (self->details_status_toast != NULL) {
+    adw_toast_dismiss(self->details_status_toast);
+    g_clear_object(&self->details_status_toast);
   }
   if (message == NULL || *message == '\0') {
-    gtk_label_set_text(self->details_status, "");
-    if (self->details_status_revealer != NULL) {
-      gtk_revealer_set_reveal_child(self->details_status_revealer, FALSE);
-    }
     return;
   }
 
-  gtk_label_set_text(self->details_status, message);
-  if (self->details_status_revealer != NULL) {
-    gtk_revealer_set_reveal_child(self->details_status_revealer, TRUE);
-  }
-  if (timeout_seconds > 0) {
-    self->status_timeout_id = g_timeout_add_seconds(timeout_seconds, hide_status_cb, g_object_ref(self));
-  }
+  AdwToast *toast = adw_toast_new(message);
+  adw_toast_set_timeout(toast, timeout_seconds);
+  self->details_status_toast = g_object_ref(toast);
+  adw_toast_overlay_add_toast(self->notifications_overlay, toast);
 }
 
 static void
@@ -403,35 +502,6 @@ set_details_status_for_server(PumpkinWindow *self, PumpkinServer *server, const 
   if (self->current != NULL && self->current == server) {
     set_details_status(self, message, timeout_seconds);
   }
-}
-
-static gboolean
-hide_status_cb(gpointer data)
-{
-  PumpkinWindow *self = PUMPKIN_WINDOW(data);
-  self->status_timeout_id = 0;
-  set_details_status(self, NULL, 0);
-  g_object_unref(self);
-  return G_SOURCE_REMOVE;
-}
-
-static gboolean
-log_line_matches_level(const char *line, int level_index)
-{
-  if (level_index <= 0 || line == NULL) {
-    return TRUE;
-  }
-  g_autofree char *lower = g_ascii_strdown(line, -1);
-  if (level_index == 1) {
-    return strstr(lower, "info") != NULL;
-  }
-  if (level_index == 2) {
-    return strstr(lower, "warn") != NULL;
-  }
-  if (level_index == 3) {
-    return strstr(lower, "error") != NULL;
-  }
-  return TRUE;
 }
 
 /* ---- Autostart server list helpers ---- */
@@ -627,14 +697,82 @@ on_popover_server_picked(GtkButton *btn, PumpkinWindow *self)
   }
 }
 
+static const char *
+selected_startup_monitor(PumpkinWindow *self)
+{
+  guint selected = adw_combo_row_get_selected(self->row_start_monitor);
+  return self->startup_monitor_ids != NULL && selected < self->startup_monitor_ids->len
+           ? g_ptr_array_index(self->startup_monitor_ids, selected) : "";
+}
+
+static void
+populate_startup_monitors(PumpkinWindow *self, const char *selected_id)
+{
+  gboolean was_loading = self->settings_loading;
+  self->settings_loading = TRUE;
+  g_autofree char *saved_id = g_strdup(selected_id);
+  g_clear_pointer(&self->startup_monitor_ids, g_ptr_array_unref);
+  self->startup_monitor_ids = g_ptr_array_new_with_free_func(g_free);
+  g_ptr_array_add(self->startup_monitor_ids, g_strdup(""));
+  g_autoptr(GtkStringList) names = gtk_string_list_new(NULL);
+  gtk_string_list_append(names, "System default");
+  guint selected = 0;
+  GListModel *monitors = gdk_display_get_monitors(gtk_widget_get_display(GTK_WIDGET(self)));
+  for (guint i = 0; i < g_list_model_get_n_items(monitors); i++) {
+    g_autoptr(GdkMonitor) monitor = g_list_model_get_item(monitors, i);
+    if (!gdk_monitor_is_valid(monitor)) {
+      continue;
+    }
+    char *id = pumpkin_monitor_id(monitor);
+    if (g_strcmp0(id, saved_id) == 0) {
+      selected = self->startup_monitor_ids->len;
+    }
+    g_ptr_array_add(self->startup_monitor_ids, id);
+    const char *model = gdk_monitor_get_model(monitor);
+    const char *connector = gdk_monitor_get_connector(monitor);
+    g_autofree char *name = connector != NULL && *connector != '\0'
+      ? g_strdup_printf("%s · %s", model != NULL ? model : "Monitor", connector)
+      : g_strdup_printf("%u · %s", i + 1, model != NULL ? model : "Monitor");
+    gtk_string_list_append(names, name);
+  }
+  /* Keep an unplugged monitor preference; startup falls back to the desktop. */
+  if (selected == 0 && saved_id != NULL && *saved_id != '\0') {
+    selected = self->startup_monitor_ids->len;
+    g_ptr_array_add(self->startup_monitor_ids, g_strdup(saved_id));
+    gtk_string_list_append(names, "Saved monitor (disconnected)");
+  }
+  adw_combo_row_set_model(self->row_start_monitor, G_LIST_MODEL(names));
+  adw_combo_row_set_selected(self->row_start_monitor, selected);
+  self->settings_loading = was_loading;
+}
+
+static void
+save_startup_preferences(PumpkinWindow *self)
+{
+  pumpkin_config_set_start_expanded(self->config, adw_switch_row_get_active(self->row_start_expanded));
+  pumpkin_config_set_start_mode(self->config, (PumpkinStartMode)adw_combo_row_get_selected(self->row_start_mode));
+  pumpkin_config_set_start_monitor(self->config, selected_startup_monitor(self));
+}
+
 static void
 update_autostart_sensitivity(PumpkinWindow *self)
 {
   gboolean boot_enabled = self->switch_autostart_on_boot != NULL &&
                            gtk_switch_get_active(self->switch_autostart_on_boot);
   if (self->switch_start_minimized != NULL) {
-    gtk_widget_set_sensitive(GTK_WIDGET(self->switch_start_minimized), boot_enabled);
+    gtk_widget_set_sensitive(GTK_WIDGET(self->switch_start_minimized),
+      boot_enabled);
   }
+  gboolean can_expand = boot_enabled && !gtk_switch_get_active(self->switch_start_minimized);
+  gtk_widget_set_sensitive(GTK_WIDGET(self->row_start_expanded), can_expand);
+  gboolean expanded = can_expand && adw_switch_row_get_active(self->row_start_expanded);
+  gboolean fullscreen = adw_combo_row_get_selected(self->row_start_mode) == PUMPKIN_START_FULLSCREEN;
+  gboolean can_place = pumpkin_startup_can_place_maximized(gtk_widget_get_display(GTK_WIDGET(self)));
+  gtk_widget_set_sensitive(GTK_WIDGET(self->row_start_mode), expanded);
+  gtk_widget_set_sensitive(GTK_WIDGET(self->row_start_monitor), expanded && (fullscreen || can_place));
+  adw_action_row_set_subtitle(ADW_ACTION_ROW(self->row_start_monitor),
+    !fullscreen && !can_place ? "For maximized windows, your desktop chooses the monitor. Select fullscreen to choose one." :
+                              "If the selected monitor is disconnected, the system default is used.");
   if (self->switch_auto_start_servers != NULL) {
     gtk_widget_set_sensitive(GTK_WIDGET(self->switch_auto_start_servers), boot_enabled);
   }
@@ -657,6 +795,9 @@ on_save_general_settings(GtkButton *button, PumpkinWindow *self)
   if (self->config == NULL) {
     return;
   }
+  if (!apply_release_channel_selection(self)) {
+    return;
+  }
   if (self->switch_use_cache != NULL) {
     pumpkin_config_set_use_cache(self->config, gtk_switch_get_active(self->switch_use_cache));
   }
@@ -670,7 +811,6 @@ on_save_general_settings(GtkButton *button, PumpkinWindow *self)
   if (self->switch_autostart_on_boot != NULL) {
     gboolean autostart = gtk_switch_get_active(self->switch_autostart_on_boot);
     pumpkin_config_set_autostart_on_boot(self->config, autostart);
-    pumpkin_config_manage_autostart_desktop(autostart);
   }
   if (self->switch_start_minimized != NULL) {
     pumpkin_config_set_start_minimized(self->config, gtk_switch_get_active(self->switch_start_minimized));
@@ -678,6 +818,7 @@ on_save_general_settings(GtkButton *button, PumpkinWindow *self)
   if (self->switch_auto_start_servers != NULL) {
     pumpkin_config_set_auto_start_servers_enabled(self->config, gtk_switch_get_active(self->switch_auto_start_servers));
   }
+  save_startup_preferences(self);
   if (self->drop_date_format != NULL) {
     pumpkin_config_set_date_format(self->config, (PumpkinDateFormat)gtk_drop_down_get_selected(self->drop_date_format));
   }
@@ -700,6 +841,7 @@ on_save_general_settings(GtkButton *button, PumpkinWindow *self)
     }
   }
   pumpkin_config_save(self->config, NULL);
+  pumpkin_config_manage_autostart_desktop(pumpkin_config_get_autostart_on_boot(self->config));
   if (self->switch_run_in_background != NULL) {
     GApplication *app = g_application_get_default();
     if (PUMPKIN_IS_APP(app)) {
@@ -727,12 +869,17 @@ on_reset_general_response(AdwAlertDialog *dialog, const char *response, PumpkinW
   }
 
   self->settings_loading = TRUE;
+  pumpkin_window_minimap_set_enabled(self, FALSE);
   if (self->switch_autostart_on_boot != NULL) {
     gtk_switch_set_active(self->switch_autostart_on_boot, FALSE);
   }
   if (self->switch_start_minimized != NULL) {
     gtk_switch_set_active(self->switch_start_minimized, FALSE);
   }
+  adw_switch_row_set_active(self->row_start_expanded, FALSE);
+  adw_combo_row_set_selected(self->row_start_mode, PUMPKIN_START_MAXIMIZED);
+  adw_combo_row_set_selected(self->row_release_channel, PUMPKIN_RELEASE_NIGHTLY);
+  adw_combo_row_set_selected(self->row_start_monitor, 0);
   if (self->switch_auto_start_servers != NULL) {
     gtk_switch_set_active(self->switch_auto_start_servers, FALSE);
   }
@@ -810,8 +957,8 @@ on_reset_server_response(AdwAlertDialog *dialog, const char *response, PumpkinWi
   pumpkin_server_set_stats_sample_msec(self->current, DEFAULT_STATS_SAMPLE_MSEC);
   pumpkin_server_set_max_cpu_cores(self->current, 0);
   pumpkin_server_set_max_ram_mb(self->current, 0);
-  pumpkin_server_set_auto_restart(self->current, FALSE);
-  pumpkin_server_set_auto_restart_delay(self->current, 10000);
+  pumpkin_server_set_auto_restart(self->current, TRUE);
+  pumpkin_server_set_auto_restart_delay(self->current, PUMPKIN_AUTO_RESTART_DELAY_DEFAULT_MS);
   pumpkin_server_set_auto_update_enabled(self->current, FALSE);
   pumpkin_server_set_auto_update_use_schedule(self->current, FALSE);
   pumpkin_server_set_auto_update_hour(self->current, 1);
@@ -982,6 +1129,12 @@ global_switches_match(PumpkinWindow *self)
   if (self->config == NULL) {
     return TRUE;
   }
+  if (pumpkin_config_get_start_expanded(self->config) != adw_switch_row_get_active(self->row_start_expanded) ||
+      (guint)pumpkin_config_get_release_channel(self->config) != adw_combo_row_get_selected(self->row_release_channel) ||
+      (guint)pumpkin_config_get_start_mode(self->config) != adw_combo_row_get_selected(self->row_start_mode) ||
+      g_strcmp0(pumpkin_config_get_start_monitor(self->config), selected_startup_monitor(self)) != 0) {
+    return FALSE;
+  }
   if (self->switch_use_cache != NULL &&
       pumpkin_config_get_use_cache(self->config) != gtk_switch_get_active(self->switch_use_cache)) {
     return FALSE;
@@ -1147,9 +1300,6 @@ discard_settings_changes(PumpkinWindow *self)
   if (self->plugin_drop_hint != NULL) {
     gtk_widget_set_sensitive(GTK_WIDGET(self->plugin_drop_hint), FALSE);
   }
-  if (self->world_drop_hint != NULL) {
-    gtk_widget_set_sensitive(GTK_WIDGET(self->world_drop_hint), FALSE);
-  }
   update_settings_form(self);
 }
 
@@ -1166,10 +1316,24 @@ on_settings_switch_changed(GObject *object, GParamSpec *pspec, PumpkinWindow *se
 {
   (void)object;
   (void)pspec;
+  if (self->settings_loading) {
+    return;
+  }
   mark_settings_dirty(self);
   validate_settings_limits(self);
   update_autostart_sensitivity(self);
   update_auto_update_controls_sensitivity(self);
+}
+
+static void
+on_startup_monitors_changed(GListModel *model, guint position, guint removed, guint added, PumpkinWindow *self)
+{
+  (void)model;
+  (void)position;
+  (void)removed;
+  (void)added;
+  populate_startup_monitors(self, selected_startup_monitor(self));
+  update_autostart_sensitivity(self);
 }
 
 GListModel *
@@ -1263,7 +1427,7 @@ restart_players_refresh_timer(PumpkinWindow *self)
     self->players_refresh_id = 0;
   }
   if (self->current != NULL && server_is_running_ui(self, self->current)) {
-    self->players_refresh_id = g_timeout_add((guint)current_stats_sample_msec(self), refresh_players_tick, self);
+    self->players_refresh_id = g_timeout_add(1000, refresh_players_tick, self);
   }
 }
 
@@ -1748,6 +1912,10 @@ confirm_leave_settings(PumpkinWindow *self, const char *target_details, const ch
   adw_alert_dialog_choose(alert, GTK_WIDGET(self), NULL, on_settings_leave_confirmed, self);
 }
 
+static const char *const details_pages[] = {
+  "console", "stats", "plugins", "players", "minimap", "worlds", "logs", "settings"
+};
+
 static void
 complete_pending_settings_navigation(PumpkinWindow *self)
 {
@@ -1784,6 +1952,13 @@ complete_pending_settings_navigation(PumpkinWindow *self)
     self->settings_guard = TRUE;
     adw_view_stack_set_visible_child_name(self->details_stack, self->pending_details_page);
     self->settings_guard = FALSE;
+    for (guint i = 0; i < G_N_ELEMENTS(details_pages); i++) {
+      if (g_strcmp0(details_pages[i], self->pending_details_page) == 0) {
+        gtk_list_box_select_row(self->details_sidebar,
+                                gtk_list_box_get_row_at_index(self->details_sidebar, (int)i));
+        break;
+      }
+    }
   }
   if (self->pending_view_page != NULL) {
     adw_view_stack_set_visible_child_name(self->view_stack, self->pending_view_page);
@@ -1896,6 +2071,70 @@ on_window_visible_changed(GObject *object, GParamSpec *pspec, gpointer user_data
 }
 
 static void
+sync_details_sidebar(PumpkinWindow *self)
+{
+  if (self->details_sidebar == NULL || self->details_stack == NULL) {
+    return;
+  }
+  const char *page = adw_view_stack_get_visible_child_name(self->details_stack);
+  for (guint i = 0; i < G_N_ELEMENTS(details_pages); i++) {
+    if (g_strcmp0(page, details_pages[i]) == 0) {
+      gtk_list_box_select_row(self->details_sidebar,
+                              gtk_list_box_get_row_at_index(self->details_sidebar, (int)i));
+      return;
+    }
+  }
+}
+
+static void
+on_details_sidebar_activated(GtkListBox *box, GtkListBoxRow *row, PumpkinWindow *self)
+{
+  (void)box;
+  int index = gtk_list_box_row_get_index(row);
+  if (index < 0 || index >= (int)G_N_ELEMENTS(details_pages)) {
+    return;
+  }
+  adw_view_stack_set_visible_child_name(self->details_stack, details_pages[index]);
+  if (adw_overlay_split_view_get_collapsed(self->details_split_view)) {
+    adw_overlay_split_view_set_show_sidebar(self->details_split_view, FALSE);
+  }
+}
+
+static void
+on_details_sidebar_toggle(GtkButton *button, PumpkinWindow *self)
+{
+  (void)button;
+  adw_overlay_split_view_set_show_sidebar(self->details_split_view,
+                                          !adw_overlay_split_view_get_show_sidebar(self->details_split_view));
+}
+
+static void
+setup_details_sidebar(PumpkinWindow *self)
+{
+  const char *const titles[] = { "Console", "Stats", "Plugins", "Players", "Minimap", "Worlds", "Logs", "Settings" };
+  const char *const icons[] = {
+    "utilities-terminal-symbolic", "dev.rotstein.SmashedPumpkin-stats-symbolic",
+    "folder-symbolic", "system-users-symbolic", "find-location-symbolic", "folder-symbolic",
+    "text-x-generic-symbolic", "emblem-system-symbolic"
+  };
+  for (guint i = 0; i < G_N_ELEMENTS(titles); i++) {
+    GtkWidget *row = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 12);
+    gtk_widget_set_margin_start(row, 12);
+    gtk_widget_set_margin_end(row, 12);
+    gtk_widget_set_margin_top(row, 10);
+    gtk_widget_set_margin_bottom(row, 10);
+    gtk_box_append(GTK_BOX(row), gtk_image_new_from_icon_name(icons[i]));
+    GtkWidget *label = gtk_label_new(titles[i]);
+    gtk_label_set_xalign(GTK_LABEL(label), 0.0f);
+    gtk_box_append(GTK_BOX(row), label);
+    gtk_list_box_append(self->details_sidebar, row);
+  }
+  g_signal_connect(self->details_sidebar, "row-activated", G_CALLBACK(on_details_sidebar_activated), self);
+  g_signal_connect(self->btn_details_sidebar_toggle, "clicked", G_CALLBACK(on_details_sidebar_toggle), self);
+  sync_details_sidebar(self);
+}
+
+static void
 on_details_stack_changed(GObject *object, GParamSpec *pspec, PumpkinWindow *self)
 {
   (void)object;
@@ -1915,6 +2154,7 @@ on_details_stack_changed(GObject *object, GParamSpec *pspec, PumpkinWindow *self
     self->settings_guard = FALSE;
     confirm_leave_settings(self, page, NULL);
   }
+  sync_details_sidebar(self);
 }
 
 static void
@@ -2025,7 +2265,7 @@ static void
 on_download_progress(goffset current, goffset total, gpointer user_data)
 {
   DownloadContext *ctx = user_data;
-  if (ctx == NULL) {
+  if (ctx == NULL || ctx->self->disposing) {
     return;
   }
   DownloadProgressState *state = get_download_progress_state(ctx->self, ctx->server, TRUE);
@@ -2071,28 +2311,28 @@ on_log_line(PumpkinServer *server, const char *line, PumpkinWindow *self)
   }
   gboolean tps_line = FALSE;
   gboolean list_line = FALSE;
-  if (is_current) {
-    list_line = pumpkin_is_player_list_snapshot_line(check);
-  }
-  if (is_current && check != NULL) {
+  g_autofree char *message = pumpkin_player_log_message(check);
+  list_line = pumpkin_parse_player_list_snapshot_line(message, NULL, NULL);
+  if (message != NULL && g_ascii_strncasecmp(message, "TPS", 3) == 0) {
     double tps = 0.0;
-    if (pumpkin_parse_tps_from_line(check, &tps)) {
-      self->last_tps = tps;
-      self->last_tps_valid = TRUE;
-      self->tps_enabled = TRUE;
+    if (pumpkin_parse_tps_from_line(message, &tps)) {
+      if (is_current) {
+        self->last_tps = tps;
+        self->last_tps_valid = TRUE;
+        self->tps_enabled = TRUE;
+      }
       tps_line = TRUE;
     }
   }
   gboolean suppress_auto_line = FALSE;
-  if (is_current) {
-    if (tps_line && self->pending_auto_tps_lines > 0) {
-      self->pending_auto_tps_lines--;
-      suppress_auto_line = TRUE;
-    }
-    if (list_line && self->pending_auto_list_lines > 0) {
-      self->pending_auto_list_lines--;
-      suppress_auto_line = TRUE;
-    }
+  if (tps_line) {
+    suppress_auto_line = pumpkin_command_consume_reply(G_OBJECT(server), "tps");
+  }
+  if (list_line) {
+    suppress_auto_line |= pumpkin_command_consume_reply(G_OBJECT(server), "list");
+  }
+  if (internal_line && g_strcmp0(line, "Server process exited") == 0) {
+    pumpkin_command_tracking_reset(G_OBJECT(server));
   }
   if (!internal_line && !suppress_auto_line) {
     append_console_line(self, server, line);
@@ -2127,13 +2367,9 @@ on_log_line(PumpkinServer *server, const char *line, PumpkinWindow *self)
     player_states_save(self, server);
     self->tps_enabled = FALSE;
     self->last_tps_valid = FALSE;
-    self->pending_auto_tps_lines = 0;
-    self->pending_auto_list_lines = 0;
     self->list_snapshot_players = 0;
     self->list_snapshot_max_players = 0;
     self->list_snapshot_updated_at = 0;
-    self->pending_java_platform_hints = 0;
-    self->pending_bedrock_platform_hints = 0;
 
     if (!self->restart_requested) {
       if (!self->user_stop_requested) {
@@ -2158,6 +2394,43 @@ on_log_line(PumpkinServer *server, const char *line, PumpkinWindow *self)
   }
 }
 
+static void
+on_server_session_started(PumpkinServer *server, PumpkinWindow *self)
+{
+  pumpkin_command_tracking_reset(G_OBJECT(server));
+  GtkTextBuffer *buffer = g_hash_table_lookup(self->console_buffers, server);
+  if (buffer != NULL) {
+    gtk_text_buffer_set_text(buffer, "", -1);
+  }
+  append_console_line(self, server, "[SMPK] Server session started");
+  if (self->current == server) {
+    player_states_mark_all_offline(self);
+    self->list_snapshot_players = -1;
+    self->list_snapshot_updated_at = 0;
+    self->last_player_list_request_at = 0;
+    g_hash_table_remove_all(self->platform_hint_by_ip);
+    invalidate_player_list_signature(self);
+    refresh_log_files(self);
+  }
+}
+
+static void
+on_server_state_changed(PumpkinServer *server, PumpkinWindow *self)
+{
+  if (!self->disposing) {
+    if (self->current == server) {
+      update_details(self);
+    }
+    queue_overview_refresh(self, FALSE);
+  }
+}
+
+static void
+prepare_bridge_for_start(PumpkinServer *server, PumpkinWindow *self)
+{
+  if (!self->disposing) pumpkin_window_minimap_prepare_start(self, server);
+}
+
 void
 ensure_server_log_handler(PumpkinWindow *self, PumpkinServer *server)
 {
@@ -2165,7 +2438,13 @@ ensure_server_log_handler(PumpkinWindow *self, PumpkinServer *server)
     return;
   }
   g_signal_handlers_disconnect_by_func(server, G_CALLBACK(on_log_line), self);
-  g_signal_connect(server, "log-line", G_CALLBACK(on_log_line), self);
+  g_signal_connect_object(server, "log-line", G_CALLBACK(on_log_line), self, 0);
+  g_signal_handlers_disconnect_by_func(server, G_CALLBACK(on_server_session_started), self);
+  g_signal_connect_object(server, "session-started", G_CALLBACK(on_server_session_started), self, 0);
+  g_signal_handlers_disconnect_by_func(server, G_CALLBACK(on_server_state_changed), self);
+  g_signal_connect_object(server, "state-changed", G_CALLBACK(on_server_state_changed), self, 0);
+  g_signal_handlers_disconnect_by_func(server, G_CALLBACK(prepare_bridge_for_start), self);
+  g_signal_connect_object(server, "prepare-start", G_CALLBACK(prepare_bridge_for_start), self, 0);
 }
 
 static void
@@ -2174,11 +2453,9 @@ clear_list_box(GtkListBox *box)
   if (box == NULL) {
     return;
   }
-  GtkWidget *child = gtk_widget_get_first_child(GTK_WIDGET(box));
-  while (child != NULL) {
-    GtkWidget *next = gtk_widget_get_next_sibling(child);
-    gtk_list_box_remove(box, child);
-    child = next;
+  GtkListBoxRow *row;
+  while ((row = gtk_list_box_get_row_at_index(box, 0)) != NULL) {
+    gtk_list_box_remove(box, GTK_WIDGET(row));
   }
 }
 
@@ -2406,18 +2683,6 @@ delete_player_tracking(PumpkinWindow *self, const char *state_key, const char *n
         g_hash_table_iter_remove(&iter);
         break;
       }
-    }
-  }
-
-  if (uuid_copy != NULL && *uuid_copy != '\0') {
-    g_autofree char *uuid_key = normalized_key(uuid_copy);
-    if (uuid_key != NULL) {
-      if (self->player_head_downloads != NULL) {
-        g_hash_table_remove(self->player_head_downloads, uuid_key);
-      }
-      g_autofree char *data_dir = pumpkin_server_get_data_dir(self->current);
-      g_autofree char *cache_path = g_strdup_printf("%s/cache/player-heads/%s.png", data_dir, uuid_key);
-      g_remove(cache_path);
     }
   }
 
@@ -2743,7 +3008,8 @@ build_label_from_binary_path(PumpkinWindow *self, const char *bin_path)
 static gboolean
 is_update_available_by_metadata(PumpkinWindow *self, PumpkinServer *server, gboolean installed)
 {
-  if (!installed || self->latest_url == NULL || server == NULL) {
+  if (!installed || self->latest_url == NULL || server == NULL ||
+      !pumpkin_release_is_managed_url(pumpkin_server_get_download_url(server))) {
     return FALSE;
   }
 
@@ -2784,7 +3050,8 @@ read_binary_signature(const char *bin_path, goffset *out_size, time_t *out_mtime
 static gboolean
 is_update_available_for_server(PumpkinWindow *self, PumpkinServer *server, gboolean installed)
 {
-  if (!installed || self == NULL || server == NULL) {
+  if (!installed || self == NULL || server == NULL ||
+      !pumpkin_release_is_managed_url(pumpkin_server_get_download_url(server))) {
     return FALSE;
   }
 
@@ -2848,12 +3115,33 @@ update_check_updates_badge(PumpkinWindow *self)
   }
 
   GtkWidget *button = GTK_WIDGET(self->btn_details_check_updates);
+  pumpkin_refresh_button_setup(self->btn_details_check_updates);
   gtk_widget_remove_css_class(button, "update-badge-current");
   gtk_widget_remove_css_class(button, "update-badge-available");
+  gtk_widget_remove_css_class(button, "error");
+
+  if (self->current != NULL && !pumpkin_release_is_managed_url(pumpkin_server_get_download_url(self->current))) {
+    pumpkin_refresh_button_set_label(self->btn_details_check_updates, "Custom source");
+    gtk_widget_set_tooltip_text(button, "Custom download URLs are not checked for updates");
+    return;
+  }
 
   if (self->latest_resolve_in_flight) {
-    gtk_button_set_label(self->btn_details_check_updates, "Checking...");
+    pumpkin_refresh_button_set_label(self->btn_details_check_updates, "Checking...");
+    gtk_widget_set_tooltip_text(button, "Checking for updates...");
     gtk_widget_add_css_class(button, "update-badge-current");
+    return;
+  }
+
+  if (self->latest_error != NULL) {
+    pumpkin_refresh_button_set_label(self->btn_details_check_updates, "Check failed");
+    gtk_widget_set_tooltip_text(button, self->latest_error);
+    gtk_widget_add_css_class(button, "error");
+    return;
+  }
+  if (self->latest_url == NULL) {
+    pumpkin_refresh_button_set_label(self->btn_details_check_updates, "Check updates");
+    gtk_widget_set_tooltip_text(button, "Check for updates");
     return;
   }
 
@@ -2865,10 +3153,12 @@ update_check_updates_badge(PumpkinWindow *self)
   }
 
   if (update_available) {
-    gtk_button_set_label(self->btn_details_check_updates, "Update available");
+    pumpkin_refresh_button_set_label(self->btn_details_check_updates, "Update available");
+    gtk_widget_set_tooltip_text(button, "Update available. Check again for newer builds");
     gtk_widget_add_css_class(button, "update-badge-available");
   } else {
-    gtk_button_set_label(self->btn_details_check_updates, "Up to date");
+    pumpkin_refresh_button_set_label(self->btn_details_check_updates, "Up to date");
+    gtk_widget_set_tooltip_text(button, "Check for updates");
     gtk_widget_add_css_class(button, "update-badge-current");
   }
 }
@@ -3216,32 +3506,6 @@ describe_invalid_binary_file(const char *path)
 }
 
 static char *
-describe_replace_paths(const char *src, const char *dest)
-{
-  g_autofree char *src_dir = src != NULL ? g_path_get_dirname(src) : NULL;
-  g_autofree char *dest_dir = dest != NULL ? g_path_get_dirname(dest) : NULL;
-
-  gboolean src_exists = src != NULL && g_file_test(src, G_FILE_TEST_EXISTS);
-  gboolean src_dir_exists = src_dir != NULL && g_file_test(src_dir, G_FILE_TEST_IS_DIR);
-  gboolean dest_exists = dest != NULL && g_file_test(dest, G_FILE_TEST_EXISTS);
-  gboolean dest_dir_exists = dest_dir != NULL && g_file_test(dest_dir, G_FILE_TEST_IS_DIR);
-
-  GStatBuf src_st;
-  gboolean src_stat_ok = src != NULL && g_stat(src, &src_st) == 0;
-
-  return g_strdup_printf("Replace diagnostics: src=\"%s\" exists=%s dir-exists=%s size=%" G_GINT64_FORMAT
-                         ", dest=\"%s\" exists=%s dest-dir=\"%s\" dest-dir-exists=%s",
-                         src != NULL ? src : "(null)",
-                         src_exists ? "yes" : "no",
-                         src_dir_exists ? "yes" : "no",
-                         src_stat_ok ? (gint64)src_st.st_size : (gint64)-1,
-                         dest != NULL ? dest : "(null)",
-                         dest_exists ? "yes" : "no",
-                         dest_dir != NULL ? dest_dir : "(null)",
-                         dest_dir_exists ? "yes" : "no");
-}
-
-static char *
 get_server_size(PumpkinServer *server)
 {
   const char *root = pumpkin_server_get_root_dir(server);
@@ -3287,41 +3551,6 @@ preferred_max_players(PumpkinWindow *self, PumpkinServer *server)
   return configured;
 }
 
-static char *
-extract_name_before_suffix(const char *line, const char *suffix)
-{
-  if (line == NULL || suffix == NULL || *suffix == '\0') {
-    return NULL;
-  }
-  const char *pos = strstr(line, suffix);
-  if (pos == NULL || pos <= line) {
-    return NULL;
-  }
-  g_autofree char *prefix = g_strndup(line, (gsize)(pos - line));
-  g_strstrip(prefix);
-  if (prefix[0] == '\0') {
-    return NULL;
-  }
-
-  const char *start = prefix;
-  const char *colon = strrchr(prefix, ':');
-  if (colon != NULL) {
-    start = colon + 1;
-  }
-  while (*start == ' ' || *start == '\t') {
-    start++;
-  }
-  if (*start == '\0') {
-    return NULL;
-  }
-
-  g_autofree char *name = g_strdup(start);
-  g_strstrip(name);
-  if (name[0] == '\0') {
-    return NULL;
-  }
-  return g_strdup(name);
-}
 
 static gboolean
 server_name_exists(PumpkinWindow *self, const char *name)
@@ -3427,7 +3656,7 @@ ingest_players_from_disk(PumpkinWindow *self)
     const char *entry = NULL;
     while ((entry = g_dir_read_name(dir)) != NULL) {
       g_autofree char *child = g_build_filename(dirs[i], entry, NULL);
-      if (g_file_test(child, G_FILE_TEST_IS_DIR)) {
+      if (!g_str_has_suffix(entry, ".dat") || !g_file_test(child, G_FILE_TEST_IS_REGULAR)) {
         continue;
       }
       if (g_hash_table_contains(seen, entry)) {
@@ -3449,8 +3678,9 @@ ingest_players_from_disk(PumpkinWindow *self)
       *dot = '\0';
     }
 
-    const char *uuid = is_uuid_string(token) ? token : NULL;
-    const char *name = token;
+    if (!is_uuid_string(token)) continue;
+    const char *uuid = token;
+    const char *name = NULL;
     if (uuid != NULL) {
       const char *mapped = g_hash_table_lookup(name_map, uuid);
       if (mapped != NULL && *mapped != '\0') {
@@ -3539,6 +3769,9 @@ static void
 on_overview_update_clicked(GtkButton *button, gpointer user_data)
 {
   PumpkinWindow *self = PUMPKIN_WINDOW(user_data);
+  if (!ensure_local_hosting_supported(self)) {
+    return;
+  }
   PumpkinServer *server = g_object_get_data(G_OBJECT(button), "server");
   if (server == NULL || self->latest_url == NULL) {
     return;
@@ -3565,7 +3798,7 @@ on_overview_update_clicked(GtkButton *button, gpointer user_data)
 static void
 open_overview_server_details(PumpkinWindow *self, PumpkinServer *server, AdwDialog *dialog)
 {
-  if (self == NULL || server == NULL) {
+  if (self == NULL || server == NULL || !pumpkin_platform_supports_local_hosting()) {
     return;
   }
 
@@ -3595,7 +3828,7 @@ on_overview_embedded_server_pressed(GtkGestureClick *gesture,
                                     double y,
                                     PumpkinWindow *self)
 {
-  if (self == NULL || n_press != 1) {
+  if (self == NULL || n_press != 1 || !pumpkin_platform_supports_local_hosting()) {
     return;
   }
 
@@ -3624,7 +3857,7 @@ static void
 on_overview_row_activated(GtkListBox *box, GtkListBoxRow *row, PumpkinWindow *self)
 {
   (void)box;
-  if (self == NULL || row == NULL) {
+  if (self == NULL || row == NULL || !pumpkin_platform_supports_local_hosting()) {
     return;
   }
   PumpkinServer *server = g_object_get_data(G_OBJECT(row), "server");
@@ -3668,6 +3901,111 @@ remove_widget_on_idle(gpointer data)
   }
   g_object_unref(widget);
   return G_SOURCE_REMOVE;
+}
+
+static gboolean
+ensure_local_hosting_supported(PumpkinWindow *self)
+{
+  if (pumpkin_platform_supports_local_hosting()) {
+    return TRUE;
+  }
+
+  if (self != NULL) {
+    set_details_status(self, "Local Pumpkin hosting is not available on Android yet.", 4);
+  }
+  return FALSE;
+}
+
+static GtkWidget *
+create_android_preview_notice(void)
+{
+  GtkWidget *card = gtk_frame_new(NULL);
+  gtk_widget_add_css_class(card, "card");
+  gtk_widget_add_css_class(card, "overview-card");
+
+  GtkWidget *box = gtk_box_new(GTK_ORIENTATION_VERTICAL, 6);
+  gtk_widget_set_margin_top(box, 12);
+  gtk_widget_set_margin_bottom(box, 12);
+  gtk_widget_set_margin_start(box, 12);
+  gtk_widget_set_margin_end(box, 12);
+
+  GtkWidget *title = gtk_label_new(ANDROID_PREVIEW_TITLE);
+  gtk_label_set_xalign(GTK_LABEL(title), 0.0);
+  gtk_widget_add_css_class(title, "title-4");
+
+  GtkWidget *body = gtk_label_new(ANDROID_PREVIEW_BODY);
+  gtk_label_set_xalign(GTK_LABEL(body), 0.0);
+  gtk_label_set_wrap(GTK_LABEL(body), TRUE);
+  gtk_label_set_wrap_mode(GTK_LABEL(body), PANGO_WRAP_WORD_CHAR);
+  gtk_widget_add_css_class(body, "dim-label");
+
+  gtk_box_append(GTK_BOX(box), title);
+  gtk_box_append(GTK_BOX(box), body);
+  gtk_frame_set_child(GTK_FRAME(card), box);
+  return card;
+}
+
+static void
+apply_android_runtime_mode(PumpkinWindow *self)
+{
+  if (self == NULL || !pumpkin_platform_is_android()) {
+    return;
+  }
+
+  if (self->overview_page_box != NULL) {
+    gtk_box_prepend(self->overview_page_box, create_android_preview_notice());
+  }
+
+  GtkWidget *hidden_widgets[] = {
+    GTK_WIDGET(self->btn_add_server),
+    GTK_WIDGET(self->btn_add_server_overview),
+    GTK_WIDGET(self->btn_add_network_overview),
+    GTK_WIDGET(self->btn_import_server),
+    GTK_WIDGET(self->btn_import_server_overview),
+    GTK_WIDGET(self->btn_remove_server),
+    GTK_WIDGET(self->btn_details_start),
+    GTK_WIDGET(self->btn_details_stop),
+    GTK_WIDGET(self->btn_details_restart),
+    GTK_WIDGET(self->btn_details_install),
+    GTK_WIDGET(self->btn_details_update),
+    GTK_WIDGET(self->btn_details_check_updates),
+    GTK_WIDGET(self->btn_network_details_start),
+    GTK_WIDGET(self->btn_network_details_stop),
+    GTK_WIDGET(self->btn_network_details_update),
+    GTK_WIDGET(self->btn_network_details_install),
+    GTK_WIDGET(self->btn_network_details_add),
+    GTK_WIDGET(self->btn_network_details_set_proxy),
+    GTK_WIDGET(self->btn_network_details_clear_proxy),
+    GTK_WIDGET(self->btn_network_details_set_icon),
+    GTK_WIDGET(self->btn_network_details_reset_icon),
+    GTK_WIDGET(self->btn_open_plugins),
+    GTK_WIDGET(self->btn_import_plugin),
+    GTK_WIDGET(self->btn_open_players),
+    GTK_WIDGET(self->btn_open_worlds),
+    GTK_WIDGET(self->console_command_row),
+    GTK_WIDGET(self->stats_row),
+    NULL
+  };
+  for (guint i = 0; hidden_widgets[i] != NULL; i++) {
+    gtk_widget_set_visible(hidden_widgets[i], FALSE);
+  }
+
+  GtkWidget *disabled_widgets[] = {
+    GTK_WIDGET(self->overview_list),
+    GTK_WIDGET(self->overview_network_list),
+    GTK_WIDGET(self->server_list),
+    GTK_WIDGET(self->switch_run_in_background),
+    GTK_WIDGET(self->switch_autostart_on_boot),
+    GTK_WIDGET(self->switch_start_minimized),
+    GTK_WIDGET(self->row_start_expanded),
+    GTK_WIDGET(self->row_start_mode),
+    GTK_WIDGET(self->row_start_monitor),
+    GTK_WIDGET(self->switch_auto_start_servers),
+    NULL
+  };
+  for (guint i = 0; disabled_widgets[i] != NULL; i++) {
+    gtk_widget_set_sensitive(disabled_widgets[i], FALSE);
+  }
 }
 
 static void
@@ -3808,17 +4146,2078 @@ open_uri_external(PumpkinWindow *self, const char *uri)
 }
 
 static void
+market_plugin_free(MarketPlugin *plugin)
+{
+  if (plugin == NULL) {
+    return;
+  }
+  g_clear_pointer(&plugin->name, g_free);
+  g_clear_pointer(&plugin->public_id, g_free);
+  g_clear_pointer(&plugin->name_key, g_free);
+  g_clear_pointer(&plugin->version, g_free);
+  g_clear_pointer(&plugin->category, g_free);
+  g_clear_pointer(&plugin->type, g_free);
+  g_clear_pointer(&plugin->dev_name, g_free);
+  g_clear_pointer(&plugin->preview_url, g_free);
+  g_clear_pointer(&plugin->created_at, g_free);
+  g_clear_pointer(&plugin->updated_at, g_free);
+  g_free(plugin);
+}
+
+static MarketPlugin *
+market_plugin_clone(const MarketPlugin *plugin)
+{
+  if (plugin == NULL) {
+    return NULL;
+  }
+
+  MarketPlugin *copy = g_new0(MarketPlugin, 1);
+  copy->id = plugin->id;
+  copy->public_id = g_strdup(plugin->public_id);
+  copy->name = g_strdup(plugin->name);
+  copy->name_key = g_strdup(plugin->name_key);
+  copy->version = g_strdup(plugin->version);
+  copy->category = g_strdup(plugin->category);
+  copy->type = g_strdup(plugin->type);
+  copy->price = plugin->price;
+  copy->downloads = plugin->downloads;
+  copy->views = plugin->views;
+  copy->dev_name = g_strdup(plugin->dev_name);
+  copy->preview_url = g_strdup(plugin->preview_url);
+  copy->created_at = g_strdup(plugin->created_at);
+  copy->updated_at = g_strdup(plugin->updated_at);
+  return copy;
+}
+
+static void
+market_install_context_free(MarketInstallContext *ctx)
+{
+  if (ctx == NULL) {
+    return;
+  }
+  g_clear_object(&ctx->self);
+  g_clear_object(&ctx->server);
+  g_clear_object(&ctx->button);
+  market_plugin_free(ctx->plugin);
+  g_clear_pointer(&ctx->dest_path, g_free);
+  g_clear_pointer(&ctx->tmp_path, g_free);
+  g_clear_pointer(&ctx->metadata_path, g_free);
+  g_clear_pointer(&ctx->destination_etag, g_free);
+  g_free(ctx);
+}
+
+static void
+marketplace_credential_context_free(MarketplaceCredentialContext *ctx)
+{
+  if (ctx == NULL) {
+    return;
+  }
+  g_clear_object(&ctx->self);
+  g_free(ctx);
+}
+
+static MarketplaceCredentialContext *
+marketplace_credential_context_new(PumpkinWindow *self)
+{
+  MarketplaceCredentialContext *ctx = g_new0(MarketplaceCredentialContext, 1);
+  ctx->self = g_object_ref(self);
+  ctx->generation = self->marketplace_credential_generation;
+  return ctx;
+}
+
+static gboolean
+marketplace_has_access_token(PumpkinWindow *self)
+{
+  return self != NULL && self->marketplace_access_token != NULL &&
+         *self->marketplace_access_token != '\0';
+}
+
+static void
+clear_marketplace_access_token(PumpkinWindow *self)
+{
+  if (self == NULL || self->marketplace_access_token == NULL) {
+    return;
+  }
+  memset(self->marketplace_access_token, 0, strlen(self->marketplace_access_token));
+  g_clear_pointer(&self->marketplace_access_token, g_free);
+}
+
+static void
+update_marketplace_account_button(PumpkinWindow *self)
+{
+  if (self == NULL || self->btn_marketplace_account == NULL) {
+    return;
+  }
+  gboolean connected = marketplace_has_access_token(self);
+  gtk_button_set_icon_name(self->btn_marketplace_account,
+                           connected ? "security-high-symbolic" : "dialog-password-symbolic");
+  if (connected) {
+    gtk_widget_add_css_class(GTK_WIDGET(self->btn_marketplace_account), "marketplace-connected-icon");
+  } else {
+    gtk_widget_remove_css_class(GTK_WIDGET(self->btn_marketplace_account), "marketplace-connected-icon");
+  }
+  gtk_widget_set_tooltip_text(GTK_WIDGET(self->btn_marketplace_account),
+                              connected ? "Marketplace API key connected"
+                                        : "Add Marketplace API key");
+}
+
+static void
+on_marketplace_credentials_loaded(GObject *source, GAsyncResult *res, gpointer user_data)
+{
+  (void)source;
+  MarketplaceCredentialContext *ctx = user_data;
+  PumpkinWindow *self = ctx->self;
+  g_autoptr(GError) error = NULL;
+  g_autofree char *token = pumpkin_marketplace_credentials_load_finish(res, &error);
+
+  if (error == NULL && token != NULL && *token != '\0' &&
+      ctx->generation == self->marketplace_credential_generation &&
+      !marketplace_has_access_token(self)) {
+    marketplace_validate_access_token_async(self, token);
+  }
+  marketplace_credential_context_free(ctx);
+}
+
+static void
+on_marketplace_credentials_stored(GObject *source, GAsyncResult *res, gpointer user_data)
+{
+  (void)source;
+  MarketplaceCredentialContext *ctx = user_data;
+  PumpkinWindow *self = ctx->self;
+  g_autoptr(GError) error = NULL;
+  gboolean stored = pumpkin_marketplace_credentials_store_finish(res, &error);
+
+  if (ctx->generation == self->marketplace_credential_generation && marketplace_has_access_token(self)) {
+    set_details_status(self,
+                       stored ? "Marketplace connected" : "Marketplace connected for this session",
+                       stored ? 3 : 6);
+  }
+  marketplace_credential_context_free(ctx);
+}
+
+static void
+on_marketplace_credentials_cleared(GObject *source, GAsyncResult *res, gpointer user_data)
+{
+  (void)source;
+  MarketplaceCredentialContext *ctx = user_data;
+  PumpkinWindow *self = ctx->self;
+  g_autoptr(GError) error = NULL;
+  gboolean cleared = pumpkin_marketplace_credentials_clear_finish(res, &error);
+
+  if (!cleared && ctx->generation == self->marketplace_credential_generation) {
+    set_details_status(self, "Marketplace disconnected; the saved key could not be removed from the system keyring", 6);
+  }
+  marketplace_credential_context_free(ctx);
+}
+
+static void
+on_marketplace_account_response(GObject *dialog, GAsyncResult *res, gpointer user_data)
+{
+  PumpkinWindow *self = PUMPKIN_WINDOW(user_data);
+  const char *response = adw_alert_dialog_choose_finish(ADW_ALERT_DIALOG(dialog), res);
+  if (self == NULL || response == NULL || g_strcmp0(response, "cancel") == 0) {
+    return;
+  }
+
+  if (g_strcmp0(response, "disconnect") == 0) {
+    self->marketplace_credential_generation++;
+    self->marketplace_key_validation_in_flight = FALSE;
+    clear_marketplace_access_token(self);
+    update_marketplace_account_button(self);
+    refresh_marketplace_view(self);
+    MarketplaceCredentialContext *ctx = marketplace_credential_context_new(self);
+    pumpkin_marketplace_credentials_clear_async(on_marketplace_credentials_cleared, ctx);
+    return;
+  }
+
+  GtkPasswordEntry *entry = g_object_get_data(dialog, "marketplace-token-entry");
+  const char *value = entry != NULL ? gtk_editable_get_text(GTK_EDITABLE(entry)) : NULL;
+  g_autofree char *token = g_strdup(value != NULL ? value : "");
+  g_strstrip(token);
+  if (*token == '\0') {
+    set_details_status(self, "Marketplace API key cannot be empty", 4);
+    return;
+  }
+  marketplace_validate_access_token_async(self, token);
+}
+
+static void
+on_marketplace_account_clicked(GtkButton *button, PumpkinWindow *self)
+{
+  (void)button;
+  if (self == NULL) {
+    return;
+  }
+
+  gboolean connected = marketplace_has_access_token(self);
+  AdwDialog *dialog = adw_alert_dialog_new(
+    connected ? "Marketplace" : "Connect Marketplace",
+    connected ? NULL : "Paste a newly created Marketplace API key.");
+  AdwAlertDialog *alert = ADW_ALERT_DIALOG(dialog);
+  adw_alert_dialog_add_response(alert, "cancel", "Cancel");
+  adw_alert_dialog_set_close_response(alert, "cancel");
+
+  if (connected) {
+    GtkWidget *status = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 8);
+    gtk_widget_set_halign(status, GTK_ALIGN_CENTER);
+    GtkWidget *icon = gtk_image_new_from_icon_name("security-high-symbolic");
+    gtk_widget_add_css_class(icon, "marketplace-connected-icon");
+    gtk_box_append(GTK_BOX(status), icon);
+    gtk_box_append(GTK_BOX(status), gtk_label_new("Connected"));
+    adw_alert_dialog_set_extra_child(alert, status);
+    adw_alert_dialog_add_response(alert, "disconnect", "Disconnect");
+    adw_alert_dialog_set_response_appearance(alert, "disconnect", ADW_RESPONSE_DESTRUCTIVE);
+    adw_alert_dialog_set_default_response(alert, "cancel");
+  } else {
+    GtkWidget *entry = gtk_password_entry_new();
+    gtk_widget_set_tooltip_text(entry, "Marketplace API key");
+    gtk_password_entry_set_show_peek_icon(GTK_PASSWORD_ENTRY(entry), TRUE);
+    adw_alert_dialog_set_extra_child(alert, entry);
+    g_object_set_data(G_OBJECT(dialog), "marketplace-token-entry", entry);
+    adw_alert_dialog_add_response(alert, "connect", "Connect");
+    adw_alert_dialog_set_default_response(alert, "connect");
+  }
+
+  adw_alert_dialog_choose(alert, GTK_WIDGET(self), NULL, on_marketplace_account_response, self);
+}
+
+static void
+market_fetch_context_free(MarketFetchContext *ctx)
+{
+  if (ctx == NULL) {
+    return;
+  }
+  g_clear_object(&ctx->self);
+  g_free(ctx);
+}
+
+static char *
+market_json_string(const cJSON *object, const char *field)
+{
+  const cJSON *value = cJSON_GetObjectItemCaseSensitive(object, field);
+  return cJSON_IsString(value) ? g_strdup(value->valuestring) : NULL;
+}
+
+static gint64
+market_json_integer(const cJSON *object, const char *field, gint64 fallback)
+{
+  const cJSON *value = cJSON_GetObjectItemCaseSensitive(object, field);
+  if (!cJSON_IsNumber(value) || !isfinite(value->valuedouble) ||
+      fabs(value->valuedouble) > 9007199254740991.0 ||
+      floor(value->valuedouble) != value->valuedouble) return fallback;
+  return (gint64)value->valuedouble;
+}
+
+static GPtrArray *
+market_parse_plugins_json(const char *json)
+{
+  g_autoptr(GPtrArray) plugins = g_ptr_array_new_with_free_func((GDestroyNotify)market_plugin_free);
+  g_autoptr(cJSON) root = json != NULL ? cJSON_ParseWithOpts(json, NULL, TRUE) : NULL;
+  if (!cJSON_IsArray(root)) return NULL;
+
+  const cJSON *object;
+  cJSON_ArrayForEach(object, root) {
+    if (!cJSON_IsObject(object)) continue;
+    MarketPlugin *plugin = g_new0(MarketPlugin, 1);
+    plugin->id = market_json_integer(object, "id", 0);
+    plugin->public_id = market_json_string(object, "public_id");
+    plugin->name = market_json_string(object, "name");
+    plugin->version = market_json_string(object, "version");
+    plugin->category = market_json_string(object, "category");
+    plugin->type = market_json_string(object, "type");
+    const cJSON *price = cJSON_GetObjectItemCaseSensitive(object, "price");
+    plugin->price = cJSON_IsNumber(price) && isfinite(price->valuedouble) ? price->valuedouble : 0.0;
+    plugin->downloads = market_json_integer(object, "downloads", 0);
+    plugin->views = market_json_integer(object, "views", -1);
+    plugin->dev_name = market_json_string(object, "dev_name");
+    plugin->preview_url = market_json_string(object, "preview_url");
+    plugin->created_at = market_json_string(object, "created_at");
+    plugin->updated_at = market_json_string(object, "updated_at");
+    plugin->name_key = normalized_key(plugin->name);
+    if (plugin->id > 0 && plugin->name != NULL && *plugin->name != '\0') {
+      g_ptr_array_add(plugins, plugin);
+    } else {
+      market_plugin_free(plugin);
+    }
+  }
+  return g_steal_pointer(&plugins);
+}
+
+static void
+marketplace_key_validation_context_free(MarketplaceKeyValidationContext *ctx)
+{
+  if (ctx == NULL) {
+    return;
+  }
+  g_clear_object(&ctx->self);
+  g_clear_object(&ctx->session);
+  g_clear_object(&ctx->message);
+  if (ctx->token != NULL) {
+    memset(ctx->token, 0, strlen(ctx->token));
+    g_clear_pointer(&ctx->token, g_free);
+  }
+  g_free(ctx);
+}
+
+static void
+marketplace_key_validation_complete(MarketplaceKeyValidationContext *ctx,
+                                    const char *failure_message)
+{
+  PumpkinWindow *self = ctx != NULL ? ctx->self : NULL;
+  if (self == NULL || ctx->generation != self->marketplace_credential_generation) {
+    marketplace_key_validation_context_free(ctx);
+    return;
+  }
+
+  self->marketplace_key_validation_in_flight = FALSE;
+  if (failure_message != NULL) {
+    set_details_status(self, failure_message, 4);
+    marketplace_key_validation_context_free(ctx);
+    return;
+  }
+
+  clear_marketplace_access_token(self);
+  self->marketplace_access_token = g_steal_pointer(&ctx->token);
+  update_marketplace_account_button(self);
+  refresh_marketplace_view(self);
+  MarketplaceCredentialContext *credential_ctx = marketplace_credential_context_new(self);
+  pumpkin_marketplace_credentials_store_async(self->marketplace_access_token,
+                                               on_marketplace_credentials_stored,
+                                               credential_ctx);
+  marketplace_key_validation_context_free(ctx);
+}
+
+static void
+on_marketplace_key_validation_done(GObject *source, GAsyncResult *res, gpointer user_data)
+{
+  MarketplaceKeyValidationContext *ctx = user_data;
+  g_autoptr(GError) error = NULL;
+  g_autoptr(GBytes) bytes = soup_session_send_and_read_finish(SOUP_SESSION(source), res, &error);
+  if (error != NULL || bytes == NULL) {
+    marketplace_key_validation_complete(ctx,
+      "Could not contact the Marketplace to validate the API key. It was not saved.");
+    return;
+  }
+  gsize size = 0;
+  const char *data = g_bytes_get_data(bytes, &size);
+  g_autofree char *body = g_strndup(data, size);
+  const char *failure = pumpkin_marketplace_auth_error(soup_message_get_status(ctx->message), body);
+  marketplace_key_validation_complete(ctx, failure);
+}
+
+static void
+marketplace_validate_access_token_async(PumpkinWindow *self, const char *token)
+{
+  if (self == NULL || token == NULL || *token == '\0') {
+    return;
+  }
+  if (!pumpkin_marketplace_auth_token_is_safe(token)) {
+    set_details_status(self, "Marketplace API key contains invalid characters or is too long. It was not saved.", 5);
+    return;
+  }
+  if (self->marketplace_key_validation_in_flight) {
+    set_details_status(self, "Marketplace API key validation is already in progress.", 3);
+    return;
+  }
+
+  self->marketplace_credential_generation++;
+  self->marketplace_key_validation_in_flight = TRUE;
+  MarketplaceKeyValidationContext *ctx = g_new0(MarketplaceKeyValidationContext, 1);
+  ctx->self = g_object_ref(self);
+  ctx->session = soup_session_new_with_options("user-agent", "Smashed Pumpkin", "timeout", 20, NULL);
+  ctx->token = g_strdup(token);
+  ctx->generation = self->marketplace_credential_generation;
+  /* This is the authenticated endpoint used by the Marketplace website,
+   * not the anonymous REST catalog or free plugin download endpoint. */
+  ctx->message = soup_message_new("GET", "https://market.pumpkinmc.org/api/user/me");
+  if (ctx->session == NULL || ctx->message == NULL) {
+    self->marketplace_key_validation_in_flight = FALSE;
+    marketplace_key_validation_context_free(ctx);
+    set_details_status(self, "Could not create the Marketplace API key validation request.", 4);
+    return;
+  }
+  soup_message_set_flags(ctx->message, SOUP_MESSAGE_NO_REDIRECT);
+  g_autofree char *authorization = g_strdup_printf("Bearer %s", token);
+  SoupMessageHeaders *headers = soup_message_get_request_headers(ctx->message);
+  soup_message_headers_replace(headers, "Authorization", authorization);
+  soup_message_headers_replace(headers, "Accept", "application/json");
+  set_details_status(self, "Validating Marketplace API key...", 0);
+  soup_session_send_and_read_async(ctx->session, ctx->message, G_PRIORITY_DEFAULT, NULL,
+                                   on_marketplace_key_validation_done, ctx);
+}
+
+static const char *
+market_type_from_dropdown(GtkDropDown *dropdown)
+{
+  if (dropdown == NULL) {
+    return NULL;
+  }
+  switch (gtk_drop_down_get_selected(dropdown)) {
+    case 1: return "free";
+    case 2: return "paid";
+    case 3: return "adwall";
+    default: return NULL;
+  }
+}
+
+static char *
+market_build_plugins_url(guint page,
+                         guint limit,
+                         const char *query,
+                         const char *category,
+                         const char *type)
+{
+  GString *url = g_string_new(MARKETPLACE_API_PLUGINS_URL);
+  g_string_append_printf(url, "?page=%u&limit=%u", page > 0 ? page : 1, limit > 0 ? limit : 25);
+  if (query != NULL && *query != '\0') {
+    g_autofree char *escaped = g_uri_escape_string(query, NULL, TRUE);
+    g_string_append_printf(url, "&q=%s", escaped);
+  }
+  if (category != NULL && *category != '\0') {
+    g_autofree char *escaped = g_uri_escape_string(category, NULL, TRUE);
+    g_string_append_printf(url, "&category=%s", escaped);
+  }
+  if (type != NULL && *type != '\0') {
+    g_autofree char *escaped = g_uri_escape_string(type, NULL, TRUE);
+    g_string_append_printf(url, "&type=%s", escaped);
+  }
+  return g_string_free(url, FALSE);
+}
+
+static gint
+compare_versions_simple(const char *left, const char *right)
+{
+  if (g_strcmp0(left, right) == 0) {
+    return 0;
+  }
+  if (left == NULL || *left == '\0') {
+    return -1;
+  }
+  if (right == NULL || *right == '\0') {
+    return 1;
+  }
+
+  g_auto(GStrv) left_parts = g_strsplit_set(left, ".-_+vV", -1);
+  g_auto(GStrv) right_parts = g_strsplit_set(right, ".-_+vV", -1);
+  for (guint i = 0;; i++) {
+    const char *lp = left_parts[i];
+    const char *rp = right_parts[i];
+    if ((lp == NULL || *lp == '\0') && (rp == NULL || *rp == '\0')) {
+      break;
+    }
+    if (lp == NULL || *lp == '\0') {
+      return -1;
+    }
+    if (rp == NULL || *rp == '\0') {
+      return 1;
+    }
+
+    gboolean left_numeric = TRUE;
+    gboolean right_numeric = TRUE;
+    for (const char *p = lp; *p != '\0'; p++) {
+      if (!g_ascii_isdigit(*p)) {
+        left_numeric = FALSE;
+        break;
+      }
+    }
+    for (const char *p = rp; *p != '\0'; p++) {
+      if (!g_ascii_isdigit(*p)) {
+        right_numeric = FALSE;
+        break;
+      }
+    }
+
+    if (left_numeric && right_numeric) {
+      gint64 li = g_ascii_strtoll(lp, NULL, 10);
+      gint64 ri = g_ascii_strtoll(rp, NULL, 10);
+      if (li < ri) {
+        return -1;
+      }
+      if (li > ri) {
+        return 1;
+      }
+      continue;
+    }
+
+    gint cmp = g_ascii_strcasecmp(lp, rp);
+    if (cmp != 0) {
+      return cmp < 0 ? -1 : 1;
+    }
+  }
+
+  return g_ascii_strcasecmp(left, right);
+}
+
+static const MarketPlugin *
+find_market_plugin_for_file(PumpkinWindow *self, const char *directory, const char *file)
+{
+  if (self == NULL || self->market_plugin_cache == NULL) {
+    return NULL;
+  }
+  g_autoptr(PumpkinPluginMetadata) metadata = pumpkin_plugin_store_lookup(directory, file);
+  if (metadata == NULL) {
+    return NULL;
+  }
+
+  for (guint i = 0; i < self->market_plugin_cache->len; i++) {
+    MarketPlugin *plugin = g_ptr_array_index(self->market_plugin_cache, i);
+    if (plugin != NULL && ((metadata->public_id != NULL && *metadata->public_id != '\0')
+                          ? g_strcmp0(plugin->public_id, metadata->public_id) == 0
+                          : plugin->id == metadata->id && metadata->id > 0)) {
+      return plugin;
+    }
+  }
+  return NULL;
+}
+
+static GtkWidget *
+create_market_badge(const char *label, const char *css_class)
+{
+  GtkWidget *badge = gtk_label_new(label);
+  gtk_widget_add_css_class(badge, "status-badge");
+  if (css_class != NULL && *css_class != '\0') {
+    gtk_widget_add_css_class(badge, css_class);
+  }
+  return badge;
+}
+
+static void
+plugin_runtime_issue_free(PluginRuntimeIssue *issue)
+{
+  if (issue == NULL) {
+    return;
+  }
+  g_clear_pointer(&issue->summary, g_free);
+  g_clear_pointer(&issue->detail, g_free);
+  g_free(issue);
+}
+
+static char *
+extract_quoted_plugin_name(const char *line, const char *prefix, const char *suffix)
+{
+  if (line == NULL || prefix == NULL || suffix == NULL) {
+    return NULL;
+  }
+
+  const char *start = strstr(line, prefix);
+  if (start == NULL) {
+    return NULL;
+  }
+  start += strlen(prefix);
+
+  const char *end = strstr(start, suffix);
+  if (end == NULL || end <= start) {
+    return NULL;
+  }
+
+  return g_strndup(start, end - start);
+}
+
+static char *
+extract_prefixed_plugin_name(const char *line, const char *prefix)
+{
+  if (line == NULL || prefix == NULL) {
+    return NULL;
+  }
+
+  const char *start = strstr(line, prefix);
+  if (start == NULL) {
+    return NULL;
+  }
+  start += strlen(prefix);
+
+  const char *end = strchr(start, ':');
+  if (end == NULL || end <= start) {
+    return NULL;
+  }
+
+  return g_strstrip(g_strndup(start, end - start));
+}
+
+static char *
+marketplace_metadata_value(const char *plugins_dir, const char *file_name, const char *key)
+{
+  if (plugins_dir == NULL || file_name == NULL || key == NULL) {
+    return NULL;
+  }
+
+  g_autoptr(PumpkinPluginMetadata) metadata = pumpkin_plugin_store_lookup(plugins_dir, file_name);
+  if (metadata == NULL) {
+    return NULL;
+  }
+  if (g_str_equal(key, "name")) return g_strdup(metadata->name);
+  if (g_str_equal(key, "version")) return g_strdup(metadata->version);
+  if (g_str_equal(key, "author")) return g_strdup(metadata->author);
+  if (g_str_equal(key, "public_id")) return g_strdup(metadata->public_id);
+  return NULL;
+}
+
+static char *
+plugin_name_from_sidecar(const char *plugins_dir, const char *file_name)
+{
+  if (plugins_dir == NULL || file_name == NULL) {
+    return NULL;
+  }
+
+  g_autofree char *marketplace_name = marketplace_metadata_value(plugins_dir, file_name, "name");
+  if (marketplace_name != NULL && *marketplace_name != '\0') {
+    return g_steal_pointer(&marketplace_name);
+  }
+
+  g_autofree char *clean = g_strdup(file_name);
+  if (g_str_has_suffix(clean, ".disabled")) {
+    clean[strlen(clean) - strlen(".disabled")] = '\0';
+  } else if (g_str_has_suffix(clean, ".deactivated")) {
+    clean[strlen(clean) - strlen(".deactivated")] = '\0';
+  }
+
+  g_autofree char *toml = g_strconcat(clean, ".toml", NULL);
+  g_autofree char *path = g_build_filename(plugins_dir, toml, NULL);
+  if (!g_file_test(path, G_FILE_TEST_EXISTS)) {
+    g_clear_pointer(&path, g_free);
+    path = g_build_filename(plugins_dir, "plugin.toml", NULL);
+  }
+  if (!g_file_test(path, G_FILE_TEST_EXISTS)) {
+    return NULL;
+  }
+
+  g_autofree char *contents = NULL;
+  if (!g_file_get_contents(path, &contents, NULL, NULL)) {
+    return NULL;
+  }
+
+  char *pos = strstr(contents, "name");
+  if (pos == NULL) {
+    return NULL;
+  }
+  char *quote = strchr(pos, '"');
+  if (quote == NULL) {
+    return NULL;
+  }
+  char *end = strchr(quote + 1, '"');
+  if (end == NULL) {
+    return NULL;
+  }
+  return g_strndup(quote + 1, end - quote - 1);
+}
+
+static char *
+plugin_display_name(const char *plugins_dir, const char *file_name)
+{
+  g_autofree char *from_sidecar = plugin_name_from_sidecar(plugins_dir, file_name);
+  if (from_sidecar != NULL && *from_sidecar != '\0') {
+    return g_steal_pointer(&from_sidecar);
+  }
+
+  g_autofree char *clean = g_strdup(file_name);
+  if (clean == NULL) {
+    return NULL;
+  }
+  if (g_str_has_suffix(clean, ".disabled")) {
+    clean[strlen(clean) - strlen(".disabled")] = '\0';
+  } else if (g_str_has_suffix(clean, ".deactivated")) {
+    clean[strlen(clean) - strlen(".deactivated")] = '\0';
+  }
+  if (g_str_has_suffix(clean, ".so")) {
+    clean[strlen(clean) - strlen(".so")] = '\0';
+  } else if (g_str_has_suffix(clean, ".wasm")) {
+    clean[strlen(clean) - strlen(".wasm")] = '\0';
+  }
+
+  char *dash = strrchr(clean, '-');
+  if (dash != NULL) {
+    gboolean likely_version = FALSE;
+    for (char *p = dash + 1; *p != '\0'; p++) {
+      if (g_ascii_isdigit(*p)) {
+        likely_version = TRUE;
+        continue;
+      }
+      if (*p != '.' && *p != '_' && *p != 'v') {
+        likely_version = FALSE;
+        break;
+      }
+    }
+    if (likely_version) {
+      *dash = '\0';
+    }
+  }
+
+  return g_steal_pointer(&clean);
+}
+
+static void
+market_cache_replace(PumpkinWindow *self, GPtrArray *plugins)
+{
+  if (self == NULL) {
+    return;
+  }
+  if (self->market_plugin_cache != NULL) {
+    g_ptr_array_unref(self->market_plugin_cache);
+    self->market_plugin_cache = NULL;
+  }
+  self->market_plugin_cache = plugins != NULL ? g_ptr_array_ref(plugins) : NULL;
+  self->market_cache_fetched_at = g_get_monotonic_time();
+  g_clear_pointer(&self->market_cache_error, g_free);
+}
+
+static gboolean
+market_cache_is_fresh(PumpkinWindow *self)
+{
+  if (self == NULL || self->market_cache_fetched_at <= 0) {
+    return FALSE;
+  }
+  if ((g_get_monotonic_time() - self->market_cache_fetched_at) >= MARKET_CACHE_STALE_USEC) {
+    return FALSE;
+  }
+  return self->market_plugin_cache != NULL || self->market_cache_error != NULL;
+}
+
+static void
+copy_plugin_sidecar_if_present(PumpkinWindow *self,
+                               const char *src_path,
+                               const char *dest_path,
+                               gboolean overwrite)
+{
+  if (src_path == NULL || dest_path == NULL) {
+    return;
+  }
+
+  g_autofree char *src_toml = g_strconcat(src_path, ".toml", NULL);
+  if (!g_file_test(src_toml, G_FILE_TEST_EXISTS)) {
+    return;
+  }
+
+  g_autofree char *dest_toml = g_strconcat(dest_path, ".toml", NULL);
+  g_autoptr(GFile) src_file = g_file_new_for_path(src_toml);
+  g_autoptr(GFile) dest_file = g_file_new_for_path(dest_toml);
+  GFileCopyFlags flags = overwrite ? G_FILE_COPY_OVERWRITE : G_FILE_COPY_NONE;
+  g_autoptr(GError) error = NULL;
+  if (!g_file_copy(src_file, dest_file, flags, NULL, NULL, NULL, &error) &&
+      error != NULL &&
+      error->code != G_IO_ERROR_EXISTS) {
+    append_log(self, error->message);
+  }
+}
+
+static void
 on_sponsor_pumpkin_clicked(GtkButton *button, PumpkinWindow *self)
 {
   (void)button;
-  open_uri_external(self, "https://github.com/sponsors/Snowiiii");
+  open_uri_external(self, "https://pumpkinmc.org/donate/");
+}
+
+static GtkWidget *
+create_marketplace_detail_line(const char *title, const char *value)
+{
+  GtkWidget *row = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 12);
+  GtkWidget *label = gtk_label_new(title);
+  GtkWidget *content = gtk_label_new(value != NULL && *value != '\0' ? value : "Unknown");
+  gtk_widget_set_hexpand(content, TRUE);
+  gtk_label_set_xalign(GTK_LABEL(label), 0.0);
+  gtk_label_set_xalign(GTK_LABEL(content), 1.0);
+  gtk_label_set_ellipsize(GTK_LABEL(content), PANGO_ELLIPSIZE_END);
+  gtk_widget_add_css_class(row, "market-detail-row");
+  gtk_widget_add_css_class(label, "dim-label");
+  gtk_box_append(GTK_BOX(row), label);
+  gtk_box_append(GTK_BOX(row), content);
+  return row;
+}
+
+static gboolean
+market_plugin_is_free(const MarketPlugin *plugin)
+{
+  return plugin != NULL && plugin->type != NULL &&
+         g_ascii_strcasecmp(plugin->type, "free") == 0;
+}
+
+static char *
+marketplace_display_date(const char *iso_date)
+{
+  if (iso_date == NULL || *iso_date == '\0') {
+    return g_strdup("Unknown");
+  }
+  g_autoptr(GDateTime) date = g_date_time_new_from_iso8601(iso_date, NULL);
+  return date != NULL ? g_date_time_format(date, "%d %b %Y") : g_strdup("Unknown");
+}
+
+static GtkWidget *
+create_market_meta_chip(const char *icon_name, const char *value)
+{
+  GtkWidget *chip = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 6);
+  GtkWidget *label = gtk_label_new(value);
+  gtk_widget_add_css_class(chip, "market-meta-chip");
+  gtk_widget_add_css_class(label, "dim-label");
+  GdkDisplay *display = gdk_display_get_default();
+  if (icon_name != NULL && display != NULL &&
+      gtk_icon_theme_has_icon(gtk_icon_theme_get_for_display(display), icon_name)) {
+    gtk_box_append(GTK_BOX(chip), gtk_image_new_from_icon_name(icon_name));
+  }
+  gtk_box_append(GTK_BOX(chip), label);
+  return chip;
+}
+
+static void
+market_preview_download_context_free(MarketPreviewDownloadContext *ctx)
+{
+  if (ctx == NULL) {
+    return;
+  }
+  g_clear_object(&ctx->self);
+  g_clear_object(&ctx->picture);
+  g_clear_pointer(&ctx->cache_key, g_free);
+  g_clear_pointer(&ctx->cache_path, g_free);
+  g_free(ctx);
+}
+
+static char *
+market_preview_cache_path(PumpkinWindow *self, const MarketPlugin *plugin, char **out_cache_key)
+{
+  if (self == NULL || plugin == NULL || plugin->preview_url == NULL || *plugin->preview_url == '\0') {
+    return NULL;
+  }
+
+  g_autofree char *cache_dir = cache_dir_for_config(self);
+  g_autofree char *preview_dir = g_build_filename(cache_dir, "marketplace-previews", NULL);
+  g_mkdir_with_parents(preview_dir, 0755);
+
+  g_autofree char *cache_key = g_compute_checksum_for_string(G_CHECKSUM_SHA256, plugin->preview_url, -1);
+  if (out_cache_key != NULL) {
+    *out_cache_key = g_strdup(cache_key);
+  }
+  return g_build_filename(preview_dir, cache_key, NULL);
+}
+
+static void
+on_market_preview_download_done(GObject *source, GAsyncResult *res, gpointer user_data)
+{
+  (void)source;
+  MarketPreviewDownloadContext *ctx = user_data;
+  if (ctx == NULL) {
+    return;
+  }
+
+  gboolean ok = pumpkin_download_file_finish(res, NULL);
+  if (ctx->self->market_preview_downloads != NULL && ctx->cache_key != NULL) {
+    g_hash_table_remove(ctx->self->market_preview_downloads, ctx->cache_key);
+  }
+
+  if (ok && ctx->picture != NULL && ctx->cache_path != NULL) {
+    g_autoptr(GError) error = NULL;
+    g_autoptr(GFile) file = g_file_new_for_path(ctx->cache_path);
+    g_autoptr(GdkTexture) texture = gdk_texture_new_from_file(file, &error);
+    if (texture != NULL) {
+      gtk_picture_set_paintable(ctx->picture, GDK_PAINTABLE(texture));
+    }
+  }
+
+  market_preview_download_context_free(ctx);
+}
+
+static void
+set_marketplace_preview_picture(PumpkinWindow *self, GtkPicture *picture, const MarketPlugin *plugin)
+{
+  if (picture == NULL) {
+    return;
+  }
+
+  gtk_picture_set_resource(picture,
+                           "/dev/rotstein/SmashedPumpkin/icons/hicolor/512x512/apps/dev.rotstein.SmashedPumpkin.png");
+  gtk_picture_set_can_shrink(picture, TRUE);
+  gtk_picture_set_content_fit(picture, GTK_CONTENT_FIT_COVER);
+
+  if (self == NULL || plugin == NULL || plugin->preview_url == NULL || *plugin->preview_url == '\0') {
+    return;
+  }
+
+  g_autofree char *cache_key = NULL;
+  g_autofree char *cache_path = market_preview_cache_path(self, plugin, &cache_key);
+  if (cache_path == NULL || cache_key == NULL) {
+    return;
+  }
+
+  if (g_file_test(cache_path, G_FILE_TEST_EXISTS)) {
+    g_autoptr(GError) error = NULL;
+    g_autoptr(GFile) file = g_file_new_for_path(cache_path);
+    g_autoptr(GdkTexture) texture = gdk_texture_new_from_file(file, &error);
+    if (texture != NULL) {
+      gtk_picture_set_paintable(picture, GDK_PAINTABLE(texture));
+      return;
+    }
+  }
+
+  if (self->market_preview_downloads != NULL &&
+      g_hash_table_contains(self->market_preview_downloads, cache_key)) {
+    return;
+  }
+  if (self->market_preview_downloads != NULL) {
+    g_hash_table_add(self->market_preview_downloads, g_strdup(cache_key));
+  }
+
+  MarketPreviewDownloadContext *ctx = g_new0(MarketPreviewDownloadContext, 1);
+  ctx->self = g_object_ref(self);
+  ctx->picture = g_object_ref(picture);
+  ctx->cache_key = g_strdup(cache_key);
+  ctx->cache_path = g_strdup(cache_path);
+
+  pumpkin_download_file_async(plugin->preview_url, cache_path, NULL, NULL, NULL,
+                              on_market_preview_download_done, ctx);
+}
+
+static gint
+market_plugin_compare_for_view(gconstpointer a, gconstpointer b, gpointer user_data)
+{
+  const MarketPlugin *left = *((const MarketPlugin * const *)a);
+  const MarketPlugin *right = *((const MarketPlugin * const *)b);
+  const PumpkinWindow *self = user_data;
+  guint sort_mode = self != NULL && self->marketplace_sort_dropdown != NULL
+                    ? gtk_drop_down_get_selected(self->marketplace_sort_dropdown)
+                    : 0;
+  gboolean ascending = self != NULL && self->btn_marketplace_sort_order != NULL
+                       ? gtk_toggle_button_get_active(self->btn_marketplace_sort_order)
+                       : FALSE;
+  gint result = 0;
+
+  switch (sort_mode) {
+    case 1:
+      if (left->downloads < right->downloads) result = -1;
+      else if (left->downloads > right->downloads) result = 1;
+      else result = g_ascii_strcasecmp(left->name, right->name);
+      break;
+    case 2:
+      result = g_strcmp0(left->created_at, right->created_at);
+      if (result == 0) {
+        result = g_ascii_strcasecmp(left->name, right->name);
+      }
+      break;
+    case 3:
+      result = g_strcmp0(left->updated_at, right->updated_at);
+      if (result == 0) {
+        result = g_ascii_strcasecmp(left->name, right->name);
+      }
+      break;
+    default:
+      result = g_ascii_strcasecmp(left->name, right->name);
+      break;
+  }
+
+  return ascending ? result : -result;
+}
+
+static char *
+find_installed_plugin_version_for_market(PumpkinWindow *self,
+                                         const MarketPlugin *plugin,
+                                         gboolean *out_installed,
+                                         guint64 *out_size,
+                                         GError **out_error)
+{
+  if (out_installed != NULL) *out_installed = FALSE;
+  if (out_size != NULL) *out_size = 0;
+  if (self == NULL || self->current == NULL || plugin == NULL) return NULL;
+
+  g_autofree char *directory = pumpkin_server_get_plugins_dir(self->current);
+  g_autoptr(GError) error = NULL;
+  g_autoptr(PumpkinPluginMetadata) metadata =
+    pumpkin_plugin_store_find(directory, plugin->id, plugin->public_id, &error);
+  if (error != NULL) {
+    if (out_installed != NULL) *out_installed = TRUE;
+    g_propagate_error(out_error, g_steal_pointer(&error));
+    return NULL;
+  }
+  if (metadata == NULL) return NULL;
+  if (out_installed != NULL) *out_installed = TRUE;
+  if (out_size != NULL) {
+    g_autofree char *path = g_build_filename(directory, metadata->file, NULL);
+    GStatBuf st;
+    if (g_stat(path, &st) == 0 && st.st_size > 0) *out_size = (guint64)st.st_size;
+  }
+  return metadata->version != NULL ? g_strdup(metadata->version)
+                                  : plugin_version_label(directory, metadata->file);
+}
+
+static char *
+marketplace_metadata_path_for_plugin_path(const char *plugin_path)
+{
+  if (plugin_path == NULL) {
+    return NULL;
+  }
+
+  g_autofree char *base = g_strdup(plugin_path);
+  if (g_str_has_suffix(base, ".disabled")) {
+    base[strlen(base) - strlen(".disabled")] = '\0';
+  } else if (g_str_has_suffix(base, ".deactivated")) {
+    base[strlen(base) - strlen(".deactivated")] = '\0';
+  }
+  return g_strconcat(base, ".marketplace", NULL);
+}
+
+static char *
+marketplace_install_destination(PumpkinWindow *self, const MarketPlugin *plugin, GError **error)
+{
+  if (self == NULL || self->current == NULL || plugin == NULL) return NULL;
+  g_autofree char *directory = pumpkin_server_get_plugins_dir(self->current);
+  if (!pumpkin_plugin_store_validate(directory, error)) return NULL;
+  if (plugin->public_id == NULL || *plugin->public_id == '\0') {
+    g_set_error_literal(error, G_IO_ERROR, G_IO_ERROR_INVALID_DATA,
+                        "Marketplace did not provide a stable public plugin ID.");
+    return NULL;
+  }
+  g_autoptr(PumpkinPluginMetadata) installed =
+    pumpkin_plugin_store_find(directory, plugin->id, plugin->public_id, error);
+  if (error != NULL && *error != NULL) return NULL;
+  if (installed != NULL) return g_build_filename(directory, installed->file, NULL);
+
+  g_autofree char *filename = g_strdup_printf("market-%" G_GINT64_FORMAT ".wasm", plugin->id);
+  char *path = g_build_filename(directory, filename, NULL);
+  if (g_file_test(path, G_FILE_TEST_EXISTS)) {
+    g_set_error_literal(error, G_IO_ERROR, G_IO_ERROR_EXISTS,
+                        "The destination belongs to another plugin. It was not overwritten.");
+    g_free(path);
+    return NULL;
+  }
+  return path;
+}
+
+static gboolean
+marketplace_download_is_wasm(const char *path)
+{
+  if (path == NULL) {
+    return FALSE;
+  }
+
+  unsigned char magic[4] = { 0 };
+  FILE *file = fopen(path, "rb");
+  if (file == NULL) {
+    return FALSE;
+  }
+  size_t read = fread(magic, 1, sizeof(magic), file);
+  fclose(file);
+  return read == sizeof(magic) && memcmp(magic, "\0asm", sizeof(magic)) == 0;
+}
+
+static gboolean
+marketplace_write_install_metadata(const char *path, const MarketPlugin *plugin, GError **error)
+{
+  if (path == NULL || plugin == NULL) {
+    g_set_error_literal(error, G_IO_ERROR, G_IO_ERROR_INVALID_ARGUMENT,
+                        "Missing Marketplace plugin metadata.");
+    return FALSE;
+  }
+
+  g_autoptr(GKeyFile) metadata = g_key_file_new();
+  g_key_file_set_int64(metadata, "marketplace", "id", plugin->id);
+  g_key_file_set_string(metadata, "marketplace", "public_id", plugin->public_id != NULL ? plugin->public_id : "");
+  g_key_file_set_string(metadata, "marketplace", "name", plugin->name != NULL ? plugin->name : "");
+  g_key_file_set_string(metadata, "marketplace", "version", plugin->version != NULL ? plugin->version : "");
+  g_key_file_set_string(metadata, "marketplace", "author", plugin->dev_name != NULL ? plugin->dev_name : "");
+  g_autofree char *data = g_key_file_to_data(metadata, NULL, NULL);
+  return g_file_set_contents_full(path, data, -1,
+                                  G_FILE_SET_CONTENTS_CONSISTENT,
+                                  0600, error);
+}
+
+static gboolean
+marketplace_replace_download(const char *tmp_path, const char *dest_path, GError **error)
+{
+  if (g_rename(tmp_path, dest_path) == 0) {
+    return TRUE;
+  }
+
+  /* Windows cannot always replace an existing open file with rename(). Keep a rollback copy. */
+  if (!g_file_test(dest_path, G_FILE_TEST_EXISTS)) {
+    g_set_error(error, G_IO_ERROR, G_IO_ERROR_FAILED, "Failed to install plugin: %s", g_strerror(errno));
+    return FALSE;
+  }
+
+  g_autofree char *uuid = g_uuid_string_random();
+  g_autofree char *backup_path = g_strdup_printf("%s.%s.previous", dest_path, uuid);
+  if (g_rename(dest_path, backup_path) != 0) {
+    g_set_error(error, G_IO_ERROR, G_IO_ERROR_FAILED, "Failed to prepare plugin update: %s", g_strerror(errno));
+    return FALSE;
+  }
+  if (g_rename(tmp_path, dest_path) == 0) {
+    g_remove(backup_path);
+    return TRUE;
+  }
+
+  int install_errno = errno;
+  g_rename(backup_path, dest_path);
+  g_set_error(error, G_IO_ERROR, G_IO_ERROR_FAILED,
+              "Failed to install plugin; the previous file was restored: %s", g_strerror(install_errno));
+  return FALSE;
+}
+
+static void
+on_market_install_download_done(GObject *source, GAsyncResult *res, gpointer user_data)
+{
+  (void)source;
+  MarketInstallContext *ctx = user_data;
+  if (ctx == NULL || ctx->self == NULL) {
+    market_install_context_free(ctx);
+    return;
+  }
+
+  PumpkinWindow *self = ctx->self;
+  g_autoptr(GError) error = NULL;
+  gboolean ok = pumpkin_download_file_finish(res, &error);
+  g_autofree char *directory = pumpkin_server_get_plugins_dir(ctx->server);
+  if (ok) {
+    ok = pumpkin_plugin_store_validate(directory, &error);
+  }
+  if (ok) {
+    g_autoptr(GFile) destination = g_file_new_for_path(ctx->dest_path);
+    g_autoptr(GError) query_error = NULL;
+    g_autoptr(GFileInfo) info = g_file_query_info(destination, G_FILE_ATTRIBUTE_ETAG_VALUE,
+                                               G_FILE_QUERY_INFO_NONE, NULL, &query_error);
+    if (query_error != NULL && !g_error_matches(query_error, G_IO_ERROR, G_IO_ERROR_NOT_FOUND)) {
+      g_propagate_error(&error, g_steal_pointer(&query_error));
+      ok = FALSE;
+    } else if (g_strcmp0(ctx->destination_etag, info != NULL ? g_file_info_get_etag(info) : NULL) != 0) {
+      g_set_error_literal(&error, G_IO_ERROR, G_IO_ERROR_WRONG_ETAG,
+                          "The installed plugin changed during the download. Retry after the other operation finishes.");
+      ok = FALSE;
+    }
+    if (ok) {
+      g_autoptr(PumpkinPluginMetadata) current = pumpkin_plugin_store_find(
+        directory, ctx->plugin->id, ctx->plugin->public_id, &error);
+      g_autofree char *expected_file = g_path_get_basename(ctx->dest_path);
+      if (error != NULL) {
+        ok = FALSE;
+      } else if ((current == NULL && info != NULL) ||
+                 (current != NULL && g_strcmp0(current->file, expected_file) != 0)) {
+        g_set_error_literal(&error, G_IO_ERROR, G_IO_ERROR_BUSY,
+                            "The plugin's file assignment changed during the download. Retry after the other operation finishes.");
+        ok = FALSE;
+      }
+    }
+  }
+  if (!ok || !marketplace_download_is_wasm(ctx->tmp_path) ||
+      !marketplace_replace_download(ctx->tmp_path, ctx->dest_path, &error)) {
+    if (ctx->tmp_path != NULL) {
+      g_remove(ctx->tmp_path);
+    }
+    const char *message = error != NULL ? error->message : "Marketplace returned an invalid WASM plugin.";
+    if (strstr(message, "HTTP status 401") != NULL) {
+      message = "The Marketplace rejected this anonymous free download. No API key was sent.";
+    } else if (strstr(message, "HTTP status 403") != NULL) {
+      message = "The Marketplace does not currently allow downloading this plugin.";
+    }
+    append_log(self, message);
+    set_details_status(self, message, 5);
+    if (ctx->button != NULL) {
+      gtk_widget_set_sensitive(GTK_WIDGET(ctx->button), TRUE);
+    }
+    self->marketplace_install_in_flight = FALSE;
+    refresh_marketplace_install_buttons(self);
+    refresh_marketplace_view(self);
+    market_install_context_free(ctx);
+    return;
+  }
+
+  g_autofree char *filename = g_path_get_basename(ctx->dest_path);
+  PumpkinPluginMetadata metadata = {
+    .id = ctx->plugin->id,
+    .public_id = ctx->plugin->public_id,
+    .name = ctx->plugin->name,
+    .author = ctx->plugin->dev_name,
+    .version = ctx->plugin->version,
+    .file = filename,
+    .updated_at = ctx->plugin->updated_at,
+  };
+  gboolean metadata_ok = pumpkin_plugin_store_record(directory, &metadata, &error);
+  if (metadata_ok) {
+    metadata_ok = marketplace_write_install_metadata(ctx->metadata_path, ctx->plugin, &error);
+  }
+  if (!metadata_ok) {
+    append_log(self, error->message);
+  }
+
+  self->marketplace_install_in_flight = FALSE;
+  refresh_plugin_list(self);
+  refresh_marketplace_install_buttons(self);
+  refresh_marketplace_view(self);
+  gboolean restart_required = server_is_running_ui(self, ctx->server);
+  g_autofree char *message = g_strdup_printf("Installed %s%s%s%s",
+                                              ctx->plugin->name,
+                                              ctx->plugin->version != NULL && *ctx->plugin->version != '\0' ? " v" : "",
+                                              ctx->plugin->version != NULL ? ctx->plugin->version : "",
+                                              restart_required ? "; restart the server to use it" : "");
+  append_log(self, message);
+  if (metadata_ok) {
+    set_details_status(self, message, 4);
+  } else {
+    g_autofree char *warning = g_strdup_printf("%s; plugin metadata could not be saved: %s", message, error->message);
+    set_details_status(self, warning, 8);
+  }
+  if (ctx->button != NULL) {
+    gtk_button_set_label(ctx->button, "Installed");
+  }
+  market_install_context_free(ctx);
+}
+
+static void
+on_market_install_clicked(GtkButton *button, PumpkinWindow *self)
+{
+  MarketPlugin *plugin = button != NULL ? g_object_get_data(G_OBJECT(button), "market-plugin-copy") : NULL;
+  if (self == NULL || plugin == NULL || self->current == NULL) {
+    if (self != NULL) {
+      set_details_status(self, "Select a server before installing a plugin", 4);
+    }
+    return;
+  }
+  if (!market_plugin_is_free(plugin)) {
+    set_details_status(self, "Only free Marketplace plugins can be installed for now", 5);
+    return;
+  }
+  if (self->marketplace_install_in_flight) {
+    return;
+  }
+  MarketInstallContext *ctx = g_new0(MarketInstallContext, 1);
+  ctx->self = g_object_ref(self);
+  ctx->server = g_object_ref(self->current);
+  ctx->plugin = market_plugin_clone(plugin);
+  ctx->button = g_object_ref(button);
+  g_autoptr(GError) destination_error = NULL;
+  ctx->dest_path = marketplace_install_destination(self, plugin, &destination_error);
+  if (ctx->dest_path == NULL) {
+    market_install_context_free(ctx);
+    set_details_status(self, destination_error != NULL ? destination_error->message
+                                                     : "Could not prepare Marketplace installation", 5);
+    return;
+  }
+  g_autoptr(GFile) destination = g_file_new_for_path(ctx->dest_path);
+  g_autoptr(GFileInfo) info = g_file_query_info(destination, G_FILE_ATTRIBUTE_ETAG_VALUE,
+                                             G_FILE_QUERY_INFO_NONE, NULL, &destination_error);
+  if (destination_error != NULL && !g_error_matches(destination_error, G_IO_ERROR, G_IO_ERROR_NOT_FOUND)) {
+    set_details_status(self, destination_error->message, 5);
+    market_install_context_free(ctx);
+    return;
+  }
+  ctx->destination_etag = info != NULL ? g_strdup(g_file_info_get_etag(info)) : NULL;
+  g_autofree char *download_id = g_uuid_string_random();
+  ctx->tmp_path = g_strdup_printf("%s.%s.download", ctx->dest_path, download_id);
+  ctx->metadata_path = marketplace_metadata_path_for_plugin_path(ctx->dest_path);
+  if (ctx->tmp_path == NULL || ctx->metadata_path == NULL) {
+    market_install_context_free(ctx);
+    set_details_status(self, "Could not prepare Marketplace installation", 4);
+    return;
+  }
+
+  g_autofree char *url = g_strdup_printf("%s/%" G_GINT64_FORMAT "/download",
+                                          MARKETPLACE_API_DOWNLOAD_URL, plugin->id);
+  self->marketplace_install_in_flight = TRUE;
+  gtk_widget_set_sensitive(GTK_WIDGET(button), FALSE);
+  refresh_marketplace_install_buttons(self);
+  refresh_marketplace_view(self);
+  set_details_status(self, "Downloading Marketplace plugin…", 0);
+  pumpkin_download_file_authorized_async(url, ctx->tmp_path, NULL, NULL, NULL, NULL,
+                                         on_market_install_download_done, ctx);
+}
+
+static void
+update_marketplace_install_button(PumpkinWindow *self, GtkButton *button, const MarketPlugin *plugin)
+{
+  gboolean installed = FALSE;
+  g_autoptr(GError) metadata_error = NULL;
+  g_autofree char *local_version = find_installed_plugin_version_for_market(self, plugin,
+                                                                              &installed, NULL, &metadata_error);
+  gboolean has_update = installed && plugin->version != NULL && *plugin->version != '\0' &&
+                        compare_versions_simple(local_version, plugin->version) < 0;
+  gtk_button_set_label(button, !market_plugin_is_free(plugin) ? "Unavailable" :
+                               has_update ? "Update" : installed ? "Installed" : "Install");
+  gtk_widget_remove_css_class(GTK_WIDGET(button), "market-install-button");
+  gtk_widget_remove_css_class(GTK_WIDGET(button), "market-update-button");
+  gtk_widget_add_css_class(GTK_WIDGET(button), has_update ? "market-update-button" : "market-install-button");
+  gboolean available = market_plugin_is_free(plugin) && self->current != NULL &&
+                       !self->marketplace_install_in_flight && !installed;
+  if (has_update) {
+    available = market_plugin_is_free(plugin) && self->current != NULL &&
+                !self->marketplace_install_in_flight;
+  }
+  gtk_widget_set_sensitive(GTK_WIDGET(button), available && metadata_error == NULL);
+  gtk_widget_set_tooltip_text(GTK_WIDGET(button), NULL);
+  if (metadata_error != NULL) {
+    gtk_widget_set_tooltip_text(GTK_WIDGET(button), metadata_error->message);
+  } else if (!market_plugin_is_free(plugin)) {
+    gtk_widget_set_tooltip_text(GTK_WIDGET(button), "Only free plugins are available for installation");
+  } else if (installed && !has_update) {
+    gtk_widget_set_tooltip_text(GTK_WIDGET(button), "Already installed");
+  } else if (self->current == NULL) {
+    gtk_widget_set_tooltip_text(GTK_WIDGET(button), "Select a server to install plugins");
+  }
+}
+
+static void
+refresh_marketplace_install_buttons(PumpkinWindow *self)
+{
+  if (self == NULL || self->marketplace_list == NULL) {
+    return;
+  }
+  for (GtkWidget *row = gtk_widget_get_first_child(GTK_WIDGET(self->marketplace_list));
+       row != NULL; row = gtk_widget_get_next_sibling(row)) {
+    GtkWidget *outer = gtk_list_box_row_get_child(GTK_LIST_BOX_ROW(row));
+    GtkWidget *button = outer != NULL ? gtk_widget_get_last_child(outer) : NULL;
+    MarketPlugin *plugin = button != NULL ? g_object_get_data(G_OBJECT(button), "market-plugin-copy") : NULL;
+    if (plugin != NULL && GTK_IS_BUTTON(button)) {
+      update_marketplace_install_button(self, GTK_BUTTON(button), plugin);
+    }
+  }
+}
+
+static GtkWidget *
+create_marketplace_install_button(PumpkinWindow *self, const MarketPlugin *plugin)
+{
+  GtkWidget *button = gtk_button_new();
+  apply_compact_button(button);
+  g_object_set_data_full(G_OBJECT(button), "market-plugin-copy", market_plugin_clone(plugin),
+                         (GDestroyNotify)market_plugin_free);
+  g_signal_connect(button, "clicked", G_CALLBACK(on_market_install_clicked), self);
+  update_marketplace_install_button(self, GTK_BUTTON(button), plugin);
+  return button;
+}
+
+static GtkWidget *
+create_marketplace_row(PumpkinWindow *self, MarketPlugin *plugin,
+                       const PluginRuntimeIssue *runtime_issue)
+{
+  GtkWidget *row = gtk_list_box_row_new();
+  GtkWidget *outer = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 10);
+  GtkWidget *open = gtk_button_new();
+  GtkWidget *open_content = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 10);
+  gtk_button_set_can_shrink(GTK_BUTTON(open), TRUE);
+  gtk_widget_set_hexpand(open, TRUE);
+  gtk_widget_add_css_class(open, "flat");
+  gtk_widget_add_css_class(open, "market-open-button");
+  gtk_widget_set_tooltip_text(open, "View plugin details");
+  GtkWidget *preview_shell = gtk_aspect_frame_new(0.5f, 0.5f, 1.0f, FALSE);
+  GtkWidget *preview = gtk_picture_new();
+  GtkWidget *box = gtk_box_new(GTK_ORIENTATION_VERTICAL, 8);
+  gtk_widget_set_margin_top(box, 10);
+  gtk_widget_set_margin_bottom(box, 10);
+  gtk_widget_set_margin_end(box, 10);
+  gtk_widget_set_margin_top(preview_shell, 10);
+  gtk_widget_set_margin_bottom(preview_shell, 10);
+  gtk_widget_set_margin_start(preview_shell, 10);
+  gtk_widget_set_halign(preview_shell, GTK_ALIGN_START);
+  gtk_widget_set_valign(preview_shell, GTK_ALIGN_START);
+  gtk_widget_set_size_request(preview_shell, 72, 72);
+  gtk_widget_set_overflow(preview_shell, GTK_OVERFLOW_HIDDEN);
+  gtk_widget_add_css_class(preview_shell, "market-preview");
+  gtk_widget_set_size_request(preview, 72, 72);
+  set_marketplace_preview_picture(self, GTK_PICTURE(preview), plugin);
+  gtk_aspect_frame_set_child(GTK_ASPECT_FRAME(preview_shell), preview);
+
+  GtkWidget *title_row = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 8);
+  GtkWidget *title = gtk_label_new(plugin->name);
+  gtk_widget_set_hexpand(title, TRUE);
+  gtk_label_set_ellipsize(GTK_LABEL(title), PANGO_ELLIPSIZE_END);
+  gtk_widget_set_tooltip_text(title, plugin->name);
+  gtk_label_set_xalign(GTK_LABEL(title), 0.0);
+  gtk_widget_add_css_class(title, "title-4");
+  gtk_box_append(GTK_BOX(title_row), title);
+
+  if (plugin->type != NULL &&
+      *plugin->type != '\0' &&
+      g_strcmp0(plugin->type, "free") != 0) {
+    gtk_box_append(GTK_BOX(title_row), create_market_badge(plugin->type, NULL));
+  }
+  if (runtime_issue != NULL) {
+    gtk_box_append(GTK_BOX(title_row),
+                   create_market_badge(runtime_issue->summary, "warning-badge"));
+  }
+
+  GtkWidget *subtitle = gtk_label_new(NULL);
+  g_autofree char *subtitle_text = g_strdup_printf("%s%s%s",
+                                                   plugin->dev_name != NULL ? plugin->dev_name : "Unknown author",
+                                                   plugin->category != NULL && *plugin->category != '\0' ? " · " : "",
+                                                   plugin->category != NULL ? plugin->category : "");
+  gtk_label_set_text(GTK_LABEL(subtitle), subtitle_text);
+  gtk_label_set_xalign(GTK_LABEL(subtitle), 0.0);
+  gtk_label_set_ellipsize(GTK_LABEL(subtitle), PANGO_ELLIPSIZE_END);
+  gtk_widget_add_css_class(subtitle, "dim-label");
+
+  GtkWidget *meta = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 8);
+  g_autofree char *downloads = g_strdup_printf("%lld", (long long)plugin->downloads);
+  gtk_box_append(GTK_BOX(meta), create_market_meta_chip("folder-download-symbolic", downloads));
+  if (plugin->views >= 0) {
+    g_autofree char *views = g_strdup_printf("%lld", (long long)plugin->views);
+    gtk_box_append(GTK_BOX(meta), create_market_meta_chip("view-reveal-symbolic", views));
+  }
+  if (plugin->version != NULL && *plugin->version != '\0') {
+    g_autofree char *version = g_strdup_printf("v%s", plugin->version);
+    gtk_box_append(GTK_BOX(meta), create_market_meta_chip("package-x-generic-symbolic", version));
+  }
+
+  guint64 installed_size = 0;
+  g_autofree char *local_version = find_installed_plugin_version_for_market(self, plugin,
+                                                                              NULL, &installed_size, NULL);
+  if (installed_size > 0) {
+    g_autofree char *size = g_format_size_full(installed_size, G_FORMAT_SIZE_IEC_UNITS);
+    gtk_box_append(GTK_BOX(meta), create_market_meta_chip("drive-harddisk-symbolic", size));
+  }
+  GtkWidget *install = create_marketplace_install_button(self, plugin);
+  gtk_widget_set_valign(install, GTK_ALIGN_CENTER);
+
+  gtk_box_append(GTK_BOX(open_content), preview_shell);
+  gtk_widget_set_hexpand(box, TRUE);
+  gtk_box_append(GTK_BOX(box), title_row);
+  gtk_box_append(GTK_BOX(box), subtitle);
+  gtk_box_append(GTK_BOX(box), meta);
+  gtk_box_append(GTK_BOX(open_content), box);
+  gtk_button_set_child(GTK_BUTTON(open), open_content);
+  g_object_set_data_full(G_OBJECT(open), "market-plugin-copy", market_plugin_clone(plugin),
+                         (GDestroyNotify)market_plugin_free);
+  g_signal_connect(open, "clicked", G_CALLBACK(on_marketplace_preview_clicked), self);
+  gtk_box_append(GTK_BOX(outer), open);
+  gtk_box_append(GTK_BOX(outer), install);
+  gtk_list_box_row_set_child(GTK_LIST_BOX_ROW(row), outer);
+  gtk_list_box_row_set_activatable(GTK_LIST_BOX_ROW(row), FALSE);
+  gtk_list_box_row_set_selectable(GTK_LIST_BOX_ROW(row), FALSE);
+  return row;
+}
+
+static void
+on_marketplace_close_clicked(GtkButton *button, AdwDialog *dialog)
+{
+  (void)button;
+  if (dialog == NULL) {
+    return;
+  }
+  adw_dialog_close(dialog);
+}
+
+static gboolean
+widget_is_descendant_of(GtkWidget *widget, GtkWidget *ancestor)
+{
+  for (GtkWidget *current = widget; current != NULL; current = gtk_widget_get_parent(current)) {
+    if (current == ancestor) {
+      return TRUE;
+    }
+  }
+  return FALSE;
+}
+
+static void
+on_marketplace_details_backdrop_pressed(GtkGestureClick *gesture,
+                                        int n_press,
+                                        double x,
+                                        double y,
+                                        GtkWidget *content)
+{
+  if (n_press != 1 || content == NULL) {
+    return;
+  }
+
+  GtkWidget *dialog_widget = gtk_event_controller_get_widget(GTK_EVENT_CONTROLLER(gesture));
+  if (!ADW_IS_DIALOG(dialog_widget)) {
+    return;
+  }
+  GtkWidget *target = gtk_widget_pick(dialog_widget, x, y, GTK_PICK_DEFAULT);
+  if (widget_is_descendant_of(target, content)) {
+    return;
+  }
+
+  gtk_gesture_set_state(GTK_GESTURE(gesture), GTK_EVENT_SEQUENCE_CLAIMED);
+  adw_dialog_close(ADW_DIALOG(dialog_widget));
+}
+
+static void
+open_marketplace_details_dialog(PumpkinWindow *self, const MarketPlugin *plugin)
+{
+  if (self == NULL || plugin == NULL) {
+    return;
+  }
+
+  AdwDialog *dialog = g_object_new(ADW_TYPE_DIALOG, NULL);
+  gtk_widget_set_size_request(GTK_WIDGET(dialog), 360, 300);
+  adw_dialog_set_title(dialog, plugin->name != NULL ? plugin->name : "Marketplace Plugin");
+  adw_dialog_set_content_width(dialog, 720);
+  adw_dialog_set_content_height(dialog, 480);
+  adw_dialog_set_can_close(dialog, TRUE);
+  adw_dialog_set_follows_content_size(dialog, FALSE);
+
+  GtkWidget *root = gtk_box_new(GTK_ORIENTATION_VERTICAL, 18);
+  gtk_widget_add_css_class(root, "market-detail-page");
+  gtk_widget_set_margin_top(root, 20);
+  gtk_widget_set_margin_bottom(root, 20);
+  gtk_widget_set_margin_start(root, 20);
+  gtk_widget_set_margin_end(root, 20);
+
+  GtkWidget *hero = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 16);
+  GtkWidget *preview_shell = gtk_aspect_frame_new(0.5f, 0.5f, 1.0f, FALSE);
+  GtkWidget *preview = gtk_picture_new();
+  gtk_widget_set_size_request(preview_shell, 96, 96);
+  gtk_widget_set_halign(preview_shell, GTK_ALIGN_START);
+  gtk_widget_set_valign(preview_shell, GTK_ALIGN_START);
+  gtk_widget_set_overflow(preview_shell, GTK_OVERFLOW_HIDDEN);
+  gtk_widget_add_css_class(preview_shell, "market-preview-large");
+  set_marketplace_preview_picture(self, GTK_PICTURE(preview), plugin);
+  gtk_aspect_frame_set_child(GTK_ASPECT_FRAME(preview_shell), preview);
+  gtk_box_append(GTK_BOX(hero), preview_shell);
+
+  GtkWidget *identity = gtk_box_new(GTK_ORIENTATION_VERTICAL, 5);
+  gtk_widget_set_hexpand(identity, TRUE);
+  GtkWidget *headline = gtk_label_new(plugin->name);
+  gtk_label_set_xalign(GTK_LABEL(headline), 0.0);
+  gtk_label_set_ellipsize(GTK_LABEL(headline), PANGO_ELLIPSIZE_END);
+  gtk_widget_add_css_class(headline, "title-1");
+  gtk_box_append(GTK_BOX(identity), headline);
+  g_autofree char *byline = g_strdup_printf("by %s", plugin->dev_name != NULL ? plugin->dev_name : "Unknown author");
+  GtkWidget *author = gtk_label_new(byline);
+  gtk_label_set_xalign(GTK_LABEL(author), 0.0);
+  gtk_widget_add_css_class(author, "dim-label");
+  gtk_box_append(GTK_BOX(identity), author);
+  if (!market_plugin_is_free(plugin) && plugin->type != NULL) {
+    GtkWidget *badge = create_market_badge(plugin->type, NULL);
+    gtk_widget_set_halign(badge, GTK_ALIGN_START);
+    gtk_box_append(GTK_BOX(identity), badge);
+  }
+  g_autoptr(GHashTable) runtime_issues = collect_plugin_runtime_issues(self);
+  g_autofree char *plugin_key = normalized_key(plugin->name);
+  PluginRuntimeIssue *runtime_issue = plugin_key != NULL
+                                       ? g_hash_table_lookup(runtime_issues, plugin_key)
+                                       : NULL;
+  if (runtime_issue != NULL) {
+    GtkWidget *badge = create_market_badge(runtime_issue->summary, "warning-badge");
+    gtk_widget_set_halign(badge, GTK_ALIGN_START);
+    gtk_box_append(GTK_BOX(identity), badge);
+  }
+  gtk_box_append(GTK_BOX(hero), identity);
+  gtk_box_append(GTK_BOX(root), hero);
+
+  GtkWidget *metrics = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 8);
+  gtk_widget_add_css_class(metrics, "market-detail-metrics");
+  g_autofree char *downloads = g_strdup_printf("%lld", (long long)plugin->downloads);
+  gtk_box_append(GTK_BOX(metrics), create_market_meta_chip("folder-download-symbolic", downloads));
+  if (plugin->views >= 0) {
+    g_autofree char *views = g_strdup_printf("%lld", (long long)plugin->views);
+    gtk_box_append(GTK_BOX(metrics), create_market_meta_chip("view-reveal-symbolic", views));
+  }
+  if (plugin->category != NULL && *plugin->category != '\0') {
+    gtk_box_append(GTK_BOX(metrics), create_market_meta_chip("folder-symbolic", plugin->category));
+  }
+  gtk_box_append(GTK_BOX(root), metrics);
+
+  GtkWidget *body = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 14);
+  gtk_widget_set_vexpand(body, TRUE);
+  GtkWidget *overview = gtk_box_new(GTK_ORIENTATION_VERTICAL, 10);
+  gtk_widget_set_hexpand(overview, TRUE);
+  gtk_widget_add_css_class(overview, "market-detail-card");
+  GtkWidget *overview_title = gtk_label_new("Overview");
+  gtk_label_set_xalign(GTK_LABEL(overview_title), 0.0);
+  gtk_widget_add_css_class(overview_title, "title-3");
+  gtk_box_append(GTK_BOX(overview), overview_title);
+  GtkWidget *overview_text = gtk_label_new("A description and screenshots are not available from the Marketplace API yet.");
+  gtk_label_set_wrap(GTK_LABEL(overview_text), TRUE);
+  gtk_label_set_xalign(GTK_LABEL(overview_text), 0.0);
+  gtk_widget_add_css_class(overview_text, "dim-label");
+  gtk_box_append(GTK_BOX(overview), overview_text);
+  gtk_box_append(GTK_BOX(body), overview);
+
+  GtkWidget *details = gtk_box_new(GTK_ORIENTATION_VERTICAL, 4);
+  gtk_widget_set_size_request(details, 230, -1);
+  gtk_widget_add_css_class(details, "market-detail-card");
+  GtkWidget *details_title = gtk_label_new("Details");
+  gtk_label_set_xalign(GTK_LABEL(details_title), 0.0);
+  gtk_widget_add_css_class(details_title, "title-3");
+  gtk_box_append(GTK_BOX(details), details_title);
+  gtk_box_append(GTK_BOX(details), create_marketplace_detail_line("Version", plugin->version));
+  g_autofree char *created = marketplace_display_date(plugin->created_at);
+  g_autofree char *updated = marketplace_display_date(plugin->updated_at);
+  gtk_box_append(GTK_BOX(details), create_marketplace_detail_line("Added", created));
+  gtk_box_append(GTK_BOX(details), create_marketplace_detail_line("Updated", updated));
+  gtk_box_append(GTK_BOX(body), details);
+  gtk_box_append(GTK_BOX(root), body);
+
+  GtkWidget *footer = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 8);
+  GtkWidget *install = create_marketplace_install_button(self, plugin);
+  GtkWidget *close = gtk_button_new_with_label("Close");
+  apply_compact_button(close);
+  g_signal_connect(close, "clicked", G_CALLBACK(on_marketplace_close_clicked), dialog);
+
+  GtkWidget *footer_spacer = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 0);
+  gtk_widget_set_hexpand(footer_spacer, TRUE);
+  gtk_box_append(GTK_BOX(footer), footer_spacer);
+  gtk_box_append(GTK_BOX(footer), install);
+  gtk_box_append(GTK_BOX(footer), close);
+
+  gtk_box_append(GTK_BOX(root), footer);
+  GtkWidget *scroller = gtk_scrolled_window_new();
+  gtk_scrolled_window_set_policy(GTK_SCROLLED_WINDOW(scroller), GTK_POLICY_NEVER, GTK_POLICY_AUTOMATIC);
+  gtk_scrolled_window_set_child(GTK_SCROLLED_WINDOW(scroller), root);
+  adw_dialog_set_child(dialog, scroller);
+  AdwBreakpoint *compact = adw_breakpoint_new(
+    adw_breakpoint_condition_new_length(ADW_BREAKPOINT_CONDITION_MAX_WIDTH, 520, ADW_LENGTH_UNIT_SP));
+  adw_breakpoint_add_setters(compact,
+                             G_OBJECT(hero), "orientation", GTK_ORIENTATION_VERTICAL,
+                             G_OBJECT(body), "orientation", GTK_ORIENTATION_VERTICAL,
+                             G_OBJECT(details), "width-request", -1,
+                             G_OBJECT(root), "margin-start", 12,
+                             G_OBJECT(root), "margin-end", 12,
+                             NULL);
+  adw_dialog_add_breakpoint(dialog, compact);
+  GtkGestureClick *backdrop_click = GTK_GESTURE_CLICK(gtk_gesture_click_new());
+  gtk_event_controller_set_propagation_phase(GTK_EVENT_CONTROLLER(backdrop_click), GTK_PHASE_CAPTURE);
+  g_signal_connect(backdrop_click, "pressed",
+                   G_CALLBACK(on_marketplace_details_backdrop_pressed), root);
+  gtk_widget_add_controller(GTK_WIDGET(dialog), GTK_EVENT_CONTROLLER(backdrop_click));
+  adw_dialog_present(dialog, GTK_WIDGET(self));
+}
+
+static void
+on_marketplace_preview_clicked(GtkButton *button, PumpkinWindow *self)
+{
+  if (self == NULL || button == NULL) {
+    return;
+  }
+  MarketPlugin *plugin = g_object_get_data(G_OBJECT(button), "market-plugin-copy");
+  if (plugin == NULL) {
+    return;
+  }
+  open_marketplace_details_dialog(self, plugin);
+}
+
+static void
+update_marketplace_view_controls(PumpkinWindow *self, guint results_len)
+{
+  if (self == NULL) {
+    return;
+  }
+  if (self->btn_marketplace_prev != NULL) {
+    gtk_widget_set_sensitive(GTK_WIDGET(self->btn_marketplace_prev),
+                             self->market_page > 1 && !self->marketplace_loading);
+  }
+  if (self->btn_marketplace_next != NULL) {
+    gtk_widget_set_sensitive(GTK_WIDGET(self->btn_marketplace_next),
+                             !self->marketplace_loading && results_len >= self->market_limit);
+  }
+  if (self->marketplace_spinner != NULL) {
+    gtk_widget_set_visible(GTK_WIDGET(self->marketplace_spinner), self->marketplace_loading);
+    if (self->marketplace_loading) {
+      gtk_spinner_start(self->marketplace_spinner);
+    } else {
+      gtk_spinner_stop(self->marketplace_spinner);
+    }
+  }
+  if (self->btn_marketplace_retry != NULL) {
+    gtk_widget_set_visible(GTK_WIDGET(self->btn_marketplace_retry),
+                           (self->marketplace_load_failed && !self->marketplace_loading) ||
+                           pumpkin_refresh_button_is_animating(self->btn_marketplace_retry));
+  }
+}
+
+static void
+show_marketplace_load_error(PumpkinWindow *self, const char *message)
+{
+  self->marketplace_loading = FALSE;
+  self->marketplace_load_failed = TRUE;
+  gtk_label_set_text(self->marketplace_status_label, "Failed to load Marketplace plugins.");
+  gtk_widget_set_tooltip_text(GTK_WIDGET(self->marketplace_status_label), message);
+  update_marketplace_view_controls(self, 0);
+  append_log(self, message);
+}
+
+static void
+render_marketplace_view(PumpkinWindow *self, GPtrArray *plugins)
+{
+  if (self == NULL || self->marketplace_list == NULL) {
+    return;
+  }
+
+  if (plugins != NULL && plugins->len > 1) {
+    g_ptr_array_sort_with_data(plugins, market_plugin_compare_for_view, self);
+  }
+
+  clear_list_box(self->marketplace_list);
+  g_autoptr(GHashTable) runtime_issues = collect_plugin_runtime_issues(self);
+  guint count = plugins != NULL ? plugins->len : 0;
+  for (guint i = 0; i < count; i++) {
+    MarketPlugin *plugin = g_ptr_array_index(plugins, i);
+    if (plugin != NULL) {
+      g_autofree char *plugin_key = normalized_key(plugin->name);
+      PluginRuntimeIssue *runtime_issue = plugin_key != NULL
+                                           ? g_hash_table_lookup(runtime_issues, plugin_key)
+                                           : NULL;
+      GtkWidget *row = create_marketplace_row(self, plugin, runtime_issue);
+      if ((i % 2) == 1) {
+        gtk_widget_add_css_class(row, "market-row-alt");
+      }
+      gtk_list_box_append(self->marketplace_list, row);
+    }
+  }
+  if (count == 0) {
+    GtkWidget *row = gtk_list_box_row_new();
+    GtkWidget *label = gtk_label_new("No marketplace plugins found for the current filters.");
+    gtk_widget_set_margin_top(label, 16);
+    gtk_widget_set_margin_bottom(label, 16);
+    gtk_widget_set_margin_start(label, 16);
+    gtk_widget_set_margin_end(label, 16);
+    gtk_label_set_xalign(GTK_LABEL(label), 0.0);
+    gtk_widget_add_css_class(label, "dim-label");
+    gtk_list_box_row_set_child(GTK_LIST_BOX_ROW(row), label);
+    gtk_list_box_append(self->marketplace_list, row);
+  }
+  if (self->marketplace_status_label != NULL) {
+    g_autofree char *status = g_strdup_printf("Page %u · %u result%s",
+                                              self->market_page,
+                                              count,
+                                              count == 1 ? "" : "s");
+    gtk_label_set_text(self->marketplace_status_label, status);
+  }
+  self->marketplace_loading = FALSE;
+  self->marketplace_load_failed = FALSE;
+  gtk_widget_set_tooltip_text(GTK_WIDGET(self->marketplace_status_label), NULL);
+  update_marketplace_view_controls(self, count);
+}
+
+static void
+on_market_fetch_done(GObject *source, GAsyncResult *res, gpointer user_data)
+{
+  (void)source;
+  MarketFetchContext *ctx = user_data;
+  g_autoptr(GError) error = NULL;
+  g_autoptr(GBytes) bytes = pumpkin_marketplace_request_finish(res, &error);
+
+  if (ctx == NULL || ctx->self == NULL) {
+    market_fetch_context_free(ctx);
+    return;
+  }
+
+  PumpkinWindow *self = ctx->self;
+  /* A cancelled/older search must not overwrite the current page or its spinner. */
+  if (!ctx->update_cache && ctx->generation != self->marketplace_request_generation) {
+    market_fetch_context_free(ctx);
+    return;
+  }
+  if (ctx->update_cache) {
+    self->market_cache_fetch_in_flight = FALSE;
+    g_clear_object(&self->market_cache_request_cancellable);
+  } else {
+    g_clear_object(&self->marketplace_request_cancellable);
+  }
+
+  g_autoptr(GPtrArray) plugins = NULL;
+  if (bytes != NULL && error == NULL) {
+    gsize size = 0;
+    const char *data = g_bytes_get_data(bytes, &size);
+    g_autofree char *json = g_strndup(data, size);
+    plugins = market_parse_plugins_json(json);
+  }
+  if (plugins == NULL) {
+    const char *message = error != NULL ? error->message
+                                        : "The Marketplace returned an invalid plugin list.";
+    if (ctx->update_cache) {
+      g_free(self->market_cache_error);
+      self->market_cache_error = g_strdup(message);
+      self->market_cache_fetched_at = g_get_monotonic_time();
+      append_log(self, message);
+    } else {
+      show_marketplace_load_error(self, message);
+    }
+  } else if (ctx->update_cache) {
+    market_cache_replace(self, plugins);
+    if (self->plugins_stack != NULL &&
+        g_strcmp0(adw_view_stack_get_visible_child_name(self->plugins_stack),
+                  "installed_plugins") == 0) {
+      refresh_plugin_list(self);
+    }
+  } else {
+    render_marketplace_view(self, plugins);
+  }
+
+  market_fetch_context_free(ctx);
+}
+
+static void
+fetch_market_plugins_async(PumpkinWindow *self,
+                           guint page,
+                           guint limit,
+                           const char *query,
+                           const char *category,
+                           const char *type,
+                           gboolean update_cache)
+{
+  if (self == NULL) {
+    return;
+  }
+
+  g_autofree char *url = market_build_plugins_url(page, limit, query, category, type);
+  MarketFetchContext *ctx = g_new0(MarketFetchContext, 1);
+  ctx->self = g_object_ref(self);
+  ctx->update_cache = update_cache;
+
+  GCancellable *cancellable;
+  if (update_cache) {
+    self->market_cache_fetch_in_flight = TRUE;
+    self->market_cache_request_cancellable = g_cancellable_new();
+    cancellable = self->market_cache_request_cancellable;
+  } else {
+    ctx->generation = ++self->marketplace_request_generation;
+    if (self->marketplace_request_cancellable != NULL) {
+      g_cancellable_cancel(self->marketplace_request_cancellable);
+      g_clear_object(&self->marketplace_request_cancellable);
+    }
+    self->marketplace_request_cancellable = g_cancellable_new();
+    cancellable = self->marketplace_request_cancellable;
+    self->marketplace_loading = TRUE;
+    self->marketplace_load_failed = FALSE;
+    gtk_label_set_text(self->marketplace_status_label, "Loading marketplace plugins...");
+    gtk_widget_set_tooltip_text(GTK_WIDGET(self->marketplace_status_label), NULL);
+    update_marketplace_view_controls(self, 0);
+  }
+
+  pumpkin_marketplace_request_async(url, 20000, cancellable, on_market_fetch_done, ctx);
+}
+
+static void
+refresh_marketplace_view(PumpkinWindow *self)
+{
+  if (self == NULL) {
+    return;
+  }
+
+  const char *query = self->marketplace_search_entry != NULL
+                      ? gtk_editable_get_text(GTK_EDITABLE(self->marketplace_search_entry))
+                      : NULL;
+  const char *category = self->marketplace_category_entry != NULL
+                         ? gtk_editable_get_text(GTK_EDITABLE(self->marketplace_category_entry))
+                         : NULL;
+  const char *type = market_type_from_dropdown(self->marketplace_type_dropdown);
+  fetch_market_plugins_async(self, self->market_page, self->market_limit,
+                             query, category, type, FALSE);
+}
+
+static void
+show_marketplace_page(PumpkinWindow *self, const char *initial_query, gboolean force_refresh)
+{
+  if (self == NULL) {
+    return;
+  }
+
+  if (self->marketplace_search_entry != NULL && initial_query != NULL) {
+    gtk_editable_set_text(GTK_EDITABLE(self->marketplace_search_entry), initial_query);
+  }
+  if (self->plugins_stack != NULL) {
+    adw_view_stack_set_visible_child_name(self->plugins_stack, "marketplace_plugins");
+  }
+
+  const char *query = self->marketplace_search_entry != NULL
+                      ? gtk_editable_get_text(GTK_EDITABLE(self->marketplace_search_entry))
+                      : NULL;
+  const char *category = self->marketplace_category_entry != NULL
+                         ? gtk_editable_get_text(GTK_EDITABLE(self->marketplace_category_entry))
+                         : NULL;
+  const char *type = market_type_from_dropdown(self->marketplace_type_dropdown);
+  gboolean can_render_cache = self->market_page <= 1 &&
+                              (query == NULL || *query == '\0') &&
+                              (category == NULL || *category == '\0') &&
+                              (type == NULL || *type == '\0');
+
+  if (force_refresh || !market_cache_is_fresh(self) || !can_render_cache) {
+    if (self->market_page == 0) {
+      self->market_page = 1;
+    }
+    refresh_marketplace_view(self);
+    return;
+  }
+
+  if (self->market_plugin_cache != NULL) {
+    ++self->marketplace_request_generation;
+    if (self->marketplace_request_cancellable != NULL) {
+      g_cancellable_cancel(self->marketplace_request_cancellable);
+      g_clear_object(&self->marketplace_request_cancellable);
+    }
+    g_autoptr(GPtrArray) plugins = g_ptr_array_new();
+    for (guint i = 0; i < self->market_plugin_cache->len; i++) {
+      g_ptr_array_add(plugins, g_ptr_array_index(self->market_plugin_cache, i));
+    }
+    g_ptr_array_sort_with_data(plugins, market_plugin_compare_for_view, self);
+    if (plugins->len > self->market_limit) {
+      g_ptr_array_set_size(plugins, (gint)self->market_limit);
+    }
+    render_marketplace_view(self, plugins);
+  } else if (self->market_cache_error != NULL) {
+    show_marketplace_load_error(self, self->market_cache_error);
+  }
+}
+
+static void
+on_marketplace_search_activate(GtkEditable *editable, PumpkinWindow *self)
+{
+  (void)editable;
+  if (self == NULL) {
+    return;
+  }
+  self->market_page = 1;
+  refresh_marketplace_view(self);
+}
+
+static void
+on_marketplace_type_changed(GObject *object, GParamSpec *pspec, PumpkinWindow *self)
+{
+  (void)object;
+  (void)pspec;
+  if (self == NULL) {
+    return;
+  }
+  self->market_page = 1;
+  refresh_marketplace_view(self);
+}
+
+static void
+on_marketplace_sort_changed(GObject *object, GParamSpec *pspec, PumpkinWindow *self)
+{
+  (void)object;
+  (void)pspec;
+  if (self == NULL) {
+    return;
+  }
+  self->market_page = 1;
+  refresh_marketplace_view(self);
+}
+
+static void
+on_marketplace_sort_order_toggled(GtkToggleButton *button, PumpkinWindow *self)
+{
+  if (self == NULL) {
+    return;
+  }
+  gboolean ascending = gtk_toggle_button_get_active(button);
+  gtk_button_set_icon_name(GTK_BUTTON(button),
+                           ascending ? "view-sort-ascending-symbolic"
+                                     : "view-sort-descending-symbolic");
+  gtk_widget_set_tooltip_text(GTK_WIDGET(button),
+                              ascending ? "Sort ascending" : "Sort descending");
+  self->market_page = 1;
+  refresh_marketplace_view(self);
+}
+
+static void
+on_marketplace_prev_clicked(GtkButton *button, PumpkinWindow *self)
+{
+  (void)button;
+  if (self == NULL || self->market_page <= 1) {
+    return;
+  }
+  self->market_page--;
+  refresh_marketplace_view(self);
+}
+
+static void
+on_marketplace_next_clicked(GtkButton *button, PumpkinWindow *self)
+{
+  (void)button;
+  if (self == NULL) {
+    return;
+  }
+  self->market_page++;
+  refresh_marketplace_view(self);
+}
+
+static void
+on_plugins_stack_visible_child_changed(GObject *object, GParamSpec *pspec, PumpkinWindow *self)
+{
+  (void)object;
+  (void)pspec;
+  if (self == NULL || self->plugins_stack == NULL) {
+    return;
+  }
+
+  const char *visible = adw_view_stack_get_visible_child_name(self->plugins_stack);
+  if (g_strcmp0(visible, "marketplace_plugins") == 0) {
+    show_marketplace_page(self, NULL, FALSE);
+    return;
+  }
+
+  if (g_strcmp0(visible, "installed_plugins") == 0) {
+    request_market_plugin_cache(self, FALSE);
+    refresh_plugin_list(self);
+  }
+}
+
+static void
+request_market_plugin_cache(PumpkinWindow *self, gboolean force)
+{
+  if (self == NULL || self->market_cache_fetch_in_flight) {
+    return;
+  }
+  if (!force && market_cache_is_fresh(self)) {
+    return;
+  }
+  fetch_market_plugins_async(self, 1, 100, NULL, NULL, NULL, TRUE);
+}
+
+static gboolean
+finish_marketplace_retry_animation(gpointer data)
+{
+  PumpkinWindow *self = data;
+  if (self->disposing) return G_SOURCE_REMOVE;
+  if (pumpkin_refresh_button_is_animating(self->btn_marketplace_retry)) return G_SOURCE_CONTINUE;
+  gtk_widget_set_visible(GTK_WIDGET(self->btn_marketplace_retry),
+    self->marketplace_load_failed && !self->marketplace_loading);
+  return G_SOURCE_REMOVE;
 }
 
 static void
 on_plugins_marketplace_clicked(GtkButton *button, PumpkinWindow *self)
 {
-  (void)button;
-  open_uri_external(self, "https://market.pumpkinmc.org");
+  if (self == NULL) {
+    return;
+  }
+  if (button == self->btn_marketplace_refresh || button == self->btn_marketplace_retry) {
+    if (self->marketplace_loading) return;
+    if (pumpkin_refresh_button_is_animating(self->btn_marketplace_refresh) ||
+        pumpkin_refresh_button_is_animating(self->btn_marketplace_retry)) return;
+    if (!pumpkin_refresh_button_begin(button)) return;
+    if (button == self->btn_marketplace_retry) {
+      g_timeout_add_full(G_PRIORITY_DEFAULT, 30, finish_marketplace_retry_animation,
+                         g_object_ref(self), g_object_unref);
+    }
+    if (self->market_page == 0) {
+      self->market_page = 1;
+    }
+    show_marketplace_page(self, NULL, TRUE);
+    return;
+  }
+
+  self->market_page = 1;
+  show_marketplace_page(self, NULL, TRUE);
+}
+
+static void
+on_plugin_market_clicked(GtkButton *button, PumpkinWindow *self)
+{
+  if (self == NULL) {
+    return;
+  }
+  g_autofree char *plugin_name = g_strdup(g_object_get_data(G_OBJECT(button), "market-plugin-query"));
+  GtkWidget *popover = gtk_widget_get_ancestor(GTK_WIDGET(button), GTK_TYPE_POPOVER);
+  if (popover != NULL) {
+    gtk_popover_popdown(GTK_POPOVER(popover));
+  }
+  self->market_page = 1;
+  show_marketplace_page(self, plugin_name, TRUE);
+}
+
+static void
+on_plugin_issue_clicked(GtkButton *button, PumpkinWindow *self)
+{
+  if (self == NULL) {
+    return;
+  }
+
+  const char *summary = g_object_get_data(G_OBJECT(button), "plugin-issue-summary");
+  const char *detail = g_object_get_data(G_OBJECT(button), "plugin-issue-detail");
+  if (summary == NULL && detail == NULL) {
+    return;
+  }
+
+  AdwDialog *dialog = adw_alert_dialog_new(summary != NULL ? summary : "Plugin issue",
+                                           detail != NULL ? detail : "Unknown plugin issue.");
+  AdwAlertDialog *alert = ADW_ALERT_DIALOG(dialog);
+  adw_alert_dialog_add_response(alert, "close", "Close");
+  adw_alert_dialog_set_default_response(alert, "close");
+  adw_alert_dialog_set_close_response(alert, "close");
+  adw_dialog_present(dialog, GTK_WIDGET(self));
 }
 
 static void
@@ -4327,6 +6726,9 @@ static void
 on_overview_network_start_all_clicked(GtkButton *button, gpointer user_data)
 {
   PumpkinWindow *self = PUMPKIN_WINDOW(user_data);
+  if (!ensure_local_hosting_supported(self)) {
+    return;
+  }
   ServerNetwork *network = network_for_button(self, button);
   if (network == NULL || network->member_server_ids->len == 0) {
     return;
@@ -4377,6 +6779,9 @@ static void
 on_overview_network_stop_all_clicked(GtkButton *button, gpointer user_data)
 {
   PumpkinWindow *self = PUMPKIN_WINDOW(user_data);
+  if (!ensure_local_hosting_supported(self)) {
+    return;
+  }
   ServerNetwork *network = network_for_button(self, button);
   if (network == NULL || network->member_server_ids->len == 0) {
     return;
@@ -4426,6 +6831,9 @@ static void
 on_overview_network_update_all_clicked(GtkButton *button, gpointer user_data)
 {
   PumpkinWindow *self = PUMPKIN_WINDOW(user_data);
+  if (!ensure_local_hosting_supported(self)) {
+    return;
+  }
   ServerNetwork *network = network_for_button(self, button);
   if (network == NULL || network->member_server_ids->len == 0) {
     return;
@@ -4477,6 +6885,9 @@ static void
 on_overview_network_install_all_clicked(GtkButton *button, gpointer user_data)
 {
   PumpkinWindow *self = PUMPKIN_WINDOW(user_data);
+  if (!ensure_local_hosting_supported(self)) {
+    return;
+  }
   ServerNetwork *network = network_for_button(self, button);
   if (network == NULL || network->member_server_ids == NULL || network->member_server_ids->len == 0) {
     return;
@@ -4527,7 +6938,8 @@ on_overview_network_install_all_clicked(GtkButton *button, gpointer user_data)
 static void
 open_overview_network_details(PumpkinWindow *self, ServerNetwork *network)
 {
-  if (self == NULL || network == NULL || self->view_stack == NULL) {
+  if (self == NULL || network == NULL || self->view_stack == NULL ||
+      !pumpkin_platform_supports_local_hosting()) {
     return;
   }
 
@@ -4558,7 +6970,7 @@ static void
 on_overview_network_row_activated(GtkListBox *box, GtkListBoxRow *row, PumpkinWindow *self)
 {
   (void)box;
-  if (self == NULL || row == NULL) {
+  if (self == NULL || row == NULL || !pumpkin_platform_supports_local_hosting()) {
     return;
   }
   const char *network_id = g_object_get_data(G_OBJECT(row), "network-id");
@@ -4651,6 +7063,9 @@ static void
 on_overview_network_add_current_clicked(GtkButton *button, gpointer user_data)
 {
   PumpkinWindow *self = PUMPKIN_WINDOW(user_data);
+  if (!ensure_local_hosting_supported(self)) {
+    return;
+  }
   ServerNetwork *network = network_for_button(self, button);
   if (self == NULL || network == NULL || self->store == NULL) {
     return;
@@ -5007,6 +7422,9 @@ static void
 on_add_network_overview(GtkButton *button, PumpkinWindow *self)
 {
   (void)button;
+  if (!ensure_local_hosting_supported(self)) {
+    return;
+  }
   AdwDialog *dialog = adw_alert_dialog_new("Add Network", "Create a folder-like group for multiple servers.");
   AdwAlertDialog *alert = ADW_ALERT_DIALOG(dialog);
   adw_alert_dialog_add_response(alert, "cancel", "Cancel");
@@ -5080,6 +7498,7 @@ create_overview_server_card(PumpkinWindow *self,
   gboolean running = server_is_running_ui(self, server);
   gboolean installed = download_active || g_strcmp0(version, "Not installed") != 0;
   gboolean global_download_active = any_download_active(self);
+  gboolean maintenance = pumpkin_server_get_maintenance(server);
   const char *version_text =
     (download_active && g_strcmp0(version, "Not installed") == 0) ? "Installing..." : version;
   gboolean update_available = is_update_available_for_server(self, server, installed);
@@ -5087,6 +7506,9 @@ create_overview_server_card(PumpkinWindow *self,
   const char *status_css = "server-state-stopped";
   if (download_active) {
     status_text = "Updating";
+    status_css = "server-state-updating";
+  } else if (maintenance) {
+    status_text = "Maintenance";
     status_css = "server-state-updating";
   } else if (running) {
     status_text = "Running";
@@ -5170,7 +7592,7 @@ create_overview_server_card(PumpkinWindow *self,
     gtk_widget_set_vexpand(btn_update, FALSE);
     g_object_set_data_full(G_OBJECT(btn_update), "server", g_object_ref(server), g_object_unref);
     g_signal_connect(btn_update, "clicked", G_CALLBACK(on_overview_update_clicked), self);
-    gtk_widget_set_sensitive(btn_update, !global_download_active);
+    gtk_widget_set_sensitive(btn_update, !global_download_active && !maintenance);
     if (download_active) {
       gtk_button_set_label(GTK_BUTTON(btn_update), "Updating...");
     } else if (global_download_active) {
@@ -5183,6 +7605,7 @@ create_overview_server_card(PumpkinWindow *self,
     GtkWidget *btn_remove = gtk_button_new();
     gtk_button_set_icon_name(GTK_BUTTON(btn_remove), "user-trash-symbolic");
     gtk_widget_set_tooltip_text(btn_remove, "Delete server");
+    gtk_widget_set_sensitive(btn_remove, !running && !download_active && !maintenance);
     gtk_widget_add_css_class(btn_remove, "card-button");
     gtk_widget_add_css_class(btn_remove, "overview-square-button");
     gtk_widget_add_css_class(btn_remove, "destructive-action");
@@ -5414,7 +7837,8 @@ on_plugin_toggle_state(GtkSwitch *sw, gboolean state, gpointer user_data)
     return FALSE;
   }
   if (self != NULL &&
-      (self->ui_state == UI_STATE_STARTING || self->ui_state == UI_STATE_RESTARTING)) {
+      (self->ui_state == UI_STATE_STARTING || self->ui_state == UI_STATE_RESTARTING ||
+       self->marketplace_install_in_flight)) {
     gtk_switch_set_active(sw, !state);
     return TRUE;
   }
@@ -5440,11 +7864,24 @@ on_plugin_toggle_state(GtkSwitch *sw, gboolean state, gpointer user_data)
   }
 
   if (to != NULL) {
+    if (g_file_test(to, G_FILE_TEST_EXISTS)) {
+      set_details_status(self, "A plugin file already exists at the target location. It was not overwritten.", 5);
+      return TRUE;
+    }
     if (g_rename(from, to) != 0) {
       if (self != NULL) {
         g_autofree char *msg = g_strdup_printf("Failed to toggle plugin: %s", g_strerror(errno));
         append_log(self, msg);
       }
+      return TRUE;
+    }
+    g_autofree char *target_file = g_path_get_basename(to);
+    g_autoptr(GError) error = NULL;
+    if (!pumpkin_plugin_store_rename(dir_path, file, target_file, &error)) {
+      if (g_rename(to, from) != 0) {
+        append_log(self, "Could not restore the previous plugin filename after a lockfile error.");
+      }
+      set_details_status(self, error->message, 6);
       return TRUE;
     }
     if (self != NULL) {
@@ -5461,7 +7898,8 @@ on_plugin_delete_clicked(GtkButton *button, PumpkinWindow *self)
   if (self->current == NULL) {
     return;
   }
-  if (self->ui_state == UI_STATE_STARTING || self->ui_state == UI_STATE_RESTARTING) {
+  if (self->ui_state == UI_STATE_STARTING || self->ui_state == UI_STATE_RESTARTING ||
+      self->marketplace_install_in_flight) {
     return;
   }
 
@@ -5471,11 +7909,16 @@ on_plugin_delete_clicked(GtkButton *button, PumpkinWindow *self)
     return;
   }
 
-  g_autofree char *title = g_strdup_printf("Delete plugin \"%s\"?", file);
+  GtkWidget *popover = gtk_widget_get_ancestor(GTK_WIDGET(button), GTK_TYPE_POPOVER);
+  if (popover != NULL) {
+    gtk_popover_popdown(GTK_POPOVER(popover));
+  }
+  g_autofree char *display_name = plugin_display_name(dir_path, file);
+  g_autofree char *title = g_strdup_printf("Remove plugin \"%s\"?", display_name);
   AdwDialog *dialog = adw_alert_dialog_new(title, "This permanently removes the plugin file.");
   AdwAlertDialog *alert = ADW_ALERT_DIALOG(dialog);
   adw_alert_dialog_add_response(alert, "cancel", "Cancel");
-  adw_alert_dialog_add_response(alert, "delete", "Delete");
+  adw_alert_dialog_add_response(alert, "delete", "Remove");
   adw_alert_dialog_set_default_response(alert, "cancel");
   adw_alert_dialog_set_close_response(alert, "cancel");
   adw_alert_dialog_set_response_appearance(alert, "delete", ADW_RESPONSE_DESTRUCTIVE);
@@ -5498,12 +7941,37 @@ on_plugin_delete_confirmed(GObject *dialog, GAsyncResult *res, gpointer user_dat
   if (self == NULL || self->current == NULL || file == NULL || dir_path == NULL) {
     return;
   }
+  if (self->marketplace_install_in_flight) {
+    set_details_status(self, "Wait for the plugin download to finish before deleting plugins.", 4);
+    return;
+  }
 
   g_autofree char *path = g_build_filename(dir_path, file, NULL);
-  if (g_remove(path) != 0) {
+  g_autofree char *uuid = g_uuid_string_random();
+  g_autofree char *backup = g_strdup_printf("%s.%s.pending-delete", path, uuid);
+  if (g_rename(path, backup) != 0) {
     append_log(self, "Failed to delete plugin.");
     return;
   }
+  g_autoptr(GError) error = NULL;
+  if (!pumpkin_plugin_store_remove(dir_path, file, &error)) {
+    if (g_rename(backup, path) != 0) {
+      append_log(self, "Could not restore the plugin filename after a lockfile error.");
+    }
+    set_details_status(self, error->message, 6);
+    return;
+  }
+  if (g_remove(backup) != 0) {
+    append_log(self, "Plugin disabled and removed from ppm.lock, but its pending-delete backup could not be deleted.");
+  }
+  g_autofree char *metadata_base = g_strdup(path);
+  if (g_str_has_suffix(metadata_base, ".disabled")) {
+    metadata_base[strlen(metadata_base) - strlen(".disabled")] = '\0';
+  } else if (g_str_has_suffix(metadata_base, ".deactivated")) {
+    metadata_base[strlen(metadata_base) - strlen(".deactivated")] = '\0';
+  }
+  g_autofree char *metadata_path = g_strconcat(metadata_base, ".marketplace", NULL);
+  g_remove(metadata_path);
 
   refresh_plugin_list(self);
 }
@@ -5545,6 +8013,7 @@ on_plugin_overwrite_confirmed(GObject *dialog, GAsyncResult *res, gpointer user_
     return;
   }
 
+  copy_plugin_sidecar_if_present(ctx->self, ctx->src_path, ctx->dest_path, TRUE);
   refresh_plugin_list(ctx->self);
 }
 
@@ -5594,6 +8063,11 @@ version_from_sidecar(const char *plugins_dir, const char *file_name)
     return NULL;
   }
 
+  g_autofree char *marketplace_version = marketplace_metadata_value(plugins_dir, file_name, "version");
+  if (marketplace_version != NULL && *marketplace_version != '\0') {
+    return g_steal_pointer(&marketplace_version);
+  }
+
   g_autofree char *clean = g_strdup(file_name);
   if (g_str_has_suffix(clean, ".disabled")) {
     clean[strlen(clean) - strlen(".disabled")] = '\0';
@@ -5638,9 +8112,145 @@ plugin_version_label(const char *plugins_dir, const char *file_name)
 {
   g_autofree char *sidecar = version_from_sidecar(plugins_dir, file_name);
   if (sidecar != NULL) {
-    return sidecar;
+    return g_steal_pointer(&sidecar);
   }
   return version_from_filename(file_name);
+}
+
+static GHashTable *
+collect_plugin_runtime_issues(PumpkinWindow *self)
+{
+  GHashTable *issues = g_hash_table_new_full(g_str_hash, g_str_equal, g_free,
+                                             (GDestroyNotify)plugin_runtime_issue_free);
+  if (self == NULL || self->current == NULL) {
+    return issues;
+  }
+
+  g_autofree char *data_dir = pumpkin_server_get_data_dir(self->current);
+  if (data_dir == NULL) {
+    return issues;
+  }
+
+  g_autofree char *latest_log = g_build_filename(data_dir, "logs", "latest.log", NULL);
+  if (!g_file_test(latest_log, G_FILE_TEST_EXISTS)) {
+    g_autofree char *logs_dir = pumpkin_server_get_logs_dir(self->current);
+    GDir *dir = logs_dir != NULL ? g_dir_open(logs_dir, 0, NULL) : NULL;
+    const char *entry = NULL;
+    g_autofree char *newest = NULL;
+    while (dir != NULL && (entry = g_dir_read_name(dir)) != NULL) {
+      if (g_str_has_prefix(entry, "session-") && g_str_has_suffix(entry, ".log") &&
+          (newest == NULL || g_strcmp0(entry, newest) > 0)) {
+        g_free(newest);
+        newest = g_strdup(entry);
+      }
+    }
+    if (dir != NULL) {
+      g_dir_close(dir);
+    }
+    if (newest == NULL) {
+      return issues;
+    }
+    g_free(latest_log);
+    latest_log = g_build_filename(logs_dir, newest, NULL);
+  }
+
+  g_autofree char *contents = NULL;
+  if (!g_file_get_contents(latest_log, &contents, NULL, NULL) || contents == NULL) {
+    return issues;
+  }
+
+  g_auto(GStrv) lines = g_strsplit(contents, "\n", -1);
+  for (guint i = 0; lines != NULL && lines[i] != NULL; i++) {
+    g_autofree char *plain = pumpkin_strip_ansi(lines[i]);
+    const char *line = plain != NULL ? plain : lines[i];
+    if (line == NULL || *line == '\0') {
+      continue;
+    }
+
+    g_autofree char *plugin_name = NULL;
+    g_autofree char *summary = NULL;
+    g_autofree char *detail = NULL;
+
+    plugin_name = extract_quoted_plugin_name(line,
+                                             "Permission denied for plugin \"",
+                                             "\", skipping loading.");
+    if (plugin_name != NULL) {
+      g_autofree char *plugins_dir = pumpkin_server_get_plugins_dir(self->current);
+      g_autofree char *data_dir = g_build_filename(plugins_dir, plugin_name, NULL);
+      summary = g_strdup("Sandbox denied");
+      detail = g_strdup_printf(
+        "Pumpkin denied this plugin filesystem access while loading.\n\n"
+        "Current upstream WASM plugins only get their own data folder preopened:\n"
+        "%s\n\n"
+        "A compatible plugin must use Pumpkin's plugin context/data-folder API instead of "
+        "reading or writing arbitrary server paths during load.\n\n"
+        "Log line:\n%s",
+        data_dir != NULL ? data_dir : "(not available)",
+        line);
+    } else {
+      g_autofree char *load_path = extract_quoted_plugin_name(line,
+                                                               "Failed to load plugin from \"", "\"");
+      if (load_path != NULL) {
+        g_autofree char *file_name = g_path_get_basename(load_path);
+        g_autofree char *plugins_dir = pumpkin_server_get_plugins_dir(self->current);
+        plugin_name = plugin_display_name(plugins_dir, file_name);
+        if (strstr(line, "different API version") != NULL ||
+            strstr(line, "matching implementation was not found in the linker") != NULL) {
+          summary = g_strdup("Incompatible plugin API");
+          detail = g_strdup_printf(
+            "This plugin was built for a different Pumpkin plugin API. "
+            "Update it from the Marketplace or ask its author for a compatible build. "
+            "Changing Smashed Pumpkin or filesystem permissions will not fix the binary.\n\n"
+            "Pumpkin log:\n%s", line);
+        } else {
+          summary = g_strdup("Load failed");
+          detail = g_strdup(line);
+        }
+      }
+    }
+
+    if (plugin_name == NULL) {
+      plugin_name = extract_prefixed_plugin_name(line, "Failed to initialize plugin ");
+      if (plugin_name != NULL) {
+        const char *sep = strchr(strstr(line, "Failed to initialize plugin "), ':');
+        summary = g_strdup("Initialization failed");
+        if (sep != NULL && sep[1] != '\0') {
+          g_autofree char *trimmed = g_strdup(sep + 1);
+          detail = g_strdup(g_strstrip(trimmed));
+        } else {
+          detail = g_strdup(line);
+        }
+      } else {
+        plugin_name = extract_prefixed_plugin_name(line, "Failed to load plugin ");
+        if (plugin_name != NULL) {
+          const char *sep = strchr(strstr(line, "Failed to load plugin "), ':');
+          summary = g_strdup("Load failed");
+          if (sep != NULL && sep[1] != '\0') {
+            g_autofree char *trimmed = g_strdup(sep + 1);
+            detail = g_strdup(g_strstrip(trimmed));
+          } else {
+            detail = g_strdup(line);
+          }
+        }
+      }
+    }
+
+    if (plugin_name == NULL || *plugin_name == '\0' || summary == NULL || detail == NULL) {
+      continue;
+    }
+
+    g_autofree char *key = normalized_key(plugin_name);
+    if (key == NULL || *key == '\0' || g_hash_table_contains(issues, key)) {
+      continue;
+    }
+
+    PluginRuntimeIssue *issue = g_new0(PluginRuntimeIssue, 1);
+    issue->summary = g_steal_pointer(&summary);
+    issue->detail = g_steal_pointer(&detail);
+    g_hash_table_insert(issues, g_steal_pointer(&key), issue);
+  }
+
+  return issues;
 }
 
 static void
@@ -5755,6 +8365,8 @@ set_download_busy(PumpkinWindow *self, gboolean busy)
 static void
 update_details(PumpkinWindow *self)
 {
+  pumpkin_window_worlds_update_state(self);
+  pumpkin_window_minimap_update(self);
   if (self->details_title == NULL) {
     return;
   }
@@ -5766,12 +8378,7 @@ update_details(PumpkinWindow *self)
     }
     set_details_error(self, NULL);
     set_details_status(self, NULL, 0);
-    gtk_widget_set_sensitive(GTK_WIDGET(self->btn_details_start), FALSE);
-    gtk_widget_set_sensitive(GTK_WIDGET(self->btn_details_stop), FALSE);
-    gtk_widget_set_sensitive(GTK_WIDGET(self->btn_details_restart), FALSE);
-    gtk_widget_set_sensitive(GTK_WIDGET(self->btn_details_install), FALSE);
-    gtk_widget_set_sensitive(GTK_WIDGET(self->btn_details_update), FALSE);
-    gtk_widget_set_visible(GTK_WIDGET(self->btn_details_update), TRUE);
+    pumpkin_window_update_server_actions(self, FALSE, FALSE, TRUE, FALSE);
     gtk_widget_set_sensitive(GTK_WIDGET(self->btn_details_check_updates), FALSE);
     update_check_updates_badge(self);
     update_domains_form(self);
@@ -5791,6 +8398,7 @@ update_details(PumpkinWindow *self)
   }
 
   gtk_label_set_text(self->details_title, pumpkin_server_get_name(self->current));
+  gtk_widget_set_tooltip_text(GTK_WIDGET(self->details_title), pumpkin_server_get_name(self->current));
   if (self->details_server_icon != NULL) {
     g_autofree char *data_dir = pumpkin_server_get_data_dir(self->current);
     g_autofree char *icon_path = g_build_filename(data_dir, "server-icon.png", NULL);
@@ -5801,14 +8409,14 @@ update_details(PumpkinWindow *self)
       texture = gdk_texture_new_from_file(file, &error);
       if (texture != NULL) {
         gtk_image_set_from_paintable(self->details_server_icon, GDK_PAINTABLE(texture));
-        gtk_image_set_pixel_size(self->details_server_icon, 32);
+        gtk_image_set_pixel_size(self->details_server_icon, 24);
       } else {
         gtk_image_set_from_icon_name(self->details_server_icon, "network-server-symbolic");
-        gtk_image_set_pixel_size(self->details_server_icon, 32);
+        gtk_image_set_pixel_size(self->details_server_icon, 24);
       }
     } else {
       gtk_image_set_from_icon_name(self->details_server_icon, "network-server-symbolic");
-      gtk_image_set_pixel_size(self->details_server_icon, 32);
+      gtk_image_set_pixel_size(self->details_server_icon, 24);
     }
   }
   set_details_error(self, NULL);
@@ -5818,24 +8426,15 @@ update_details(PumpkinWindow *self)
                    self->ui_state == UI_STATE_RESTARTING);
   gboolean any_download_busy = any_download_active(self);
   busy = busy || any_download_busy;
-  gboolean can_start = installed && !running && !busy;
-  gboolean can_stop = running && !busy;
-  gboolean can_restart = running && !busy &&
-                         self->restart_delay_id == 0;
-
-  gtk_widget_set_sensitive(GTK_WIDGET(self->btn_details_start), can_start);
-  gtk_widget_set_sensitive(GTK_WIDGET(self->btn_details_stop), can_stop);
-  gtk_widget_set_sensitive(GTK_WIDGET(self->btn_details_restart), can_restart);
-  gtk_widget_set_sensitive(GTK_WIDGET(self->btn_details_install), !running && !busy);
-  gtk_widget_set_sensitive(GTK_WIDGET(self->btn_details_update), update_available && !running && !busy);
-  gtk_widget_set_visible(GTK_WIDGET(self->btn_details_update), TRUE);
+  pumpkin_window_update_server_actions(self, installed, update_available, busy, running);
   gtk_widget_set_sensitive(GTK_WIDGET(self->btn_details_check_updates), self->current != NULL && !any_download_busy);
   update_check_updates_badge(self);
   if (self->btn_console_copy != NULL) {
     gtk_widget_set_sensitive(GTK_WIDGET(self->btn_console_copy), self->current != NULL);
   }
   if (self->btn_console_send != NULL) {
-    gtk_widget_set_sensitive(GTK_WIDGET(self->btn_console_send), self->current != NULL);
+    gtk_widget_set_sensitive(GTK_WIDGET(self->btn_console_send), running &&
+                              !pumpkin_server_get_stopping(self->current));
   }
   if (self->btn_console_clear != NULL) {
     gtk_widget_set_sensitive(GTK_WIDGET(self->btn_console_clear), self->current != NULL);
@@ -5843,7 +8442,7 @@ update_details(PumpkinWindow *self)
 
   if (running) {
     if (self->players_refresh_id == 0) {
-      self->players_refresh_id = g_timeout_add((guint)current_stats_sample_msec(self),
+      self->players_refresh_id = g_timeout_add(1000,
                                                refresh_players_tick,
                                                self);
     }
@@ -6055,6 +8654,171 @@ stats_color_with_alpha(GdkRGBA color, double alpha)
   return color;
 }
 
+static double
+stats_ram_scale(PumpkinWindow *self)
+{
+  double max_mb = self->stats_ram_limit_mb;
+  for (int i = 0; i < self->stats_count; i++) {
+    double value = stats_get_sample(self, self->stats_ram_mb, i);
+    if (isfinite(value)) {
+      max_mb = fmax(max_mb, value);
+    }
+  }
+  if (self->stats_ram_limit_mb <= 0.0) {
+    max_mb *= 1.15;
+  }
+  return ceil(fmax(max_mb, 512.0) / 512.0) * 512.0;
+}
+
+static GtkDrawingArea *
+stats_area_for_metric(PumpkinWindow *self, int metric)
+{
+  switch (metric) {
+    case 0: return self->stats_graph_usage;
+    case 1: return self->stats_graph_ram;
+    default: return self->stats_graph_disk;
+  }
+}
+
+static void
+draw_stats_hover(PumpkinWindow *self, cairo_t *cr, int metric, double max_value,
+                 double left, double top, double right, double bottom, int width, int height)
+{
+  int offset = self->stats_hover_index[metric];
+  if (offset < 0 || offset >= self->stats_count || max_value <= 0.0) {
+    return;
+  }
+  double *series = metric == 0 ? self->stats_cpu : metric == 1 ? self->stats_ram_mb : self->stats_disk_mb;
+  double value = stats_get_sample(self, series, offset);
+  if (!isfinite(value)) {
+    return;
+  }
+  double graph_w = width - left - right;
+  double graph_h = height - top - bottom;
+  double slot = STATS_SAMPLES - self->stats_count + offset;
+  double x = left + slot / (STATS_SAMPLES - 1) * graph_w;
+  double y = top + (1.0 - CLAMP(value / max_value, 0.0, 1.0)) * graph_h;
+  GdkRGBA fg;
+  gtk_widget_get_color(GTK_WIDGET(stats_area_for_metric(self, metric)), &fg);
+  cairo_set_source_rgba(cr, fg.red, fg.green, fg.blue, 0.22);
+  cairo_set_line_width(cr, 1.0);
+  cairo_move_to(cr, x, top);
+  cairo_line_to(cr, x, height - bottom);
+  cairo_stroke(cr);
+  const double colors[3][3] = {{0.86, 0.53, 0.20}, {0.33, 0.55, 0.93}, {0.35, 0.77, 0.45}};
+  cairo_set_source_rgb(cr, colors[metric][0], colors[metric][1], colors[metric][2]);
+  cairo_arc(cr, x, y, 4.0, 0.0, 2.0 * G_PI);
+  cairo_fill(cr);
+}
+
+static void
+on_stats_graph_motion(GtkEventControllerMotion *controller, double x, double y, PumpkinWindow *self)
+{
+  int metric = GPOINTER_TO_INT(g_object_get_data(G_OBJECT(controller), "stats-metric"));
+  for (int other = 0; other < 3; other++) {
+    if (other == metric) {
+      continue;
+    }
+    if (self->stats_hover_index[other] >= 0) {
+      self->stats_hover_index[other] = -1;
+      gtk_widget_queue_draw(GTK_WIDGET(stats_area_for_metric(self, other)));
+    }
+  }
+  GtkDrawingArea *area = stats_area_for_metric(self, metric);
+  GtkLabel *label = self->stats_hover_label;
+  if (self->stats_hover_metric != metric) {
+    GtkWidget *hover_widget = GTK_WIDGET(self->stats_hover_layer);
+    GtkWidget *parent = gtk_widget_get_parent(hover_widget);
+    if (parent != NULL) {
+      gtk_overlay_remove_overlay(GTK_OVERLAY(parent), hover_widget);
+    }
+    gtk_overlay_add_overlay(GTK_OVERLAY(gtk_widget_get_parent(GTK_WIDGET(area))), hover_widget);
+    gtk_overlay_set_clip_overlay(GTK_OVERLAY(gtk_widget_get_parent(GTK_WIDGET(area))), hover_widget, TRUE);
+    self->stats_hover_metric = metric;
+  }
+  int width = gtk_widget_get_width(GTK_WIDGET(area));
+  int height = gtk_widget_get_height(GTK_WIDGET(area));
+  double left = metric == 1 ? 72.0 : 44.0;
+  double graph_width = width - left - 12.0;
+  int slot = graph_width > 0.0 ? (int)llround((x - left) / graph_width * (STATS_SAMPLES - 1)) : -1;
+  int offset = slot - (STATS_SAMPLES - self->stats_count);
+  if (self->stats_count < 2 || x < left || x > width - 12.0 ||
+      y < 12.0 || y > height - 16.0 || offset < 0 || offset >= self->stats_count) {
+    gtk_widget_set_visible(GTK_WIDGET(label), FALSE);
+    self->stats_hover_index[metric] = -1;
+    gtk_widget_queue_draw(GTK_WIDGET(area));
+    return;
+  }
+
+  double value = stats_get_sample(self, metric == 0 ? self->stats_cpu :
+                                         metric == 1 ? self->stats_ram_mb : self->stats_disk_mb, offset);
+  g_autofree char *metric_value = NULL;
+  if (!isfinite(value)) {
+    metric_value = g_strdup("No data");
+  } else if (metric == 0) {
+    metric_value = g_strdup_printf("CPU  %.1f%%", value);
+  } else if (metric == 1) {
+    g_autofree char *size = g_format_size_full((guint64)(fmax(value, 0.0) * 1024.0 * 1024.0),
+                                                G_FORMAT_SIZE_IEC_UNITS);
+    metric_value = g_strdup_printf("Memory  %s", size);
+  } else {
+    metric_value = g_strdup_printf("TPS  %.1f", value);
+  }
+  gint64 timestamp = self->stats_time_usec[stats_sample_index(self, offset)];
+  gint64 age_seconds = MAX(0, (g_get_monotonic_time() - timestamp) / G_USEC_PER_SEC);
+  g_autofree char *age = age_seconds < 60 ? g_strdup_printf("%" G_GINT64_FORMAT "s ago", age_seconds) :
+                                              g_strdup_printf("%" G_GINT64_FORMAT "m %02" G_GINT64_FORMAT "s ago",
+                                                              age_seconds / 60, age_seconds % 60);
+  int players = (int)stats_get_sample(self, self->stats_players, offset);
+  g_autofree char *tooltip = g_strdup_printf("%s\n%d %s · %s", metric_value, players,
+                                            players == 1 ? "player" : "players", age);
+  gtk_label_set_text(label, tooltip);
+  gtk_widget_set_visible(GTK_WIDGET(label), TRUE);
+  int minimum, natural, label_height;
+  gtk_widget_measure(GTK_WIDGET(label), GTK_ORIENTATION_HORIZONTAL, -1, &minimum, &natural, NULL, NULL);
+  gtk_widget_measure(GTK_WIDGET(label), GTK_ORIENTATION_VERTICAL, natural, &minimum, &label_height, NULL, NULL);
+  int target_x = (int)x + 14;
+  if (target_x + natural > width) {
+    target_x = (int)x - natural - 14;
+  }
+  /* Position must not contribute to the next tooltip size measurement. */
+  gtk_fixed_move(self->stats_hover_layer, GTK_WIDGET(label),
+                 CLAMP(target_x, 0, MAX(0, width - natural)),
+                 CLAMP((int)y - label_height - 10, 0, MAX(0, height - label_height)));
+  self->stats_hover_index[metric] = offset;
+  gtk_widget_queue_draw(GTK_WIDGET(area));
+}
+
+static void
+on_stats_graph_leave(GtkEventControllerMotion *controller, PumpkinWindow *self)
+{
+  int metric = GPOINTER_TO_INT(g_object_get_data(G_OBJECT(controller), "stats-metric"));
+  if (self->stats_hover_metric == metric) {
+    gtk_widget_set_visible(GTK_WIDGET(self->stats_hover_label), FALSE);
+    self->stats_hover_metric = -1;
+  }
+  self->stats_hover_index[metric] = -1;
+  gtk_widget_queue_draw(GTK_WIDGET(stats_area_for_metric(self, metric)));
+}
+
+static void
+setup_stats_hover(PumpkinWindow *self, int metric)
+{
+  GtkEventController *motion = gtk_event_controller_motion_new();
+  g_object_set_data(G_OBJECT(motion), "stats-metric", GINT_TO_POINTER(metric));
+  g_signal_connect(motion, "motion", G_CALLBACK(on_stats_graph_motion), self);
+  g_signal_connect(motion, "leave", G_CALLBACK(on_stats_graph_leave), self);
+
+  /* The tooltip is another child of the overlay. Tracking the overlay itself
+   * prevents its movement from producing synthetic leave/enter transitions. */
+  GtkWidget *overlay = gtk_widget_get_parent(GTK_WIDGET(stats_area_for_metric(self, metric)));
+  if (GTK_IS_OVERLAY(overlay)) {
+    gtk_widget_add_controller(overlay, motion);
+  } else {
+    gtk_widget_add_controller(GTK_WIDGET(stats_area_for_metric(self, metric)), motion);
+  }
+}
+
 static void
 draw_stats_series(PumpkinWindow *self, cairo_t *cr, double *series, int total_samples, int valid_count,
                   double max_value, int smoothing_window, double r, double g, double b,
@@ -6080,6 +8844,10 @@ draw_stats_series(PumpkinWindow *self, cairo_t *cr, double *series, int total_sa
     double raw = window > 1
                    ? stats_get_smoothed(self, series, offset, window)
                    : stats_get_sample(self, series, offset);
+    if (!isfinite(raw)) {
+      started = FALSE;
+      continue;
+    }
     double val = raw / max_value;
     if (val < 0.0) {
       val = 0.0;
@@ -6099,49 +8867,6 @@ draw_stats_series(PumpkinWindow *self, cairo_t *cr, double *series, int total_sa
 }
 
 static void
-draw_stats_grid(cairo_t *cr, double left, double top, double right, double bottom,
-                int width, int height, int rows, const GdkRGBA *color)
-{
-  double graph_w = width - left - right;
-  double graph_h = height - top - bottom;
-
-  set_cairo_source_rgba(cr, color);
-  cairo_set_line_width(cr, 1.0);
-  for (int i = 1; i < rows; i++) {
-    double y = top + (graph_h / (double)rows) * i;
-    cairo_move_to(cr, left, y);
-    cairo_line_to(cr, left + graph_w, y);
-  }
-  cairo_stroke(cr);
-}
-
-static int
-usage_scale_percent(PumpkinWindow *self)
-{
-  double max_val = 0.0;
-  for (int i = 0; i < self->stats_count; i++) {
-    double cpu = stats_get_sample(self, self->stats_cpu, i);
-    double ram = stats_get_sample(self, self->stats_ram_mb, i);
-    if (cpu > max_val) {
-      max_val = cpu;
-    }
-    if (ram > max_val) {
-      max_val = ram;
-    }
-  }
-  int scale = (int)(ceil(max_val / 10.0) * 10.0);
-  if (scale < 5) {
-    scale = 5;
-  } else if (scale < 10) {
-    scale = 10;
-  }
-  if (scale > 100) {
-    scale = 100;
-  }
-  return scale;
-}
-
-static void
 draw_stats_axis_labels(cairo_t *cr, double left, double top, double right, double bottom,
                        int width, int height, int rows, const char *top_label,
                        const char *mid_label, const char *bottom_label,
@@ -6158,11 +8883,15 @@ draw_stats_axis_labels(cairo_t *cr, double left, double top, double right, doubl
   double y_mid = top + (graph_h / (double)rows) * (rows / 2.0) + 2.0;
   double y_bottom = top + graph_h + 2.0;
 
-  cairo_move_to(cr, left - 36.0, y_top);
+  cairo_text_extents_t extents;
+  cairo_text_extents(cr, top_label, &extents);
+  cairo_move_to(cr, left - extents.width - 8.0, y_top);
   cairo_show_text(cr, top_label);
-  cairo_move_to(cr, left - 36.0, y_mid);
+  cairo_text_extents(cr, mid_label, &extents);
+  cairo_move_to(cr, left - extents.width - 8.0, y_mid);
   cairo_show_text(cr, mid_label);
-  cairo_move_to(cr, left - 36.0, y_bottom);
+  cairo_text_extents(cr, bottom_label, &extents);
+  cairo_move_to(cr, left - extents.width - 8.0, y_bottom);
   cairo_show_text(cr, bottom_label);
 }
 
@@ -6174,7 +8903,7 @@ draw_time_axis_labels(PumpkinWindow *self, cairo_t *cr, double left, double top,
   double y = top + graph_h + 14.0;
   double graph_w = width - left - right;
   double history_seconds = (double)STATS_SAMPLES * (double)current_stats_sample_msec(self) / 1000.0;
-  const int segments = 6;
+  const int segments = 2;
   set_cairo_source_rgba(cr, color);
   cairo_select_font_face(cr, "Sans", CAIRO_FONT_SLANT_NORMAL, CAIRO_FONT_WEIGHT_NORMAL);
   cairo_set_font_size(cr, 11.0);
@@ -6184,18 +8913,22 @@ draw_time_axis_labels(PumpkinWindow *self, cairo_t *cr, double left, double top,
     double x = left + graph_w * ratio;
     int seconds = (int)llround(history_seconds * (1.0 - ratio));
     g_autofree char *text = NULL;
-    if (seconds >= 60) {
+    if (seconds == 0) {
+      text = g_strdup("Now");
+    } else if (seconds >= 60) {
       int minutes = seconds / 60;
       int rem = seconds % 60;
       if (rem == 0) {
-        text = g_strdup_printf("%dm", minutes);
+        text = g_strdup_printf("-%dm", minutes);
       } else {
-        text = g_strdup_printf("%dm%02ds", minutes, rem);
+        text = g_strdup_printf("-%dm%02ds", minutes, rem);
       }
     } else {
-      text = g_strdup_printf("%ds", seconds);
+      text = g_strdup_printf("-%ds", seconds);
     }
-    cairo_move_to(cr, x - 10.0, y);
+    cairo_text_extents_t extents;
+    cairo_text_extents(cr, text, &extents);
+    cairo_move_to(cr, x - extents.width / 2.0, y);
     cairo_show_text(cr, text);
   }
 }
@@ -6204,12 +8937,9 @@ static void
 stats_graph_draw_usage(GtkDrawingArea *area, cairo_t *cr, int width, int height, gpointer data)
 {
   PumpkinWindow *self = PUMPKIN_WINDOW(data);
-  (void)area;
-
-  GdkRGBA fg = { .red = 0.45, .green = 0.45, .blue = 0.48, .alpha = 1.0 };
-  GdkRGBA border = { .red = 0.45, .green = 0.45, .blue = 0.48, .alpha = 1.0 };
+  GdkRGBA fg;
+  gtk_widget_get_color(GTK_WIDGET(area), &fg);
   GdkRGBA muted_fg = stats_color_with_alpha(fg, 0.78);
-  GdkRGBA muted_border = stats_color_with_alpha(border, 0.28);
 
   cairo_save(cr);
   cairo_set_operator(cr, CAIRO_OPERATOR_SOURCE);
@@ -6232,38 +8962,22 @@ stats_graph_draw_usage(GtkDrawingArea *area, cairo_t *cr, int width, int height,
   double right = 12.0;
   double bottom = 16.0;
 
-  int scale = usage_scale_percent(self);
-  int rows = scale == 5 ? 1 : scale / 10;
-  g_autofree char *top_label = g_strdup_printf("%d%%", scale);
-  g_autofree char *mid_label = g_strdup_printf("%d%%", scale == 5 ? 0 : scale / 2);
-  draw_stats_grid(cr, left, top, right, bottom, width, height, rows, &muted_border);
-  draw_stats_axis_labels(cr, left, top, right, bottom, width, height, rows,
-                         top_label, mid_label, "0%", &muted_fg);
+  draw_stats_axis_labels(cr, left, top, right, bottom, width, height, 2,
+                         "100%", "50%", "0%", &muted_fg);
   draw_time_axis_labels(self, cr, left, top, right, bottom, width, height, &muted_fg);
 
-  draw_stats_series(self, cr, self->stats_cpu, STATS_SAMPLES, self->stats_count, (double)scale,
-                    5, 0.93, 0.33, 0.33, left, top, right, bottom, width, height);
-  draw_stats_series(self, cr, self->stats_ram_mb, STATS_SAMPLES, self->stats_count, (double)scale,
-                    5, 0.33, 0.55, 0.93, left, top, right, bottom, width, height);
+  draw_stats_series(self, cr, self->stats_cpu, STATS_SAMPLES, self->stats_count, 100.0,
+                    1, 0.86, 0.53, 0.20, left, top, right, bottom, width, height);
+  draw_stats_hover(self, cr, 0, 100.0, left, top, right, bottom, width, height);
 }
 
 static void
-stats_graph_draw_players(GtkDrawingArea *area, cairo_t *cr, int width, int height, gpointer data)
+stats_graph_draw_ram(GtkDrawingArea *area, cairo_t *cr, int width, int height, gpointer data)
 {
   PumpkinWindow *self = PUMPKIN_WINDOW(data);
-  (void)area;
-
-  GdkRGBA fg = { .red = 0.45, .green = 0.45, .blue = 0.48, .alpha = 1.0 };
-  GdkRGBA border = { .red = 0.45, .green = 0.45, .blue = 0.48, .alpha = 1.0 };
+  GdkRGBA fg;
+  gtk_widget_get_color(GTK_WIDGET(area), &fg);
   GdkRGBA muted_fg = stats_color_with_alpha(fg, 0.78);
-  GdkRGBA muted_border = stats_color_with_alpha(border, 0.28);
-
-  cairo_save(cr);
-  cairo_set_operator(cr, CAIRO_OPERATOR_SOURCE);
-  cairo_set_source_rgba(cr, 0.0, 0.0, 0.0, 0.0);
-  cairo_rectangle(cr, 0, 0, width, height);
-  cairo_fill(cr);
-  cairo_restore(cr);
 
   if (self->stats_count < 2) {
     set_cairo_source_rgba(cr, &muted_fg);
@@ -6274,48 +8988,33 @@ stats_graph_draw_players(GtkDrawingArea *area, cairo_t *cr, int width, int heigh
     return;
   }
 
-  double left = 44.0;
-  double top = 12.0;
-  double right = 12.0;
-  double bottom = 16.0;
+  const double left = 72.0;
+  const double top = 12.0;
+  const double right = 12.0;
+  const double bottom = 16.0;
+  double scale_mb = stats_ram_scale(self);
+  g_autofree char *top_label = g_format_size_full((guint64)(scale_mb * 1024.0 * 1024.0),
+                                                   G_FORMAT_SIZE_IEC_UNITS);
+  g_autofree char *mid_label = g_format_size_full((guint64)(scale_mb * 512.0 * 1024.0),
+                                                   G_FORMAT_SIZE_IEC_UNITS);
 
-  draw_stats_grid(cr, left, top, right, bottom, width, height, 4, &muted_border);
-
-  double players_max = 1.0;
-  if (self->current != NULL) {
-    int max_players = preferred_max_players(self, self->current);
-    if (max_players > 0) {
-      players_max = (double)max_players;
-    }
-  }
-  if (players_max <= 1.0) {
-    double max_seen = 0.0;
-    for (int i = 0; i < self->stats_count; i++) {
-      max_seen = fmax(max_seen, stats_get_sample(self, self->stats_players, i));
-    }
-    players_max = max_seen > 0.0 ? max_seen : 1.0;
-  }
-
-  g_autofree char *top_label = g_strdup_printf("%d", (int)players_max);
-  g_autofree char *mid_label = g_strdup_printf("%d", (int)(players_max / 2.0));
-  draw_stats_axis_labels(cr, left, top, right, bottom, width, height, 4,
+  draw_stats_axis_labels(cr, left, top, right, bottom, width, height, 2,
                          top_label, mid_label, "0", &muted_fg);
   draw_time_axis_labels(self, cr, left, top, right, bottom, width, height, &muted_fg);
 
-  draw_stats_series(self, cr, self->stats_players, STATS_SAMPLES, self->stats_count, players_max,
-                    3, 0.95, 0.66, 0.26, left, top, right, bottom, width, height);
+  draw_stats_series(self, cr, self->stats_ram_mb, STATS_SAMPLES, self->stats_count, scale_mb,
+                    1, 0.33, 0.55, 0.93, left, top, right, bottom, width, height);
+  draw_stats_hover(self, cr, 1, scale_mb, left, top, right, bottom, width, height);
 }
+
 
 static void
 stats_graph_draw_disk(GtkDrawingArea *area, cairo_t *cr, int width, int height, gpointer data)
 {
   PumpkinWindow *self = PUMPKIN_WINDOW(data);
-  (void)area;
-
-  GdkRGBA fg = { .red = 0.45, .green = 0.45, .blue = 0.48, .alpha = 1.0 };
-  GdkRGBA border = { .red = 0.45, .green = 0.45, .blue = 0.48, .alpha = 1.0 };
+  GdkRGBA fg;
+  gtk_widget_get_color(GTK_WIDGET(area), &fg);
   GdkRGBA muted_fg = stats_color_with_alpha(fg, 0.78);
-  GdkRGBA muted_border = stats_color_with_alpha(border, 0.28);
 
   cairo_save(cr);
   cairo_set_operator(cr, CAIRO_OPERATOR_SOURCE);
@@ -6338,12 +9037,12 @@ stats_graph_draw_disk(GtkDrawingArea *area, cairo_t *cr, int width, int height, 
   double right = 12.0;
   double bottom = 16.0;
 
-  draw_stats_grid(cr, left, top, right, bottom, width, height, 4, &muted_border);
   draw_stats_axis_labels(cr, left, top, right, bottom, width, height, 4, "20", "10", "0", &muted_fg);
   draw_time_axis_labels(self, cr, left, top, right, bottom, width, height, &muted_fg);
 
   draw_stats_series(self, cr, self->stats_disk_mb, STATS_SAMPLES, self->stats_count, 20.0,
                     1, 0.35, 0.77, 0.45, left, top, right, bottom, width, height);
+  draw_stats_hover(self, cr, 2, 20.0, left, top, right, bottom, width, height);
 }
 
 static void
@@ -6371,8 +9070,17 @@ reset_stats_history(PumpkinWindow *self)
   self->stats_count = 0;
   memset(self->stats_cpu, 0, sizeof(self->stats_cpu));
   memset(self->stats_ram_mb, 0, sizeof(self->stats_ram_mb));
+  self->stats_ram_limit_mb = 0.0;
   memset(self->stats_disk_mb, 0, sizeof(self->stats_disk_mb));
   memset(self->stats_players, 0, sizeof(self->stats_players));
+  memset(self->stats_time_usec, 0, sizeof(self->stats_time_usec));
+  for (guint i = 0; i < G_N_ELEMENTS(self->stats_hover_index); i++) {
+    self->stats_hover_index[i] = -1;
+  }
+  self->stats_hover_metric = -1;
+  if (self->stats_hover_label != NULL) {
+    gtk_widget_set_visible(GTK_WIDGET(self->stats_hover_label), FALSE);
+  }
   self->last_tps = 0.0;
   self->last_tps_valid = FALSE;
   self->tps_enabled = FALSE;
@@ -6387,7 +9095,7 @@ set_stats_graphs_disabled(PumpkinWindow *self, gboolean disabled)
 
   GtkWidget *graphs[3] = {
     self->stats_graph_usage != NULL ? GTK_WIDGET(self->stats_graph_usage) : NULL,
-    self->stats_graph_players != NULL ? GTK_WIDGET(self->stats_graph_players) : NULL,
+    self->stats_graph_ram != NULL ? GTK_WIDGET(self->stats_graph_ram) : NULL,
     self->stats_graph_disk != NULL ? GTK_WIDGET(self->stats_graph_disk) : NULL
   };
 
@@ -6586,32 +9294,20 @@ update_stats_tick(gpointer data)
         start_query_players(self, self->current);
       }
       if (now_mono - self->last_tps_request_at >= tps_query_interval_usec(self)) {
-        if (pumpkin_server_send_command(self->current, "tps", NULL)) {
-          if (self->pending_auto_tps_lines < 8) {
-            self->pending_auto_tps_lines++;
-          }
-        }
+        pumpkin_server_send_poll_command(self->current, "tps");
         self->last_tps_request_at = now_mono;
       }
       if (now_mono - self->last_player_list_request_at >= player_list_query_interval_usec(self)) {
-        if (pumpkin_server_send_command(self->current, "list", NULL)) {
-          if (self->pending_auto_list_lines < 8) {
-            self->pending_auto_list_lines++;
-          }
-        }
+        pumpkin_server_send_poll_command(self->current, "list uuids");
         self->last_player_list_request_at = now_mono;
       }
     } else if (!server_running) {
       self->query_valid = FALSE;
       self->tps_enabled = FALSE;
       self->last_tps_valid = FALSE;
-      self->pending_auto_tps_lines = 0;
-      self->pending_auto_list_lines = 0;
       self->list_snapshot_players = 0;
       self->list_snapshot_max_players = 0;
       self->list_snapshot_updated_at = 0;
-      self->pending_java_platform_hints = 0;
-      self->pending_bedrock_platform_hints = 0;
     }
     if (list_snapshot_is_fresh(self)) {
       players_count = self->list_snapshot_players;
@@ -6644,23 +9340,19 @@ update_stats_tick(gpointer data)
     self->last_proc_pid = pid;
   }
 
-  if (has_system_cpu && pid > 0 && read_process_stats(pid, &proc_ticks, &rss) && prev_total != 0) {
+  gboolean has_process_stats = pid > 0 && read_process_stats(pid, &proc_ticks, &rss);
+  gboolean has_cpu_sample = FALSE;
+  if (has_system_cpu && has_process_stats && prev_total != 0) {
     if (self->last_proc_jiffies != 0 && total > prev_total) {
       unsigned long long delta_proc = proc_ticks - self->last_proc_jiffies;
       unsigned long long delta_total = total - prev_total;
       if (delta_total > 0) {
         proc_cpu = (double)delta_proc / (double)delta_total * 100.0;
+        has_cpu_sample = TRUE;
       }
     }
-    if (self->last_proc_cpu_smoothed <= 0.01) {
-      self->last_proc_cpu_smoothed = proc_cpu;
-    } else {
-      self->last_proc_cpu_smoothed = (self->last_proc_cpu_smoothed * 0.72) + (proc_cpu * 0.28);
-    }
-    proc_cpu = self->last_proc_cpu_smoothed;
     self->last_proc_jiffies = proc_ticks;
   } else {
-    self->last_proc_cpu_smoothed = 0.0;
     self->last_proc_jiffies = 0;
     if (pid == 0) {
       self->last_proc_pid = 0;
@@ -6687,21 +9379,8 @@ update_stats_tick(gpointer data)
   }
 
   double rss_mb = (rss > 0) ? (double)rss / (1024.0 * 1024.0) : 0.0;
-  double ram_limit_mb = 0.0;
-  if (max_ram_mb > 0) {
-    ram_limit_mb = (double)max_ram_mb;
-  } else if (mem_total > 0) {
-    ram_limit_mb = (double)mem_total / (1024.0 * 1024.0);
-  }
-  double ram_pct = 0.0;
-  if (ram_limit_mb > 0.0) {
-    ram_pct = (rss_mb / ram_limit_mb) * 100.0;
-  }
-  if (ram_pct > 100.0) {
-    ram_pct = 100.0;
-  } else if (ram_pct < 0.0) {
-    ram_pct = 0.0;
-  }
+  double ram_limit_mb = max_ram_mb > 0 ? (double)max_ram_mb : 0.0;
+  self->stats_ram_limit_mb = ram_limit_mb;
 
   if (server_running) {
     if (self->last_tps_valid) {
@@ -6722,9 +9401,10 @@ update_stats_tick(gpointer data)
       self->stats_disk_mb[self->stats_index] = 0.0;
     }
 
-    self->stats_cpu[self->stats_index] = proc_cpu;
-    self->stats_ram_mb[self->stats_index] = ram_pct;
+    self->stats_cpu[self->stats_index] = has_cpu_sample ? proc_cpu : NAN;
+    self->stats_ram_mb[self->stats_index] = has_process_stats && rss > 0 ? rss_mb : NAN;
     self->stats_players[self->stats_index] = (double)players_count;
+    self->stats_time_usec[self->stats_index] = g_get_monotonic_time();
     self->stats_index = (self->stats_index + 1) % STATS_SAMPLES;
     if (self->stats_count < STATS_SAMPLES) {
       self->stats_count++;
@@ -6734,8 +9414,8 @@ update_stats_tick(gpointer data)
   if (self->stats_graph_usage != NULL) {
     gtk_widget_queue_draw(GTK_WIDGET(self->stats_graph_usage));
   }
-  if (self->stats_graph_players != NULL) {
-    gtk_widget_queue_draw(GTK_WIDGET(self->stats_graph_players));
+  if (self->stats_graph_ram != NULL) {
+    gtk_widget_queue_draw(GTK_WIDGET(self->stats_graph_ram));
   }
   if (self->stats_graph_disk != NULL) {
     gtk_widget_queue_draw(GTK_WIDGET(self->stats_graph_disk));
@@ -6743,7 +9423,7 @@ update_stats_tick(gpointer data)
 
   if (server_running) {
     if (self->label_stats_cpu != NULL) {
-      g_autofree char *val = g_strdup_printf("CPU %.1f%%", proc_cpu);
+      g_autofree char *val = has_cpu_sample ? g_strdup_printf("%.1f%%", proc_cpu) : g_strdup("--");
       gtk_label_set_text(self->label_stats_cpu, val);
     }
     if (self->label_stats_ram != NULL) {
@@ -6751,32 +9431,45 @@ update_stats_tick(gpointer data)
         g_autofree char *used_str = g_format_size_full((guint64)rss, G_FORMAT_SIZE_IEC_UNITS);
         g_autofree char *limit_str = g_format_size_full((guint64)(ram_limit_mb * 1024.0 * 1024.0),
                                                         G_FORMAT_SIZE_IEC_UNITS);
-        g_autofree char *val = g_strdup_printf("RAM %s / %s (%.0f%%)", used_str, limit_str, ram_pct);
+        g_autofree char *val = g_strdup_printf("%s / %s", used_str, limit_str);
         gtk_label_set_text(self->label_stats_ram, val);
       } else if (rss > 0) {
         g_autofree char *used_str = g_format_size_full((guint64)rss, G_FORMAT_SIZE_IEC_UNITS);
-        g_autofree char *val = g_strdup_printf("RAM %s", used_str);
+        g_autofree char *val = g_strdup(used_str);
         gtk_label_set_text(self->label_stats_ram, val);
       } else {
-        gtk_label_set_text(self->label_stats_ram, "RAM --");
+        gtk_label_set_text(self->label_stats_ram, "--");
       }
     }
     if (self->label_stats_disk != NULL) {
       if (self->last_tps_valid) {
-        g_autofree char *val = g_strdup_printf("TPS %.1f", self->last_tps);
+        g_autofree char *val = g_strdup_printf("%.1f", self->last_tps);
         gtk_label_set_text(self->label_stats_disk, val);
       } else {
-        gtk_label_set_text(self->label_stats_disk, "TPS --");
+        gtk_label_set_text(self->label_stats_disk, "--");
       }
     }
     if (self->label_stats_players != NULL) {
       g_autofree char *val = NULL;
       if (max_players > 0) {
-        val = g_strdup_printf("Players %d / %d", players_count, max_players);
+        val = g_strdup_printf("%d / %d", players_count, max_players);
       } else {
-        val = g_strdup_printf("Players %d", players_count);
+        val = g_strdup_printf("%d", players_count);
       }
       gtk_label_set_text(self->label_stats_players, val);
+    }
+  } else {
+    if (self->label_stats_cpu != NULL) {
+      gtk_label_set_text(self->label_stats_cpu, "--");
+    }
+    if (self->label_stats_ram != NULL) {
+      gtk_label_set_text(self->label_stats_ram, "--");
+    }
+    if (self->label_stats_players != NULL) {
+      gtk_label_set_text(self->label_stats_players, "--");
+    }
+    if (self->label_stats_disk != NULL) {
+      gtk_label_set_text(self->label_stats_disk, "--");
     }
   }
 
@@ -6825,16 +9518,63 @@ load_server_list(PumpkinWindow *self)
   }
 
   GtkListBoxRow *first = gtk_list_box_get_row_at_index(self->server_list, 0);
-  if (first != NULL) {
+  if (first != NULL && pumpkin_platform_supports_local_hosting()) {
     gtk_list_box_select_row(self->server_list, first);
   }
   refresh_overview_list(self);
 }
 
+static gboolean
+plugin_actions_are_open(GtkWidget *widget)
+{
+  if (GTK_IS_MENU_BUTTON(widget)) {
+    GtkPopover *popover = gtk_menu_button_get_popover(GTK_MENU_BUTTON(widget));
+    if (popover != NULL && gtk_widget_get_mapped(GTK_WIDGET(popover))) {
+      return TRUE;
+    }
+  }
+  for (GtkWidget *child = gtk_widget_get_first_child(widget); child != NULL;
+       child = gtk_widget_get_next_sibling(child)) {
+    if (plugin_actions_are_open(child)) {
+      return TRUE;
+    }
+  }
+  return FALSE;
+}
+
+static gboolean
+refresh_plugins_after_menu_closed(gpointer data)
+{
+  PumpkinWindow *self = PUMPKIN_WINDOW(data);
+  if (!self->disposing && gtk_widget_get_visible(GTK_WIDGET(self))) {
+    refresh_plugin_list(self);
+  }
+  return G_SOURCE_REMOVE;
+}
+
+static void
+on_plugin_actions_closed(GtkPopover *popover, PumpkinWindow *self)
+{
+  (void)popover;
+  if (self->disposing) {
+    return;
+  }
+  /* Do not destroy the clicked action while its signal is still dispatching. */
+  g_idle_add_full(G_PRIORITY_DEFAULT_IDLE, refresh_plugins_after_menu_closed,
+                  g_object_ref(self), g_object_unref);
+}
+
 static void
 refresh_plugin_list(PumpkinWindow *self)
 {
+  if (self->disposing) {
+    return;
+  }
+  if (plugin_actions_are_open(GTK_WIDGET(self->plugin_list))) {
+    return;
+  }
   clear_list_box(self->plugin_list);
+  g_autoptr(GHashTable) runtime_issues = collect_plugin_runtime_issues(self);
   if (self->current == NULL) {
     if (self->plugin_drop_hint != NULL) {
       gtk_widget_set_visible(GTK_WIDGET(self->plugin_drop_hint), TRUE);
@@ -6848,9 +9588,11 @@ refresh_plugin_list(PumpkinWindow *self)
     return;
   }
 
-  gboolean busy = (self->ui_state == UI_STATE_STARTING || self->ui_state == UI_STATE_RESTARTING);
+  gboolean busy = (self->ui_state == UI_STATE_STARTING || self->ui_state == UI_STATE_RESTARTING ||
+                   self->marketplace_install_in_flight);
   const char *entry = NULL;
   while ((entry = g_dir_read_name(dir)) != NULL) {
+    if (pumpkin_map_is_internal_plugin(entry)) continue;
     gboolean disabled = g_str_has_suffix(entry, ".disabled") || g_str_has_suffix(entry, ".deactivated");
     gboolean is_so = g_str_has_suffix(entry, ".so") ||
                      g_str_has_suffix(entry, ".so.disabled") ||
@@ -6870,12 +9612,19 @@ refresh_plugin_list(PumpkinWindow *self)
 
     GtkWidget *row = gtk_list_box_row_new();
     GtkWidget *box = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 8);
-    GtkWidget *label = gtk_label_new(display);
     g_autofree char *plugin_path = g_build_filename(plugins_dir, entry, NULL);
+    g_autofree char *plugin_name = plugin_display_name(plugins_dir, display);
+    g_autofree char *plugin_key = normalized_key(plugin_name);
+    g_autofree char *version = plugin_version_label(plugins_dir, display);
+    GtkWidget *label = gtk_label_new(plugin_name != NULL && *plugin_name != '\0' ? plugin_name : display);
+    const MarketPlugin *market_plugin = find_market_plugin_for_file(self, plugins_dir, entry);
+    PluginRuntimeIssue *runtime_issue =
+      plugin_key != NULL ? g_hash_table_lookup(runtime_issues, plugin_key) : NULL;
     GStatBuf plugin_st;
     gboolean has_size = (g_stat(plugin_path, &plugin_st) == 0);
     GtkWidget *toggle = gtk_switch_new();
-    GtkWidget *btn_delete = gtk_button_new_with_label("Delete");
+    GtkWidget *btn_delete = gtk_button_new_with_label("Remove plugin…");
+    GtkWidget *menu_content = gtk_box_new(GTK_ORIENTATION_VERTICAL, 0);
 
     gtk_switch_set_active(GTK_SWITCH(toggle), !disabled);
     gtk_widget_set_hexpand(label, TRUE);
@@ -6889,11 +9638,24 @@ refresh_plugin_list(PumpkinWindow *self)
     gtk_widget_set_sensitive(toggle, !busy);
 
     gtk_box_append(GTK_BOX(box), label);
-    g_autofree char *version = plugin_version_label(plugins_dir, display);
     if (version != NULL) {
       GtkWidget *ver_label = gtk_label_new(version);
       gtk_widget_add_css_class(ver_label, "dim-label");
       gtk_box_append(GTK_BOX(box), ver_label);
+    }
+    if (market_plugin != NULL) {
+      GtkWidget *market_badge = create_market_badge("Market", NULL);
+      gtk_box_append(GTK_BOX(box), market_badge);
+      if (market_plugin->version != NULL && *market_plugin->version != '\0' &&
+          compare_versions_simple(version, market_plugin->version) < 0) {
+        g_autofree char *update_label = g_strdup_printf("Update %s", market_plugin->version);
+        gtk_box_append(GTK_BOX(box), create_market_badge(update_label, "status-running"));
+      }
+    }
+    if (runtime_issue != NULL) {
+      GtkWidget *issue_badge = create_market_badge(runtime_issue->summary, "warning-badge");
+      gtk_widget_set_tooltip_text(issue_badge, "Open the warning button for details");
+      gtk_box_append(GTK_BOX(box), issue_badge);
     }
     if (has_size) {
       g_autofree char *size = g_format_size_full((guint64)plugin_st.st_size, G_FORMAT_SIZE_IEC_UNITS);
@@ -6901,23 +9663,61 @@ refresh_plugin_list(PumpkinWindow *self)
       gtk_widget_add_css_class(size_label, "dim-label");
       gtk_box_append(GTK_BOX(box), size_label);
     }
+    if (market_plugin != NULL) {
+      GtkWidget *btn_market = gtk_button_new_with_label("View in Marketplace");
+      gtk_widget_add_css_class(btn_market, "flat");
+      gtk_label_set_xalign(GTK_LABEL(gtk_button_get_child(GTK_BUTTON(btn_market))), 0.0f);
+      gtk_widget_set_sensitive(btn_market, TRUE);
+      g_object_set_data_full(G_OBJECT(btn_market), "market-plugin-query",
+                             g_strdup(plugin_name != NULL ? plugin_name : market_plugin->name),
+                             g_free);
+      g_signal_connect(btn_market, "clicked", G_CALLBACK(on_plugin_market_clicked), self);
+      gtk_box_append(GTK_BOX(menu_content), btn_market);
+    }
+    if (runtime_issue != NULL) {
+      GtkWidget *btn_issue = gtk_button_new_from_icon_name("dialog-warning-symbolic");
+      gtk_widget_set_tooltip_text(btn_issue, runtime_issue->summary);
+      gtk_widget_add_css_class(btn_issue, "flat");
+      gtk_widget_add_css_class(btn_issue, "small");
+      gtk_widget_add_css_class(btn_issue, "compact-button");
+      gtk_widget_add_css_class(btn_issue, "warning");
+      gtk_widget_set_valign(btn_issue, GTK_ALIGN_CENTER);
+      gtk_widget_set_vexpand(btn_issue, FALSE);
+      g_object_set_data_full(G_OBJECT(btn_issue), "plugin-issue-summary",
+                             g_strdup(runtime_issue->summary), g_free);
+      g_object_set_data_full(G_OBJECT(btn_issue), "plugin-issue-detail",
+                             g_strdup(runtime_issue->detail), g_free);
+      g_signal_connect(btn_issue, "clicked", G_CALLBACK(on_plugin_issue_clicked), self);
+      gtk_box_append(GTK_BOX(box), btn_issue);
+    }
     gtk_box_append(GTK_BOX(box), toggle);
-    gtk_button_set_icon_name(GTK_BUTTON(btn_delete), "user-trash-symbolic");
-    gtk_widget_set_tooltip_text(btn_delete, "Delete plugin");
+    GtkWidget *btn_folder = gtk_button_new_with_label("Open plugins folder");
+    gtk_widget_add_css_class(btn_folder, "flat");
+    gtk_label_set_xalign(GTK_LABEL(gtk_button_get_child(GTK_BUTTON(btn_folder))), 0.0f);
+    g_signal_connect(btn_folder, "clicked", G_CALLBACK(on_open_plugins), self);
+    gtk_box_append(GTK_BOX(menu_content), btn_folder);
+    gtk_box_append(GTK_BOX(menu_content), gtk_separator_new(GTK_ORIENTATION_HORIZONTAL));
     gtk_widget_add_css_class(btn_delete, "destructive-action");
     gtk_widget_add_css_class(btn_delete, "flat");
-    gtk_widget_add_css_class(btn_delete, "small");
-    gtk_widget_add_css_class(btn_delete, "compact-button");
-    gtk_widget_add_css_class(btn_delete, "plugin-delete-button");
+    gtk_label_set_xalign(GTK_LABEL(gtk_button_get_child(GTK_BUTTON(btn_delete))), 0.0f);
     gtk_widget_set_valign(btn_delete, GTK_ALIGN_CENTER);
     gtk_widget_set_vexpand(btn_delete, FALSE);
     gtk_widget_set_sensitive(btn_delete, !busy);
     g_object_set_data_full(G_OBJECT(btn_delete), "plugin-file", g_strdup(entry), g_free);
     g_object_set_data_full(G_OBJECT(btn_delete), "plugin-dir", g_strdup(plugins_dir), g_free);
     g_signal_connect(btn_delete, "clicked", G_CALLBACK(on_plugin_delete_clicked), self);
-    gtk_box_append(GTK_BOX(box), btn_delete);
+    GtkWidget *actions = gtk_menu_button_new();
+    gtk_menu_button_set_icon_name(GTK_MENU_BUTTON(actions), "view-more-symbolic");
+    gtk_widget_set_tooltip_text(actions, "Plugin actions");
+    gtk_widget_add_css_class(actions, "flat");
+    gtk_widget_set_valign(actions, GTK_ALIGN_CENTER);
+    GtkWidget *popover = gtk_popover_new();
+    gtk_box_append(GTK_BOX(menu_content), btn_delete);
+    gtk_popover_set_child(GTK_POPOVER(popover), menu_content);
+    g_signal_connect_object(popover, "closed", G_CALLBACK(on_plugin_actions_closed), self, 0);
+    gtk_menu_button_set_popover(GTK_MENU_BUTTON(actions), popover);
+    gtk_box_append(GTK_BOX(box), actions);
     gtk_list_box_row_set_child(GTK_LIST_BOX_ROW(row), box);
-    attach_hover_delete_button(row, btn_delete);
 
     g_object_set_data_full(G_OBJECT(row), "plugin-file", g_strdup(entry), g_free);
     g_object_set_data_full(G_OBJECT(toggle), "plugin-file", g_strdup(entry), g_free);
@@ -6933,97 +9733,12 @@ refresh_plugin_list(PumpkinWindow *self)
   }
 }
 
-static void
-refresh_world_list(PumpkinWindow *self)
+
+static char *
+player_metadata_key(const char *name, const char *uuid)
 {
-  clear_list_box(self->world_list);
-  if (self->current == NULL) {
-    if (self->world_drop_hint != NULL) {
-      gtk_widget_set_visible(GTK_WIDGET(self->world_drop_hint), TRUE);
-    }
-    return;
-  }
-
-  gboolean running = server_is_running_ui(self, self->current);
-  gboolean busy = (self->ui_state == UI_STATE_STARTING || self->ui_state == UI_STATE_RESTARTING);
-  g_autofree char *worlds_dir = pumpkin_server_get_worlds_dir(self->current);
-  GDir *dir = g_dir_open(worlds_dir, 0, NULL);
-  if (dir != NULL) {
-    const char *entry = NULL;
-    while ((entry = g_dir_read_name(dir)) != NULL) {
-      g_autofree char *child = g_build_filename(worlds_dir, entry, NULL);
-      if (!g_file_test(child, G_FILE_TEST_IS_DIR)) {
-        continue;
-      }
-
-      GtkWidget *row = gtk_list_box_row_new();
-      GtkWidget *box = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 8);
-      GtkWidget *label = gtk_label_new(entry);
-      gtk_label_set_xalign(GTK_LABEL(label), 0.0);
-      gtk_widget_set_hexpand(label, TRUE);
-
-      guint64 size_bytes = dir_size_bytes(child);
-      g_autofree char *size = g_format_size_full(size_bytes, G_FORMAT_SIZE_IEC_UNITS);
-      GtkWidget *size_label = gtk_label_new(size);
-      gtk_label_set_xalign(GTK_LABEL(size_label), 1.0);
-      gtk_widget_add_css_class(size_label, "dim-label");
-
-      gtk_box_append(GTK_BOX(box), label);
-      gtk_box_append(GTK_BOX(box), size_label);
-
-      GtkWidget *btn_delete = gtk_button_new();
-      gtk_button_set_icon_name(GTK_BUTTON(btn_delete), "user-trash-symbolic");
-      gtk_widget_set_tooltip_text(btn_delete, "Delete world");
-      gtk_widget_add_css_class(btn_delete, "destructive-action");
-      gtk_widget_add_css_class(btn_delete, "flat");
-      gtk_widget_set_sensitive(btn_delete, !running && !busy);
-      g_object_set_data_full(G_OBJECT(btn_delete), "world-path", g_strdup(child), g_free);
-      g_signal_connect(btn_delete, "clicked", G_CALLBACK(on_world_delete_clicked), self);
-      gtk_box_append(GTK_BOX(box), btn_delete);
-
-      gtk_list_box_row_set_child(GTK_LIST_BOX_ROW(row), box);
-      attach_hover_delete_button(row, btn_delete);
-      gtk_list_box_append(self->world_list, row);
-    }
-    g_dir_close(dir);
-  }
-
-  g_autofree char *default_world = g_build_filename(pumpkin_server_get_data_dir(self->current), "world", NULL);
-  if (g_file_test(default_world, G_FILE_TEST_IS_DIR)) {
-    GtkWidget *row = gtk_list_box_row_new();
-    GtkWidget *box = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 8);
-    GtkWidget *label = gtk_label_new("world");
-    gtk_label_set_xalign(GTK_LABEL(label), 0.0);
-    gtk_widget_set_hexpand(label, TRUE);
-
-    guint64 size_bytes = dir_size_bytes(default_world);
-    g_autofree char *size = g_format_size_full(size_bytes, G_FORMAT_SIZE_IEC_UNITS);
-    GtkWidget *size_label = gtk_label_new(size);
-    gtk_label_set_xalign(GTK_LABEL(size_label), 1.0);
-    gtk_widget_add_css_class(size_label, "dim-label");
-
-    gtk_box_append(GTK_BOX(box), label);
-    gtk_box_append(GTK_BOX(box), size_label);
-
-    GtkWidget *btn_delete = gtk_button_new();
-    gtk_button_set_icon_name(GTK_BUTTON(btn_delete), "user-trash-symbolic");
-    gtk_widget_set_tooltip_text(btn_delete, "Delete world");
-    gtk_widget_add_css_class(btn_delete, "destructive-action");
-    gtk_widget_add_css_class(btn_delete, "flat");
-    gtk_widget_set_sensitive(btn_delete, !running && !busy);
-    g_object_set_data_full(G_OBJECT(btn_delete), "world-path", g_strdup(default_world), g_free);
-    g_signal_connect(btn_delete, "clicked", G_CALLBACK(on_world_delete_clicked), self);
-    gtk_box_append(GTK_BOX(box), btn_delete);
-
-    gtk_list_box_row_set_child(GTK_LIST_BOX_ROW(row), box);
-    attach_hover_delete_button(row, btn_delete);
-    gtk_list_box_append(self->world_list, row);
-  }
-
-  if (self->world_drop_hint != NULL) {
-    gboolean empty = (gtk_list_box_get_row_at_index(self->world_list, 0) == NULL);
-    gtk_widget_set_visible(GTK_WIDGET(self->world_drop_hint), empty);
-  }
+  /* A UUID-qualified role must not leak to another account with the same name. */
+  return normalized_key(uuid != NULL && g_uuid_string_is_valid(uuid) ? uuid : name);
 }
 
 static void
@@ -7032,14 +9747,8 @@ player_lookup_add_set(GHashTable *set, const char *name, const char *uuid)
   if (set == NULL) {
     return;
   }
-  g_autofree char *name_key = normalized_key(name);
-  g_autofree char *uuid_key = normalized_key(uuid);
-  if (name_key != NULL && *name_key != '\0') {
-    g_hash_table_add(set, g_strdup(name_key));
-  }
-  if (uuid_key != NULL && *uuid_key != '\0') {
-    g_hash_table_add(set, g_strdup(uuid_key));
-  }
+  g_autofree char *key = player_metadata_key(name, uuid);
+  if (key != NULL && *key != '\0') g_hash_table_add(set, g_strdup(key));
 }
 
 static void
@@ -7048,15 +9757,9 @@ player_lookup_add_reason(GHashTable *map, const char *name, const char *uuid, co
   if (map == NULL) {
     return;
   }
-  g_autofree char *name_key = normalized_key(name);
-  g_autofree char *uuid_key = normalized_key(uuid);
+  g_autofree char *key = player_metadata_key(name, uuid);
   const char *stored = (reason != NULL && *reason != '\0') ? reason : "";
-  if (name_key != NULL && *name_key != '\0') {
-    g_hash_table_replace(map, g_strdup(name_key), g_strdup(stored));
-  }
-  if (uuid_key != NULL && *uuid_key != '\0') {
-    g_hash_table_replace(map, g_strdup(uuid_key), g_strdup(stored));
-  }
+  if (key != NULL && *key != '\0') g_hash_table_replace(map, g_strdup(key), g_strdup(stored));
 }
 
 static void
@@ -7079,16 +9782,10 @@ player_lookup_add_op_level(GHashTable *map, const char *name, const char *uuid, 
   if (map == NULL) {
     return;
   }
-  int stored_level = op_level >= 0 ? op_level : 0;
+  int stored_level = CLAMP(op_level, 0, G_MAXINT - 1);
   gpointer value = GINT_TO_POINTER(stored_level + 1);
-  g_autofree char *name_key = normalized_key(name);
-  g_autofree char *uuid_key = normalized_key(uuid);
-  if (name_key != NULL && *name_key != '\0') {
-    g_hash_table_replace(map, g_strdup(name_key), value);
-  }
-  if (uuid_key != NULL && *uuid_key != '\0') {
-    g_hash_table_replace(map, g_strdup(uuid_key), value);
-  }
+  g_autofree char *key = player_metadata_key(name, uuid);
+  if (key != NULL && *key != '\0') g_hash_table_replace(map, g_strdup(key), value);
 }
 
 static gboolean
@@ -7133,6 +9830,50 @@ player_lookup_reason_for_ip_variants(GHashTable *map, const char *ip)
 }
 
 static void
+on_player_head_changed(GtkImage *image, GParamSpec *pspec, PumpkinWindow *self)
+{
+  (void)pspec;
+  if (!pumpkin_player_head_is_java(image) || self->current == NULL ||
+      self->current != g_object_get_data(G_OBJECT(image), "player-server") ||
+      self->player_states == NULL) return;
+  const char *uuid = g_object_get_data(G_OBJECT(image), "player-uuid");
+  PlayerState *state = ensure_player_state(self, uuid, NULL, FALSE);
+  if (state != NULL && state->platform == PLAYER_PLATFORM_UNKNOWN) {
+    state->platform = PLAYER_PLATFORM_JAVA;
+    player_states_set_dirty(self);
+    invalidate_player_list_signature(self);
+  }
+}
+
+static void
+set_player_head(PumpkinWindow *self, GtkImage *image, PlayerState *state)
+{
+  if (state == NULL) return;
+  g_object_set_data_full(G_OBJECT(image), "player-uuid", g_strdup(state->uuid), g_free);
+  g_object_set_data_full(G_OBJECT(image), "player-server", g_object_ref(self->current), g_object_unref);
+  g_signal_connect_object(image, "notify::paintable", G_CALLBACK(on_player_head_changed), self, 0);
+  pumpkin_player_head_set(image, state->uuid, state->name,
+    state->platform == PLAYER_PLATFORM_JAVA, state->platform == PLAYER_PLATFORM_BEDROCK);
+}
+
+static void
+update_player_row_activity(PumpkinWindow *self, GtkListBox *list)
+{
+  for (GtkWidget *row = gtk_widget_get_first_child(GTK_WIDGET(list)); row != NULL;
+       row = gtk_widget_get_next_sibling(row)) {
+    const char *key = g_object_get_data(G_OBJECT(row), "activity-player-key");
+    GtkLabel *label = g_object_get_data(G_OBJECT(row), "activity-label");
+    PlayerState *state = key != NULL ? g_hash_table_lookup(self->player_states, key) : NULL;
+    if (state == NULL || label == NULL) continue;
+    g_autofree char *played = format_duration(player_state_effective_playtime(state));
+    g_autofree char *seen = relative_time_label(state->last_online_unix);
+    g_autofree char *text = state->online ? g_strdup_printf("Played %s", played)
+      : g_strdup_printf("Played %s  ·  Last seen %s", played, seen);
+    gtk_label_set_text(label, text);
+  }
+}
+
+static void
 append_player_state_row(PumpkinWindow *self,
                         GtkListBox *list,
                         PlayerState *state,
@@ -7149,111 +9890,109 @@ append_player_state_row(PumpkinWindow *self,
   }
 
   const char *display_name = state->name != NULL && *state->name != '\0'
-                               ? state->name
-                               : (state->uuid != NULL ? state->uuid : "Unknown");
-
+                               ? state->name : "Unknown player";
   g_autofree char *playtime = format_duration(player_state_effective_playtime(state));
-  g_autofree char *last_seen = state->online
-                                ? g_strdup("Online now")
-                                : relative_time_label(state->last_online_unix);
-  g_autofree char *first_joined = format_unix_time(self, state->first_joined_unix);
-
-  g_autofree char *meta = g_strdup_printf("Played %s · Last seen %s · First joined %s",
-                                          playtime, last_seen, first_joined);
-  if (banned && ban_reason != NULL && *ban_reason != '\0') {
-    g_autofree char *with_reason = g_strdup_printf("%s · Ban reason: %s", meta, ban_reason);
-    g_free(meta);
-    meta = g_strdup(with_reason);
-  }
-  if (ip_banned) {
-    if (ip_ban_reason != NULL && *ip_ban_reason != '\0') {
-      g_autofree char *with_ip_reason = g_strdup_printf("%s · IP ban reason: %s", meta, ip_ban_reason);
-      g_free(meta);
-      meta = g_strdup(with_ip_reason);
-    } else {
-      g_autofree char *with_ip = g_strdup_printf("%s · IP banned", meta);
-      g_free(meta);
-      meta = g_strdup(with_ip);
-    }
-  }
-  gboolean is_op = op_level >= 0;
-  gboolean is_admin = player_is_admin_from_op_level(op_level);
+  g_autofree char *last_seen = relative_time_label(state->last_online_unix);
+  g_autofree char *meta = state->online
+    ? g_strdup_printf("Played %s", playtime)
+    : g_strdup_printf("Played %s  ·  Last seen %s", playtime, last_seen);
 
   GtkWidget *row = gtk_list_box_row_new();
-  GtkWidget *box = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 10);
-  gtk_widget_set_margin_top(box, 4);
-  gtk_widget_set_margin_bottom(box, 4);
-  gtk_widget_set_margin_start(box, 4);
-  gtk_widget_set_margin_end(box, 4);
+  gtk_widget_add_css_class(row, "player-row");
+  GtkWidget *box = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 12);
+  gtk_widget_set_margin_top(box, 12);
+  gtk_widget_set_margin_bottom(box, 12);
+  gtk_widget_set_margin_start(box, 12);
+  gtk_widget_set_margin_end(box, 12);
 
-  GtkWidget *avatar = gtk_image_new_from_icon_name("avatar-default-symbolic");
-  gtk_image_set_pixel_size(GTK_IMAGE(avatar), 32);
-  set_player_head_image(self, GTK_IMAGE(avatar), state->uuid);
-  gtk_box_append(GTK_BOX(box), avatar);
+  GtkWidget *avatar_frame = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 0);
+  gtk_widget_add_css_class(avatar_frame, "player-head");
+  gtk_widget_set_valign(avatar_frame, GTK_ALIGN_CENTER);
+  gtk_widget_set_overflow(avatar_frame, GTK_OVERFLOW_HIDDEN);
+  GtkWidget *avatar = gtk_image_new();
+  gtk_image_set_pixel_size(GTK_IMAGE(avatar), 48);
+  set_player_head(self, GTK_IMAGE(avatar), state);
+  gtk_box_append(GTK_BOX(avatar_frame), avatar);
+  gtk_box_append(GTK_BOX(box), avatar_frame);
 
-  GtkWidget *text_box = gtk_box_new(GTK_ORIENTATION_VERTICAL, 4);
+  GtkWidget *text_box = gtk_box_new(GTK_ORIENTATION_VERTICAL, 5);
   gtk_widget_set_hexpand(text_box, TRUE);
-
-  GtkWidget *title_row = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 6);
+  gtk_widget_set_valign(text_box, GTK_ALIGN_CENTER);
+  GtkWidget *title_row = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 8);
   GtkWidget *name_label = gtk_label_new(display_name);
   gtk_label_set_xalign(GTK_LABEL(name_label), 0.0);
-  gtk_widget_set_hexpand(name_label, TRUE);
-  if (!state->online) {
-    gtk_widget_add_css_class(name_label, "dim-label");
-  }
+  gtk_label_set_ellipsize(GTK_LABEL(name_label), PANGO_ELLIPSIZE_END);
+  gtk_widget_add_css_class(name_label, "player-name");
   gtk_box_append(GTK_BOX(title_row), name_label);
-
-  GtkWidget *platform_chip = gtk_label_new(platform_label(state->platform));
-  gtk_widget_add_css_class(platform_chip, "status-badge");
-  gtk_widget_add_css_class(platform_chip, "player-platform-badge");
-  gtk_box_append(GTK_BOX(title_row), platform_chip);
-
-  GtkWidget *status_chip = gtk_label_new(state->online ? "Online" : "Offline");
-  gtk_widget_add_css_class(status_chip, "status-badge");
-  gtk_widget_add_css_class(status_chip, state->online ? "status-running" : "status-stopped");
-  gtk_box_append(GTK_BOX(title_row), status_chip);
-
-  if (whitelisted) {
-    GtkWidget *whitelist_chip = gtk_label_new("Whitelisted");
-    gtk_widget_add_css_class(whitelist_chip, "status-badge");
-    gtk_widget_add_css_class(whitelist_chip, "status-running");
-    gtk_box_append(GTK_BOX(title_row), whitelist_chip);
-  }
-  if (banned) {
-    GtkWidget *ban_chip = gtk_label_new("Banned");
-    gtk_widget_add_css_class(ban_chip, "status-badge");
-    gtk_widget_add_css_class(ban_chip, "status-stopped");
-    gtk_box_append(GTK_BOX(title_row), ban_chip);
-  }
-  if (ip_banned) {
-    GtkWidget *ip_ban_chip = gtk_label_new("IP Banned");
-    gtk_widget_add_css_class(ip_ban_chip, "status-badge");
-    gtk_widget_add_css_class(ip_ban_chip, "status-stopped");
-    gtk_box_append(GTK_BOX(title_row), ip_ban_chip);
-  }
-  if (is_admin) {
-    GtkWidget *admin_chip = gtk_label_new("ADMIN");
-    gtk_widget_add_css_class(admin_chip, "status-badge");
-    gtk_widget_add_css_class(admin_chip, "warning-badge");
-    gtk_box_append(GTK_BOX(title_row), admin_chip);
-  } else if (is_op) {
-    GtkWidget *op_chip = gtk_label_new("OP");
-    gtk_widget_add_css_class(op_chip, "status-badge");
-    gtk_widget_add_css_class(op_chip, "status-running");
-    gtk_box_append(GTK_BOX(title_row), op_chip);
-  }
-
+  GtkWidget *edition = gtk_label_new(state->platform == PLAYER_PLATFORM_UNKNOWN
+                                     ? "Edition unknown" : platform_label(state->platform));
+  gtk_widget_add_css_class(edition, "status-badge");
+  gtk_widget_add_css_class(edition, "player-platform-badge");
+  gtk_widget_set_tooltip_text(edition, state->platform == PLAYER_PLATFORM_UNKNOWN
+    ? "Pumpkin has not reported this player's edition. It is never guessed from the username."
+    : platform_label(state->platform));
+  gtk_box_append(GTK_BOX(title_row), edition);
   gtk_box_append(GTK_BOX(text_box), title_row);
 
   GtkWidget *meta_label = gtk_label_new(meta);
   gtk_label_set_xalign(GTK_LABEL(meta_label), 0.0);
+  gtk_label_set_ellipsize(GTK_LABEL(meta_label), PANGO_ELLIPSIZE_END);
   gtk_widget_add_css_class(meta_label, "dim-label");
-  if (!state->online) {
-    gtk_widget_add_css_class(meta_label, "player-offline-meta");
-  }
+  gtk_widget_add_css_class(meta_label, "caption");
   gtk_box_append(GTK_BOX(text_box), meta_label);
+  g_object_set_data(G_OBJECT(row), "activity-label", meta_label);
+  g_object_set_data_full(G_OBJECT(row), "activity-player-key", g_strdup(state->key), g_free);
 
+  if (whitelisted || banned || ip_banned || op_level >= 0) {
+    GtkWidget *roles = gtk_flow_box_new();
+    gtk_flow_box_set_selection_mode(GTK_FLOW_BOX(roles), GTK_SELECTION_NONE);
+    gtk_flow_box_set_column_spacing(GTK_FLOW_BOX(roles), 6);
+    gtk_flow_box_set_row_spacing(GTK_FLOW_BOX(roles), 4);
+    gtk_flow_box_set_max_children_per_line(GTK_FLOW_BOX(roles), 4);
+    gtk_widget_set_can_target(roles, FALSE);
+    gtk_widget_add_css_class(roles, "player-roles");
+    const char *labels[] = {
+      op_level >= 0 ? (player_is_admin_from_op_level(op_level) ? "Admin" : "Operator") : NULL,
+      whitelisted ? "Whitelisted" : NULL,
+      banned ? "Banned" : NULL, ip_banned ? "IP banned" : NULL
+    };
+    for (guint i = 0; i < G_N_ELEMENTS(labels); i++) {
+      if (labels[i] == NULL) continue;
+      GtkWidget *badge = gtk_label_new(labels[i]);
+      gtk_widget_set_halign(badge, GTK_ALIGN_START);
+      gtk_widget_add_css_class(badge, "status-badge");
+      gtk_widget_add_css_class(badge, i >= 2 ? "error-badge" : "player-platform-badge");
+      gtk_flow_box_append(GTK_FLOW_BOX(roles), badge);
+      gtk_widget_set_focusable(gtk_widget_get_parent(badge), FALSE);
+    }
+    gtk_box_append(GTK_BOX(text_box), roles);
+  }
+  if (list == self->banned_list && ban_reason != NULL && *ban_reason != '\0') {
+    GtkWidget *reason_label = gtk_label_new(ban_reason);
+    gtk_label_set_xalign(GTK_LABEL(reason_label), 0.0);
+    gtk_label_set_ellipsize(GTK_LABEL(reason_label), PANGO_ELLIPSIZE_END);
+    gtk_widget_add_css_class(reason_label, "caption");
+    gtk_widget_add_css_class(reason_label, "dim-label");
+    gtk_box_append(GTK_BOX(text_box), reason_label);
+  }
   gtk_box_append(GTK_BOX(box), text_box);
+  GtkWidget *status = gtk_label_new(state->online ? "Online" : "Offline");
+  gtk_widget_add_css_class(status, "status-badge");
+  gtk_widget_add_css_class(status, state->online ? "player-online" : "player-platform-badge");
+  gtk_widget_set_valign(status, GTK_ALIGN_CENTER);
+  gtk_box_append(GTK_BOX(box), status);
+  if (interactive) {
+    GtkWidget *arrow = gtk_image_new_from_icon_name("go-next-symbolic");
+    gtk_widget_add_css_class(arrow, "dim-label");
+    gtk_box_append(GTK_BOX(box), arrow);
+  }
+  g_autofree char *tooltip = g_strdup_printf("%s%s%s%s%s",
+    state->uuid != NULL ? state->uuid : "UUID not yet available",
+    banned && ban_reason != NULL ? "\nBan: " : "",
+    banned && ban_reason != NULL ? ban_reason : "",
+    ip_banned && ip_ban_reason != NULL ? "\nIP ban: " : "",
+    ip_banned && ip_ban_reason != NULL ? ip_ban_reason : "");
+  gtk_widget_set_tooltip_text(row, tooltip);
   gtk_list_box_row_set_child(GTK_LIST_BOX_ROW(row), box);
   gtk_list_box_append(list, row);
 
@@ -7283,6 +10022,8 @@ player_state_sort_cmp(gconstpointer a, gconstpointer b, gpointer user_data)
   const PlayerState *left = *(const PlayerState * const *)a;
   const PlayerState *right = *(const PlayerState * const *)b;
   const PlayerSortSettings *settings = user_data;
+
+  if (left->online != right->online) return left->online ? -1 : 1;
 
   if (settings != NULL && settings->op_level_map != NULL) {
     gboolean left_admin = player_is_admin_from_op_level(
@@ -7315,12 +10056,13 @@ player_state_sort_cmp(gconstpointer a, gconstpointer b, gpointer user_data)
     cmp = ll < rl ? -1 : (ll > rl ? 1 : 0);
   }
 
+  if (settings != NULL && !settings->ascending) {
+    cmp = -cmp;
+  }
   if (cmp == 0) {
     cmp = g_ascii_strcasecmp(left->name != NULL ? left->name : "",
                              right->name != NULL ? right->name : "");
-  }
-  if (settings != NULL && !settings->ascending) {
-    cmp = -cmp;
+    if (cmp == 0) cmp = g_strcmp0(left->key, right->key);
   }
   return cmp;
 }
@@ -7366,552 +10108,206 @@ player_list_signature_mix_str(guint64 signature, const char *text)
   return signature;
 }
 
+static gboolean
+player_query_matches(const char *query, const char *name, const char *uuid,
+                     const char *ip, const char *reason, const char *ip_reason)
+{
+  if (query == NULL || *query == '\0') return TRUE;
+  const char *fields[] = {name, uuid, ip, reason, ip_reason};
+  for (guint i = 0; i < G_N_ELEMENTS(fields); i++) {
+    g_autofree char *key = normalized_key(fields[i]);
+    if (key != NULL && strstr(key, query) != NULL) return TRUE;
+  }
+  return FALSE;
+}
+
+static void
+on_ip_ban_remove_clicked(GtkButton *button, PumpkinWindow *self)
+{
+  if (self->current != g_object_get_data(G_OBJECT(button), "player-server") ||
+      !pumpkin_server_get_running(self->current)) return;
+  const char *ip = g_object_get_data(G_OBJECT(button), "banned-ip");
+  if (send_pardon_ip_for_player(self, ip, NULL)) {
+    set_details_status(self, "IP unban requested", 3);
+    g_timeout_add(350, refresh_player_list_deferred, g_object_ref(self));
+  }
+}
+
+static void
+append_ip_ban_row(PumpkinWindow *self, const PlayerEntry *entry)
+{
+  AdwActionRow *row = ADW_ACTION_ROW(adw_action_row_new());
+  adw_preferences_row_set_use_markup(ADW_PREFERENCES_ROW(row), FALSE);
+  adw_preferences_row_set_title(ADW_PREFERENCES_ROW(row), entry->ip);
+  adw_action_row_set_subtitle(row, entry->reason != NULL && *entry->reason != '\0'
+    ? entry->reason : "Connections from this address are blocked");
+  adw_action_row_add_prefix(row, gtk_image_new_from_icon_name("network-workgroup-symbolic"));
+  GtkWidget *button = gtk_button_new_with_label("Unban");
+  gtk_widget_set_valign(button, GTK_ALIGN_CENTER);
+  gtk_widget_set_sensitive(button, pumpkin_server_get_running(self->current));
+  gtk_widget_set_tooltip_text(button, pumpkin_server_get_running(self->current)
+    ? "Remove this IP ban" : "Start the server to remove an IP ban");
+  g_object_set_data_full(G_OBJECT(button), "banned-ip", g_strdup(entry->ip), g_free);
+  g_object_set_data_full(G_OBJECT(button), "player-server", g_object_ref(self->current), g_object_unref);
+  g_signal_connect_object(button, "clicked", G_CALLBACK(on_ip_ban_remove_clicked), self, 0);
+  adw_action_row_add_suffix(row, button);
+  gtk_list_box_append(self->ip_bans_list, GTK_WIDGET(row));
+}
+
 static void
 refresh_player_list(PumpkinWindow *self)
 {
-  if (self == NULL || self->player_list == NULL) {
-    return;
-  }
+  if (self == NULL || self->player_list == NULL) return;
   if (self->current == NULL) {
     clear_list_box(self->player_list);
+    clear_list_box(self->whitelist_list);
+    clear_list_box(self->banned_list);
+    clear_list_box(self->ip_bans_list);
+    gtk_label_set_text(self->player_summary, "No server selected");
     invalidate_player_list_signature(self);
     return;
   }
 
-  gint64 now_mono = g_get_monotonic_time();
-  if (self->player_list_pointer_inside || now_mono < self->player_list_interaction_until) {
-    return;
-  }
-
+  update_player_row_activity(self, self->player_list);
+  update_player_row_activity(self, self->whitelist_list);
+  update_player_row_activity(self, self->banned_list);
+  if (g_get_monotonic_time() < self->player_list_interaction_until) return;
   ingest_players_from_disk(self);
 
-  g_autofree char *whitelist_path = resolve_data_file(self->current, "whitelist.json");
-  g_autoptr(GPtrArray) whitelist_entries = load_player_entries_from_file(whitelist_path);
+  const char *files[] = {"whitelist.json", "banned-players.json", "banned-ips.json", "ops.json"};
+  g_autoptr(GPtrArray) entries = g_ptr_array_new_with_free_func((GDestroyNotify)g_ptr_array_unref);
+  for (guint i = 0; i < G_N_ELEMENTS(files); i++) {
+    g_autofree char *path = resolve_data_file(self->current, files[i]);
+    GPtrArray *items = load_player_entries_from_file(path);
+    g_ptr_array_add(entries, items != NULL ? items : g_ptr_array_new());
+  }
+  GPtrArray *ip_bans = g_ptr_array_index(entries, 2);
   g_autoptr(GHashTable) whitelist_set = g_hash_table_new_full(g_str_hash, g_str_equal, g_free, NULL);
-  if (whitelist_entries != NULL) {
-    for (guint i = 0; i < whitelist_entries->len; i++) {
-      PlayerEntry *entry = g_ptr_array_index(whitelist_entries, i);
-      if (entry == NULL) {
+  g_autoptr(GHashTable) banned_map = g_hash_table_new_full(g_str_hash, g_str_equal, g_free, g_free);
+  g_autoptr(GHashTable) ip_map = g_hash_table_new_full(g_str_hash, g_str_equal, g_free, g_free);
+  g_autoptr(GHashTable) op_map = g_hash_table_new_full(g_str_hash, g_str_equal, g_free, NULL);
+  for (guint group = 0; group < entries->len; group++) {
+    GPtrArray *items = g_ptr_array_index(entries, group);
+    for (guint i = 0; i < items->len; i++) {
+      PlayerEntry *entry = g_ptr_array_index(items, i);
+      if (group == 2) {
+        player_lookup_add_ip_reason(ip_map, entry->ip, entry->reason);
         continue;
       }
-      player_lookup_add_set(whitelist_set, entry->name, entry->uuid);
+      ensure_player_state(self, entry->uuid, entry->name, TRUE);
+      if (group == 0) player_lookup_add_set(whitelist_set, entry->name, entry->uuid);
+      else if (group == 1) player_lookup_add_reason(banned_map, entry->name, entry->uuid, entry->reason);
+      else player_lookup_add_op_level(op_map, entry->name, entry->uuid, entry->op_level);
     }
   }
 
-  g_autofree char *banned_path = resolve_data_file(self->current, "banned-players.json");
-  g_autoptr(GPtrArray) banned_entries = load_player_entries_from_file(banned_path);
-  g_autoptr(GHashTable) banned_reason_map = g_hash_table_new_full(g_str_hash, g_str_equal, g_free, g_free);
-  if (banned_entries != NULL) {
-    for (guint i = 0; i < banned_entries->len; i++) {
-      PlayerEntry *entry = g_ptr_array_index(banned_entries, i);
-      if (entry == NULL) {
-        continue;
-      }
-      player_lookup_add_reason(banned_reason_map, entry->name, entry->uuid, entry->reason);
-    }
-  }
-
-  g_autofree char *banned_ips_path = resolve_data_file(self->current, "banned-ips.json");
-  g_autoptr(GPtrArray) banned_ip_entries = load_player_entries_from_file(banned_ips_path);
-  g_autoptr(GHashTable) banned_ip_reason_map = g_hash_table_new_full(g_str_hash, g_str_equal, g_free, g_free);
-  if (banned_ip_entries != NULL) {
-    for (guint i = 0; i < banned_ip_entries->len; i++) {
-      PlayerEntry *entry = g_ptr_array_index(banned_ip_entries, i);
-      if (entry == NULL) {
-        continue;
-      }
-      player_lookup_add_ip_reason(banned_ip_reason_map, entry->ip, entry->reason);
-    }
-  }
-
-  g_autofree char *ops_path = resolve_data_file(self->current, "ops.json");
-  g_autoptr(GPtrArray) ops_entries = load_player_entries_from_file(ops_path);
-  g_autoptr(GHashTable) op_level_map = g_hash_table_new_full(g_str_hash, g_str_equal, g_free, NULL);
-  if (ops_entries != NULL) {
-    for (guint i = 0; i < ops_entries->len; i++) {
-      PlayerEntry *entry = g_ptr_array_index(ops_entries, i);
-      if (entry == NULL) {
-        continue;
-      }
-      player_lookup_add_op_level(op_level_map, entry->name, entry->uuid, entry->op_level);
-    }
-  }
-
-  const char *query = self->player_search != NULL
-                        ? gtk_editable_get_text(GTK_EDITABLE(self->player_search))
-                        : NULL;
+  const char *page = adw_view_stack_get_visible_child_name(self->players_stack);
+  gboolean whitelist_page = g_strcmp0(page, "whitelisted") == 0;
+  gboolean bans_page = g_strcmp0(page, "bans") == 0;
+  GtkListBox *list = whitelist_page ? self->whitelist_list : bans_page ? self->banned_list : self->player_list;
+  const char *query = gtk_editable_get_text(GTK_EDITABLE(self->player_search));
   g_autofree char *query_key = normalized_key(query);
-
-  PlayerSortSettings sort = {0};
-  sort.field = self->player_sort_field;
-  sort.ascending = self->player_sort_ascending;
-  sort.op_level_map = op_level_map;
-  sort.now_unix = (gint64)time(NULL);
-
+  guint presence = gtk_drop_down_get_selected(self->player_presence_filter);
+  PlayerSortSettings sort = {
+    .field = self->player_sort_field, .ascending = self->player_sort_ascending,
+    .op_level_map = op_map, .now_unix = (gint64)time(NULL)
+  };
   g_autoptr(GPtrArray) states = g_ptr_array_new();
+  guint known = 0, online = 0, scope = 0, scope_online = 0;
   GHashTableIter iter;
-  gpointer key = NULL;
-  gpointer value = NULL;
+  gpointer value;
   g_hash_table_iter_init(&iter, self->player_states);
-  while (g_hash_table_iter_next(&iter, &key, &value)) {
+  while (g_hash_table_iter_next(&iter, NULL, &value)) {
     PlayerState *state = value;
-    if (state == NULL) {
-      continue;
-    }
-    if (query_key != NULL && *query_key != '\0') {
-      g_autofree char *name_key = normalized_key(state->name);
-      g_autofree char *uuid_key = normalized_key(state->uuid);
-      g_autofree char *ip_key = normalized_key(state->last_ip);
-      const char *ban_reason = player_lookup_reason_for_state(banned_reason_map, state);
-      const char *ip_ban_reason = player_lookup_reason_for_ip_variants(banned_ip_reason_map, state->last_ip);
-      g_autofree char *ban_reason_key = normalized_key(ban_reason);
-      g_autofree char *ip_ban_reason_key = normalized_key(ip_ban_reason);
-      gboolean match = FALSE;
-      if (name_key != NULL && strstr(name_key, query_key) != NULL) {
-        match = TRUE;
-      }
-      if (!match && uuid_key != NULL && strstr(uuid_key, query_key) != NULL) {
-        match = TRUE;
-      }
-      if (!match && ip_key != NULL && strstr(ip_key, query_key) != NULL) {
-        match = TRUE;
-      }
-      if (!match && ban_reason_key != NULL && strstr(ban_reason_key, query_key) != NULL) {
-        match = TRUE;
-      }
-      if (!match && ip_ban_reason_key != NULL && strstr(ip_ban_reason_key, query_key) != NULL) {
-        match = TRUE;
-      }
-      if (!match) {
-        continue;
-      }
-    }
-    g_ptr_array_add(states, state);
+    known++;
+    if (state->online) online++;
+    const char *reason = player_lookup_reason_for_state(banned_map, state);
+    gboolean whitelisted = player_lookup_contains_state(whitelist_set, state);
+    if ((whitelist_page && !whitelisted) || (bans_page && reason == NULL)) continue;
+    scope++;
+    if (state->online) scope_online++;
+    if ((presence == 1 && !state->online) || (presence == 2 && state->online)) continue;
+    const char *ip_reason = player_lookup_reason_for_ip_variants(ip_map, state->last_ip);
+    if (player_query_matches(query_key, state->name, state->uuid, state->last_ip, reason, ip_reason))
+      g_ptr_array_add(states, state);
   }
-
   g_ptr_array_sort_with_data(states, player_state_sort_cmp, &sort);
+  g_autoptr(GPtrArray) matching_ips = g_ptr_array_new();
+  for (guint i = 0; i < ip_bans->len; i++) {
+    PlayerEntry *entry = g_ptr_array_index(ip_bans, i);
+    if (entry->ip != NULL && player_query_matches(query_key, NULL, NULL, entry->ip, entry->reason, NULL))
+      g_ptr_array_add(matching_ips, entry);
+  }
+  g_autofree char *summary = NULL;
+  gboolean filtered = (query_key != NULL && *query_key != '\0') || presence != 0;
+  gtk_widget_set_visible(GTK_WIDGET(self->btn_player_reset_filters), filtered);
+  if (bans_page)
+    summary = g_strdup_printf("%u of %u account bans  ·  %u of %u IP bans",
+      states->len, scope, matching_ips->len, ip_bans->len);
+  else if (whitelist_page)
+    summary = g_strdup_printf("%u of %u whitelisted players  ·  %u online",
+      states->len, scope, scope_online);
+  else if (filtered)
+    summary = g_strdup_printf("%u of %u players  ·  %u online", states->len, known, online);
+  else
+    summary = g_strdup_printf("%u online  ·  %u known %s", online, known, known == 1 ? "player" : "players");
+  gtk_label_set_text(self->player_summary, summary);
+  gtk_label_set_text(self->player_heading, whitelist_page ? "Whitelist" : bans_page ? "Bans" : "Your players");
 
-  guint64 signature = 0xcbf29ce484222325ULL;
-  signature = player_list_signature_mix_u64(signature, (guint64)sort.field);
-  signature = player_list_signature_mix_u64(signature, sort.ascending ? 1 : 0);
+  guint64 signature = player_list_signature_mix_u64(0xcbf29ce484222325ULL, (guint64)(sort.now_unix / 60));
+  signature = player_list_signature_mix_str(signature, page);
   signature = player_list_signature_mix_str(signature, query_key);
+  signature = player_list_signature_mix_u64(signature, presence);
+  signature = player_list_signature_mix_u64(signature, (guint64)sort.field);
+  signature = player_list_signature_mix_u64(signature, sort.ascending);
+  signature = player_list_signature_mix_u64(signature, pumpkin_server_get_running(self->current));
   for (guint i = 0; i < states->len; i++) {
     PlayerState *state = g_ptr_array_index(states, i);
-    if (state == NULL) {
-      continue;
-    }
-    gboolean whitelisted = player_lookup_contains_state(whitelist_set, state);
-    const char *ban_reason = player_lookup_reason_for_state(banned_reason_map, state);
-    gboolean banned = (ban_reason != NULL);
-    const char *ip_ban_reason = player_lookup_reason_for_ip_variants(banned_ip_reason_map, state->last_ip);
-    gboolean ip_banned = (ip_ban_reason != NULL) ||
-                         (state->ip_banned_hint && (state->last_ip == NULL || state->last_ip[0] == '\0'));
-    int op_level = player_lookup_op_level_for_state(op_level_map, state);
     signature = player_list_signature_mix_str(signature, state->key);
     signature = player_list_signature_mix_str(signature, state->name);
     signature = player_list_signature_mix_str(signature, state->uuid);
     signature = player_list_signature_mix_str(signature, state->last_ip);
-    signature = player_list_signature_mix_u64(signature, state->online ? 1 : 0);
+    signature = player_list_signature_mix_u64(signature, state->online);
     signature = player_list_signature_mix_u64(signature, (guint64)state->platform);
+    signature = player_list_signature_mix_u64(signature, state->playtime_seconds);
+    signature = player_list_signature_mix_u64(signature, state->online ? 0 : (guint64)state->last_online_unix);
     signature = player_list_signature_mix_u64(signature, (guint64)state->first_joined_unix);
-    signature = player_list_signature_mix_u64(signature, whitelisted ? 1 : 0);
-    signature = player_list_signature_mix_u64(signature, banned ? 1 : 0);
-    signature = player_list_signature_mix_u64(signature, ip_banned ? 1 : 0);
-    signature = player_list_signature_mix_u64(signature, (guint64)(op_level + 1));
-    signature = player_list_signature_mix_u64(signature, player_is_admin_from_op_level(op_level) ? 1 : 0);
-    signature = player_list_signature_mix_str(signature, ban_reason);
-    signature = player_list_signature_mix_str(signature, ip_ban_reason);
+    signature = player_list_signature_mix_u64(signature, player_lookup_contains_state(whitelist_set, state));
+    signature = player_list_signature_mix_u64(signature, (guint64)(player_lookup_op_level_for_state(op_map, state) + 1));
+    signature = player_list_signature_mix_str(signature, player_lookup_reason_for_state(banned_map, state));
+    signature = player_list_signature_mix_str(signature, player_lookup_reason_for_ip_variants(ip_map, state->last_ip));
+    signature = player_list_signature_mix_u64(signature, state->ip_banned_hint);
   }
-
-  if (self->player_list_signature_valid &&
-      self->player_list_signature == signature &&
-      self->player_list_signature_count == states->len) {
-    return;
+  for (guint i = 0; i < matching_ips->len; i++) {
+    PlayerEntry *entry = g_ptr_array_index(matching_ips, i);
+    signature = player_list_signature_mix_str(signature, entry->ip);
+    signature = player_list_signature_mix_str(signature, entry->reason);
   }
+  if (self->player_list_signature_valid && self->player_list_signature == signature &&
+      self->player_list_signature_count == states->len) return;
   self->player_list_signature_valid = TRUE;
   self->player_list_signature = signature;
   self->player_list_signature_count = states->len;
-
-  clear_list_box(self->player_list);
-
+  clear_list_box(list);
   for (guint i = 0; i < states->len; i++) {
     PlayerState *state = g_ptr_array_index(states, i);
-    if (state == NULL) {
-      continue;
-    }
-    gboolean whitelisted = player_lookup_contains_state(whitelist_set, state);
-    const char *ban_reason = player_lookup_reason_for_state(banned_reason_map, state);
-    gboolean banned = (ban_reason != NULL);
-    const char *ip_ban_reason = player_lookup_reason_for_ip_variants(banned_ip_reason_map, state->last_ip);
-    gboolean ip_banned = (ip_ban_reason != NULL) ||
-                         (state->ip_banned_hint && (state->last_ip == NULL || state->last_ip[0] == '\0'));
-    int op_level = player_lookup_op_level_for_state(op_level_map, state);
-    append_player_state_row(self, self->player_list, state, whitelisted, banned, ban_reason,
-                            ip_banned, ip_ban_reason, op_level, TRUE);
+    const char *reason = player_lookup_reason_for_state(banned_map, state);
+    const char *ip_reason = player_lookup_reason_for_ip_variants(ip_map, state->last_ip);
+    append_player_state_row(self, list, state, player_lookup_contains_state(whitelist_set, state),
+      reason != NULL, reason, ip_reason != NULL || state->ip_banned_hint, ip_reason,
+      player_lookup_op_level_for_state(op_map, state), TRUE);
   }
-
-  refresh_whitelist_list(self);
-  refresh_banned_list(self);
-}
-
-static void
-player_head_download_context_free(PlayerHeadDownloadContext *ctx)
-{
-  if (ctx == NULL) {
-    return;
-  }
-  g_clear_object(&ctx->self);
-  g_clear_object(&ctx->server);
-  g_clear_pointer(&ctx->uuid_key, g_free);
-  g_clear_pointer(&ctx->cache_path, g_free);
-  g_free(ctx);
-}
-
-static void
-on_player_head_download_done(GObject *source, GAsyncResult *res, gpointer user_data)
-{
-  (void)source;
-  PlayerHeadDownloadContext *ctx = user_data;
-  if (ctx == NULL) {
-    return;
-  }
-
-  gboolean ok = pumpkin_download_file_finish(res, NULL);
-  if (ctx->self->player_head_downloads != NULL && ctx->uuid_key != NULL) {
-    g_hash_table_remove(ctx->self->player_head_downloads, ctx->uuid_key);
-  }
-  if (ok && ctx->self->current != NULL && ctx->self->current == ctx->server) {
-    invalidate_player_list_signature(ctx->self);
-    refresh_player_list(ctx->self);
-  }
-  player_head_download_context_free(ctx);
-}
-
-static void
-set_player_head_image(PumpkinWindow *self, GtkImage *image, const char *uuid)
-{
-  if (self == NULL || image == NULL || self->current == NULL || uuid == NULL || *uuid == '\0') {
-    gtk_image_set_from_icon_name(image, "avatar-default-symbolic");
-    return;
-  }
-
-  g_autofree char *uuid_key = normalized_key(uuid);
-  if (uuid_key == NULL) {
-    gtk_image_set_from_icon_name(image, "avatar-default-symbolic");
-    return;
-  }
-
-  g_autofree char *data_dir = pumpkin_server_get_data_dir(self->current);
-  g_autofree char *cache_dir = g_build_filename(data_dir, "cache", "player-heads", NULL);
-  g_mkdir_with_parents(cache_dir, 0755);
-  g_autofree char *cache_path = g_strdup_printf("%s/%s.png", cache_dir, uuid_key);
-
-  if (g_file_test(cache_path, G_FILE_TEST_EXISTS)) {
-    g_autoptr(GError) error = NULL;
-    g_autoptr(GFile) file = g_file_new_for_path(cache_path);
-    g_autoptr(GdkTexture) texture = gdk_texture_new_from_file(file, &error);
-    if (texture != NULL) {
-      gtk_image_set_from_paintable(image, GDK_PAINTABLE(texture));
-      gtk_image_set_pixel_size(image, 32);
-      return;
-    }
-  }
-
-  gtk_image_set_from_icon_name(image, "avatar-default-symbolic");
-  gtk_image_set_pixel_size(image, 32);
-
-  if (self->player_head_downloads != NULL &&
-      g_hash_table_contains(self->player_head_downloads, uuid_key)) {
-    return;
-  }
-  if (self->player_head_downloads != NULL) {
-    g_hash_table_add(self->player_head_downloads, g_strdup(uuid_key));
-  }
-
-  g_autofree char *uuid_compact = g_strdup(uuid_key);
-  char *dst = uuid_compact;
-  for (char *src = uuid_compact; *src != '\0'; src++) {
-    if (*src != '-') {
-      *dst++ = *src;
-    }
-  }
-  *dst = '\0';
-
-  PlayerHeadDownloadContext *ctx = g_new0(PlayerHeadDownloadContext, 1);
-  ctx->self = g_object_ref(self);
-  ctx->server = g_object_ref(self->current);
-  ctx->uuid_key = g_strdup(uuid_key);
-  ctx->cache_path = g_strdup(cache_path);
-
-  g_autofree char *url = g_strdup_printf("https://crafatar.com/avatars/%s?size=64&overlay=true",
-                                         uuid_compact);
-  pumpkin_download_file_async(url, cache_path, NULL, NULL, NULL, on_player_head_download_done, ctx);
-}
-
-static void
-refresh_whitelist_list(PumpkinWindow *self)
-{
-  clear_list_box(self->whitelist_list);
-  if (self->current == NULL) {
-    return;
-  }
-  ingest_players_from_disk(self);
-  const char *query = self->player_search != NULL
-                        ? gtk_editable_get_text(GTK_EDITABLE(self->player_search))
-                        : NULL;
-  g_autofree char *query_key = normalized_key(query);
-
-  g_autofree char *whitelist_path = resolve_data_file(self->current, "whitelist.json");
-  g_autoptr(GPtrArray) whitelist_entries = load_player_entries_from_file(whitelist_path);
-  if (whitelist_entries == NULL) {
-    return;
-  }
-
-  g_autofree char *banned_path = resolve_data_file(self->current, "banned-players.json");
-  g_autoptr(GPtrArray) banned_entries = load_player_entries_from_file(banned_path);
-  g_autoptr(GHashTable) banned_reason_map = g_hash_table_new_full(g_str_hash, g_str_equal, g_free, g_free);
-  if (banned_entries != NULL) {
-    for (guint i = 0; i < banned_entries->len; i++) {
-      PlayerEntry *entry = g_ptr_array_index(banned_entries, i);
-      if (entry == NULL) {
-        continue;
-      }
-      player_lookup_add_reason(banned_reason_map, entry->name, entry->uuid, entry->reason);
-    }
-  }
-
-  g_autofree char *banned_ips_path = resolve_data_file(self->current, "banned-ips.json");
-  g_autoptr(GPtrArray) banned_ip_entries = load_player_entries_from_file(banned_ips_path);
-  g_autoptr(GHashTable) banned_ip_reason_map = g_hash_table_new_full(g_str_hash, g_str_equal, g_free, g_free);
-  if (banned_ip_entries != NULL) {
-    for (guint i = 0; i < banned_ip_entries->len; i++) {
-      PlayerEntry *entry = g_ptr_array_index(banned_ip_entries, i);
-      if (entry == NULL) {
-        continue;
-      }
-      player_lookup_add_ip_reason(banned_ip_reason_map, entry->ip, entry->reason);
-    }
-  }
-
-  g_autofree char *ops_path = resolve_data_file(self->current, "ops.json");
-  g_autoptr(GPtrArray) ops_entries = load_player_entries_from_file(ops_path);
-  g_autoptr(GHashTable) op_level_map = g_hash_table_new_full(g_str_hash, g_str_equal, g_free, NULL);
-  if (ops_entries != NULL) {
-    for (guint i = 0; i < ops_entries->len; i++) {
-      PlayerEntry *entry = g_ptr_array_index(ops_entries, i);
-      if (entry == NULL) {
-        continue;
-      }
-      player_lookup_add_op_level(op_level_map, entry->name, entry->uuid, entry->op_level);
-    }
-  }
-
-  PlayerSortSettings sort = {0};
-  sort.field = self->player_sort_field;
-  sort.ascending = self->player_sort_ascending;
-  sort.op_level_map = op_level_map;
-  sort.now_unix = (gint64)time(NULL);
-
-  g_autoptr(GPtrArray) states = g_ptr_array_new();
-  for (guint i = 0; i < whitelist_entries->len; i++) {
-    PlayerEntry *entry = g_ptr_array_index(whitelist_entries, i);
-    if (entry == NULL) {
-      continue;
-    }
-
-    PlayerState *state = ensure_player_state(self, entry->uuid, entry->name, TRUE);
-    if (state == NULL) {
-      continue;
-    }
-
-    const char *ban_reason = player_lookup_reason_for_state(banned_reason_map, state);
-    const char *ip_ban_reason = player_lookup_reason_for_ip_variants(banned_ip_reason_map, state->last_ip);
-
-    if (query_key != NULL && *query_key != '\0') {
-      g_autofree char *name_key = normalized_key(state->name);
-      g_autofree char *uuid_key = normalized_key(state->uuid);
-      g_autofree char *ip_key = normalized_key(state->last_ip);
-      g_autofree char *reason_key = normalized_key(ban_reason);
-      g_autofree char *ip_reason_key = normalized_key(ip_ban_reason);
-      gboolean match = FALSE;
-      if (name_key != NULL && strstr(name_key, query_key) != NULL) {
-        match = TRUE;
-      }
-      if (!match && uuid_key != NULL && strstr(uuid_key, query_key) != NULL) {
-        match = TRUE;
-      }
-      if (!match && ip_key != NULL && strstr(ip_key, query_key) != NULL) {
-        match = TRUE;
-      }
-      if (!match && reason_key != NULL && strstr(reason_key, query_key) != NULL) {
-        match = TRUE;
-      }
-      if (!match && ip_reason_key != NULL && strstr(ip_reason_key, query_key) != NULL) {
-        match = TRUE;
-      }
-      if (!match) {
-        continue;
-      }
-    }
-    g_ptr_array_add(states, state);
-  }
-
-  g_ptr_array_sort_with_data(states, player_state_sort_cmp, &sort);
-
-  for (guint i = 0; i < states->len; i++) {
-    PlayerState *state = g_ptr_array_index(states, i);
-    if (state == NULL) {
-      continue;
-    }
-
-    const char *ban_reason = player_lookup_reason_for_state(banned_reason_map, state);
-    gboolean banned = (ban_reason != NULL);
-    const char *ip_ban_reason = player_lookup_reason_for_ip_variants(banned_ip_reason_map, state->last_ip);
-    gboolean ip_banned = (ip_ban_reason != NULL) ||
-                         (state->ip_banned_hint && (state->last_ip == NULL || state->last_ip[0] == '\0'));
-    int op_level = player_lookup_op_level_for_state(op_level_map, state);
-
-    append_player_state_row(self, self->whitelist_list, state, TRUE, banned, ban_reason,
-                            ip_banned, ip_ban_reason, op_level, FALSE);
-  }
-}
-
-static void
-refresh_banned_list(PumpkinWindow *self)
-{
-  clear_list_box(self->banned_list);
-  if (self->current == NULL) {
-    return;
-  }
-  ingest_players_from_disk(self);
-  const char *query = self->player_search != NULL
-                        ? gtk_editable_get_text(GTK_EDITABLE(self->player_search))
-                        : NULL;
-  g_autofree char *query_key = normalized_key(query);
-
-  g_autofree char *banned_path = resolve_data_file(self->current, "banned-players.json");
-  g_autoptr(GPtrArray) banned_entries = load_player_entries_from_file(banned_path);
-  if (banned_entries == NULL) {
-    return;
-  }
-
-  g_autofree char *banned_ips_path = resolve_data_file(self->current, "banned-ips.json");
-  g_autoptr(GPtrArray) banned_ip_entries = load_player_entries_from_file(banned_ips_path);
-  g_autoptr(GHashTable) banned_ip_reason_map = g_hash_table_new_full(g_str_hash, g_str_equal, g_free, g_free);
-  if (banned_ip_entries != NULL) {
-    for (guint i = 0; i < banned_ip_entries->len; i++) {
-      PlayerEntry *entry = g_ptr_array_index(banned_ip_entries, i);
-      if (entry == NULL) {
-        continue;
-      }
-      player_lookup_add_ip_reason(banned_ip_reason_map, entry->ip, entry->reason);
-    }
-  }
-
-  g_autofree char *whitelist_path = resolve_data_file(self->current, "whitelist.json");
-  g_autoptr(GPtrArray) whitelist_entries = load_player_entries_from_file(whitelist_path);
-  g_autoptr(GHashTable) whitelist_set = g_hash_table_new_full(g_str_hash, g_str_equal, g_free, NULL);
-  if (whitelist_entries != NULL) {
-    for (guint i = 0; i < whitelist_entries->len; i++) {
-      PlayerEntry *entry = g_ptr_array_index(whitelist_entries, i);
-      if (entry == NULL) {
-        continue;
-      }
-      player_lookup_add_set(whitelist_set, entry->name, entry->uuid);
-    }
-  }
-
-  g_autofree char *ops_path = resolve_data_file(self->current, "ops.json");
-  g_autoptr(GPtrArray) ops_entries = load_player_entries_from_file(ops_path);
-  g_autoptr(GHashTable) op_level_map = g_hash_table_new_full(g_str_hash, g_str_equal, g_free, NULL);
-  if (ops_entries != NULL) {
-    for (guint i = 0; i < ops_entries->len; i++) {
-      PlayerEntry *entry = g_ptr_array_index(ops_entries, i);
-      if (entry == NULL) {
-        continue;
-      }
-      player_lookup_add_op_level(op_level_map, entry->name, entry->uuid, entry->op_level);
-    }
-  }
-
-  PlayerSortSettings sort = {0};
-  sort.field = self->player_sort_field;
-  sort.ascending = self->player_sort_ascending;
-  sort.op_level_map = op_level_map;
-  sort.now_unix = (gint64)time(NULL);
-
-  g_autoptr(GPtrArray) states = g_ptr_array_new();
-  for (guint i = 0; i < banned_entries->len; i++) {
-    PlayerEntry *entry = g_ptr_array_index(banned_entries, i);
-    if (entry == NULL) {
-      continue;
-    }
-
-    PlayerState *state = ensure_player_state(self, entry->uuid, entry->name, TRUE);
-    if (state == NULL) {
-      continue;
-    }
-    const char *ip_ban_reason = player_lookup_reason_for_ip_variants(banned_ip_reason_map, state->last_ip);
-
-    if (query_key != NULL && *query_key != '\0') {
-      g_autofree char *name_key = normalized_key(state->name);
-      g_autofree char *uuid_key = normalized_key(state->uuid);
-      g_autofree char *reason_key = normalized_key(entry->reason);
-      g_autofree char *ip_key = normalized_key(state->last_ip);
-      g_autofree char *ip_reason_key = normalized_key(ip_ban_reason);
-      gboolean match = FALSE;
-      if (name_key != NULL && strstr(name_key, query_key) != NULL) {
-        match = TRUE;
-      }
-      if (!match && uuid_key != NULL && strstr(uuid_key, query_key) != NULL) {
-        match = TRUE;
-      }
-      if (!match && ip_key != NULL && strstr(ip_key, query_key) != NULL) {
-        match = TRUE;
-      }
-      if (!match && reason_key != NULL && strstr(reason_key, query_key) != NULL) {
-        match = TRUE;
-      }
-      if (!match && ip_reason_key != NULL && strstr(ip_reason_key, query_key) != NULL) {
-        match = TRUE;
-      }
-      if (!match) {
-        continue;
-      }
-    }
-    g_ptr_array_add(states, state);
-  }
-
-  g_ptr_array_sort_with_data(states, player_state_sort_cmp, &sort);
-
-  for (guint i = 0; i < states->len; i++) {
-    PlayerState *state = g_ptr_array_index(states, i);
-    if (state == NULL) {
-      continue;
-    }
-
-    gboolean whitelisted = player_lookup_contains_state(whitelist_set, state);
-    int op_level = player_lookup_op_level_for_state(op_level_map, state);
-    const char *ban_reason = NULL;
-    const char *ip_ban_reason = player_lookup_reason_for_ip_variants(banned_ip_reason_map, state->last_ip);
-    gboolean ip_banned = (ip_ban_reason != NULL) ||
-                         (state->ip_banned_hint && (state->last_ip == NULL || state->last_ip[0] == '\0'));
-
-    for (guint j = 0; j < banned_entries->len; j++) {
-      PlayerEntry *entry = g_ptr_array_index(banned_entries, j);
-      if (entry == NULL) {
-        continue;
-      }
-      gboolean same_uuid = (entry->uuid != NULL && state->uuid != NULL && g_strcmp0(entry->uuid, state->uuid) == 0);
-      gboolean same_name = (entry->name != NULL && state->name != NULL && g_strcmp0(entry->name, state->name) == 0);
-      if (same_uuid || same_name) {
-        ban_reason = entry->reason;
-        break;
-      }
-    }
-
-    append_player_state_row(self, self->banned_list, state, whitelisted, TRUE, ban_reason,
-                            ip_banned, ip_ban_reason, op_level, FALSE);
+  set_player_list_placeholder(list, filtered ? "No matching players" :
+    whitelist_page ? "Whitelist is empty" : bans_page ? "No account bans" : "No players yet",
+    filtered ? "Try a different search or connection-status filter." :
+    whitelist_page ? "Players allowed by your server whitelist appear here." :
+    bans_page ? "Account bans appear here. Address blocks are listed separately below." :
+    "Players appear here when they join your server.");
+  if (bans_page) {
+    clear_list_box(self->ip_bans_list);
+    for (guint i = 0; i < matching_ips->len; i++) append_ip_ban_row(self, g_ptr_array_index(matching_ips, i));
+    set_player_list_placeholder(self->ip_bans_list, query_key != NULL && *query_key != '\0'
+      ? "No matching IP bans" : "No IP bans", "IP bans block an address rather than an individual account.");
   }
 }
 
@@ -7985,16 +10381,7 @@ refresh_active_player_section(PumpkinWindow *self)
   if (self == NULL) {
     return;
   }
-  const char *page = self->players_stack != NULL
-                       ? adw_view_stack_get_visible_child_name(self->players_stack)
-                       : NULL;
-  if (g_strcmp0(page, "whitelisted") == 0) {
-    refresh_whitelist_list(self);
-  } else if (g_strcmp0(page, "bans") == 0) {
-    refresh_banned_list(self);
-  } else {
-    refresh_player_list(self);
-  }
+  refresh_player_list(self);
 }
 
 static void
@@ -8034,7 +10421,7 @@ update_player_search_placeholder(PumpkinWindow *self)
   if (g_strcmp0(page, "whitelisted") == 0) {
     placeholder = "Search whitelisted players";
   } else if (g_strcmp0(page, "bans") == 0) {
-    placeholder = "Search banned players";
+    placeholder = "Search accounts, addresses or ban reasons";
   }
   gtk_search_entry_set_placeholder_text(self->player_search, placeholder);
 }
@@ -8050,6 +10437,47 @@ on_player_sort_dropdown_changed(GObject *object, GParamSpec *pspec, PumpkinWindo
   self->player_sort_field = (int)gtk_drop_down_get_selected(self->player_sort_dropdown);
   self->player_list_interaction_until = 0;
   refresh_active_player_section(self);
+}
+
+static void
+on_player_presence_filter_changed(GObject *object, GParamSpec *pspec, PumpkinWindow *self)
+{
+  (void)object;
+  (void)pspec;
+  self->player_list_interaction_until = 0;
+  invalidate_player_list_signature(self);
+  refresh_player_list(self);
+}
+
+static void
+on_player_filters_reset(GtkButton *button, PumpkinWindow *self)
+{
+  (void)button;
+  gtk_editable_set_text(GTK_EDITABLE(self->player_search), "");
+  gtk_drop_down_set_selected(self->player_presence_filter, 0);
+  self->player_list_interaction_until = 0;
+  refresh_player_list(self);
+}
+
+static void
+set_player_list_placeholder(GtkListBox *list, const char *title, const char *description)
+{
+  GtkWidget *box = gtk_box_new(GTK_ORIENTATION_VERTICAL, 12);
+  gtk_widget_add_css_class(box, "player-empty");
+  GtkWidget *icon = gtk_image_new_from_icon_name("system-users-symbolic");
+  gtk_image_set_pixel_size(GTK_IMAGE(icon), 40);
+  gtk_widget_add_css_class(icon, "dim-label");
+  gtk_box_append(GTK_BOX(box), icon);
+  GtkWidget *heading = gtk_label_new(title);
+  gtk_widget_add_css_class(heading, "title-3");
+  gtk_box_append(GTK_BOX(box), heading);
+  GtkWidget *subtitle = gtk_label_new(description);
+  gtk_label_set_wrap(GTK_LABEL(subtitle), TRUE);
+  gtk_label_set_justify(GTK_LABEL(subtitle), GTK_JUSTIFY_CENTER);
+  gtk_label_set_max_width_chars(GTK_LABEL(subtitle), 42);
+  gtk_widget_add_css_class(subtitle, "dim-label");
+  gtk_box_append(GTK_BOX(box), subtitle);
+  gtk_list_box_set_placeholder(list, box);
 }
 
 static void
@@ -8074,13 +10502,12 @@ on_players_stack_visible_child_changed(GObject *object, GParamSpec *pspec, Pumpk
 }
 
 static void
-on_player_action_confirmed(GObject *dialog, GAsyncResult *res, gpointer user_data)
+perform_player_action(GObject *dialog, const char *response, PumpkinWindow *self)
 {
-  PumpkinWindow *self = PUMPKIN_WINDOW(user_data);
-  const char *response = adw_alert_dialog_choose_finish(ADW_ALERT_DIALOG(dialog), res);
   if (response == NULL || g_strcmp0(response, "cancel") == 0) {
     return;
   }
+  if (g_object_get_data(dialog, "player-server") != self->current) return;
 
   const char *name = g_object_get_data(G_OBJECT(dialog), "player-name");
   const char *state_key = g_object_get_data(G_OBJECT(dialog), "player-key");
@@ -8450,115 +10877,290 @@ on_player_pardon_ip_manual_confirmed(GObject *dialog, GAsyncResult *res, gpointe
   }
 }
 
+static AdwActionRow *
+player_info_row(AdwPreferencesGroup *group, const char *title, const char *value)
+{
+  AdwActionRow *row = ADW_ACTION_ROW(adw_action_row_new());
+  adw_preferences_row_set_title(ADW_PREFERENCES_ROW(row), title);
+  adw_preferences_row_set_use_markup(ADW_PREFERENCES_ROW(row), FALSE);
+  adw_action_row_set_subtitle(row, value != NULL && *value != '\0' ? value : "Not available");
+  adw_action_row_set_subtitle_selectable(row, TRUE);
+  adw_preferences_group_add(group, GTK_WIDGET(row));
+  return row;
+}
+
+static void
+on_player_history_removal_confirmed(GObject *alert, GAsyncResult *result, gpointer data)
+{
+  g_autoptr(PumpkinWindow) self = PUMPKIN_WINDOW(data);
+  const char *response = adw_alert_dialog_choose_finish(ADW_ALERT_DIALOG(alert), result);
+  if (g_strcmp0(response, "remove") == 0)
+    perform_player_action(g_object_get_data(alert, "player-context"), "delete_data", self);
+}
+
+static void
+on_player_management_clicked(GtkButton *button, PumpkinWindow *self)
+{
+  g_autoptr(AdwDialog) dialog = g_object_ref(g_object_get_data(G_OBJECT(button), "player-dialog"));
+  const char *action = g_object_get_data(G_OBJECT(button), "player-action");
+  if (g_strcmp0(action, "delete_data") == 0) {
+    AdwAlertDialog *confirm = ADW_ALERT_DIALOG(adw_alert_dialog_new(
+      "Remove player from history?",
+      "This removes Smashed Pumpkin's activity history, not the player's world data. "
+      "The player will appear again when they join."));
+    adw_alert_dialog_add_response(confirm, "cancel", "Cancel");
+    adw_alert_dialog_add_response(confirm, "remove", "Remove");
+    adw_alert_dialog_set_close_response(confirm, "cancel");
+    adw_alert_dialog_set_response_appearance(confirm, "remove", ADW_RESPONSE_DESTRUCTIVE);
+    g_object_set_data_full(G_OBJECT(confirm), "player-context", g_object_ref(dialog), g_object_unref);
+    adw_dialog_close(dialog);
+    adw_alert_dialog_choose(confirm, GTK_WIDGET(self), NULL,
+                            on_player_history_removal_confirmed, g_object_ref(self));
+  } else {
+    adw_dialog_close(dialog);
+    perform_player_action(G_OBJECT(dialog), action, self);
+  }
+}
+
+static void
+player_management_row(PumpkinWindow *self, AdwDialog *dialog, AdwPreferencesGroup *group,
+                       const char *title, const char *description, const char *label,
+                       const char *action, gboolean enabled, gboolean destructive)
+{
+  AdwActionRow *row = player_info_row(group, title, description);
+  adw_action_row_set_subtitle_selectable(row, FALSE);
+  GtkWidget *button = gtk_button_new_with_label(label);
+  gtk_widget_set_valign(button, GTK_ALIGN_CENTER);
+  gtk_widget_set_sensitive(button, enabled);
+  if (destructive) gtk_widget_add_css_class(button, "destructive-action");
+  adw_action_row_add_suffix(row, button);
+  g_object_set_data(G_OBJECT(button), "player-dialog", dialog);
+  g_object_set_data_full(G_OBJECT(button), "player-action", g_strdup(action), g_free);
+  if (g_strcmp0(action, "kick") == 0) g_object_set_data(G_OBJECT(dialog), "live-kick", button);
+  if (g_strcmp0(action, "delete_data") == 0) g_object_set_data(G_OBJECT(dialog), "live-remove", button);
+  g_signal_connect_object(button, "clicked", G_CALLBACK(on_player_management_clicked), self, 0);
+}
+
+static void
+player_details_page(AdwViewStack *stack, const char *name, const char *title,
+                     const char *icon, GtkWidget *body)
+{
+  GtkWidget *scroll = gtk_scrolled_window_new();
+  gtk_scrolled_window_set_policy(GTK_SCROLLED_WINDOW(scroll), GTK_POLICY_NEVER, GTK_POLICY_AUTOMATIC);
+  gtk_widget_set_margin_end(body, 2);
+  gtk_widget_set_margin_bottom(body, 4);
+  gtk_scrolled_window_set_child(GTK_SCROLLED_WINDOW(scroll), body);
+  AdwViewStackPage *page = adw_view_stack_add_titled(stack, scroll, name, title);
+  adw_view_stack_page_set_icon_name(page, icon);
+}
+
+typedef struct {
+  GWeakRef window;
+  AdwDialog *dialog;
+  AdwActionRow *playtime;
+  AdwActionRow *last_seen;
+  GtkLabel *status;
+  GtkLabel *edition;
+  guint timer;
+} PlayerDetailsLive;
+
+static void
+player_details_stop(AdwDialog *dialog, PlayerDetailsLive *live)
+{
+  (void)dialog;
+  if (live->timer != 0) {
+    g_source_remove(live->timer);
+    live->timer = 0;
+  }
+}
+
+static void
+player_details_live_free(gpointer data)
+{
+  PlayerDetailsLive *live = data;
+  player_details_stop(NULL, live);
+  g_weak_ref_clear(&live->window);
+  g_free(live);
+}
+
+static gboolean
+update_player_details(gpointer data)
+{
+  PlayerDetailsLive *live = data;
+  g_autoptr(PumpkinWindow) self = g_weak_ref_get(&live->window);
+  if (self == NULL || self->player_states == NULL ||
+      self->current != g_object_get_data(G_OBJECT(live->dialog), "player-server")) {
+    live->timer = 0;
+    return G_SOURCE_REMOVE;
+  }
+  const char *uuid = g_object_get_data(G_OBJECT(live->dialog), "player-uuid");
+  const char *name = g_object_get_data(G_OBJECT(live->dialog), "player-name");
+  PlayerState *state = ensure_player_state(self, uuid, name, FALSE);
+  gboolean online = state != NULL && state->online;
+  g_autofree char *played = format_duration(player_state_effective_playtime(state));
+  g_autofree char *seen = format_unix_time(self, state != NULL ? state->last_online_unix : 0);
+  adw_action_row_set_subtitle(live->playtime, played);
+  adw_action_row_set_subtitle(live->last_seen, online ? "Online now" : seen);
+  gtk_label_set_text(live->status, online ? "Online" : "Offline");
+  gtk_widget_remove_css_class(GTK_WIDGET(live->status), online ? "player-platform-badge" : "player-online");
+  gtk_widget_add_css_class(GTK_WIDGET(live->status), online ? "player-online" : "player-platform-badge");
+  gtk_label_set_text(live->edition, state != NULL && state->platform != PLAYER_PLATFORM_UNKNOWN
+    ? platform_label(state->platform) : "Edition unknown");
+  g_object_set_data(G_OBJECT(live->dialog), "player-online", GINT_TO_POINTER(online));
+  GtkWidget *kick = g_object_get_data(G_OBJECT(live->dialog), "live-kick");
+  GtkWidget *remove = g_object_get_data(G_OBJECT(live->dialog), "live-remove");
+  gtk_widget_set_sensitive(kick, online && pumpkin_server_get_running(self->current));
+  gtk_widget_set_sensitive(remove, !online);
+  return G_SOURCE_CONTINUE;
+}
+
 static void
 on_player_row_activated(GtkListBox *box, GtkListBoxRow *row, PumpkinWindow *self)
 {
   (void)box;
-  if (row == NULL) {
-    return;
-  }
-  extend_player_list_interaction_freeze(self, 1500000);
-
+  if (row == NULL || self->current == NULL) return;
   const char *name = g_object_get_data(G_OBJECT(row), "player-name");
   const char *uuid = g_object_get_data(G_OBJECT(row), "player-uuid");
-  const char *state_key = g_object_get_data(G_OBJECT(row), "player-key");
-  const char *last_ip = g_object_get_data(G_OBJECT(row), "player-last-ip");
-  gboolean is_online = GPOINTER_TO_INT(g_object_get_data(G_OBJECT(row), "player-online")) != 0;
-  gboolean is_banned = GPOINTER_TO_INT(g_object_get_data(G_OBJECT(row), "player-banned")) != 0;
-  gboolean is_ip_banned = GPOINTER_TO_INT(g_object_get_data(G_OBJECT(row), "player-ip-banned")) != 0;
+  const char *key = g_object_get_data(G_OBJECT(row), "player-key");
+  const char *ip = g_object_get_data(G_OBJECT(row), "player-last-ip");
+  PlayerState *state = key != NULL ? g_hash_table_lookup(self->player_states, key) : NULL;
+  gboolean online = state != NULL && state->online;
+  gboolean banned = GPOINTER_TO_INT(g_object_get_data(G_OBJECT(row), "player-banned")) != 0;
+  gboolean ip_banned = GPOINTER_TO_INT(g_object_get_data(G_OBJECT(row), "player-ip-banned")) != 0;
   int op_level = GPOINTER_TO_INT(g_object_get_data(G_OBJECT(row), "player-op-level")) - 1;
-  gboolean is_op = op_level >= 0;
-  gboolean is_admin = player_is_admin_from_op_level(op_level);
-  gboolean has_last_ip = (last_ip != NULL && *last_ip != '\0');
-  gboolean has_name = (name != NULL && *name != '\0');
-  PlayerState *state = NULL;
-  if (state_key != NULL && self->player_states != NULL) {
-    state = g_hash_table_lookup(self->player_states, state_key);
-  }
+  gboolean running = pumpkin_server_get_running(self->current);
+  gboolean has_name = name != NULL && *name != '\0';
 
-  const char *title = has_name ? name : "Player";
-  g_autofree char *body = NULL;
-  if (state != NULL) {
-    g_autofree char *playtime = format_duration(player_state_effective_playtime(state));
-    g_autofree char *first_joined = format_unix_time(self, state->first_joined_unix);
-    g_autofree char *last_seen = format_unix_time(self, state->last_online_unix);
-    const char *perm_label = is_admin ? "ADMIN" : (is_op ? "OP" : "Player");
-    body = g_strdup_printf("UUID: %s\nPlatform: %s\nStatus: %s\nPermissions: %s\nBanned: %s\nIP banned: %s\nLast IP: %s\nFirst joined: %s\nLast online: %s\nPlaytime: %s",
-                           state->uuid != NULL ? state->uuid : "Unknown",
-                           platform_label(state->platform),
-                           state->online ? "Online" : "Offline",
-                           perm_label,
-                           is_banned ? "Yes" : "No",
-                           is_ip_banned ? "Yes" : "No",
-                           has_last_ip ? last_ip : "Unknown",
-                           first_joined,
-                           state->online ? "Now" : last_seen,
-                           playtime);
-  } else if (uuid != NULL) {
-    body = g_strdup_printf("UUID: %s", uuid);
-  }
+  AdwDialog *dialog = adw_dialog_new();
+  adw_dialog_set_title(dialog, "Player Details");
+  adw_dialog_set_content_width(dialog, 560);
+  adw_dialog_set_content_height(dialog, 650);
+  gtk_widget_set_size_request(GTK_WIDGET(dialog), 360, 300);
+  AdwToolbarView *toolbar = ADW_TOOLBAR_VIEW(adw_toolbar_view_new());
+  adw_toolbar_view_add_top_bar(toolbar, adw_header_bar_new());
+  GtkWidget *content = gtk_box_new(GTK_ORIENTATION_VERTICAL, 16);
+  gtk_widget_set_margin_start(content, 24);
+  gtk_widget_set_margin_end(content, 24);
+  gtk_widget_set_margin_top(content, 12);
+  gtk_widget_set_margin_bottom(content, 24);
 
-  AdwDialog *dialog = adw_alert_dialog_new(title, body);
-  AdwAlertDialog *alert = ADW_ALERT_DIALOG(dialog);
-  adw_alert_dialog_add_response(alert, "cancel", "Cancel");
-  adw_alert_dialog_add_response(alert, "kick", "Kick");
-  adw_alert_dialog_add_response(alert, "deop", "Deop");
-  adw_alert_dialog_add_response(alert, "op", "Op");
-  adw_alert_dialog_add_response(alert, "ban", "Ban");
-  adw_alert_dialog_add_response(alert, "unban", "Unban");
-  adw_alert_dialog_add_response(alert, "ban_ip", "Ban IP");
-  adw_alert_dialog_add_response(alert, "pardon_ip", "Pardon IP");
-  adw_alert_dialog_add_response(alert, "delete_data", "Delete Data");
-  adw_alert_dialog_set_default_response(alert, "cancel");
+  GtkWidget *profile = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 16);
+  GtkWidget *frame = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 0);
+  gtk_widget_add_css_class(frame, "player-head");
+  gtk_widget_set_valign(frame, GTK_ALIGN_CENTER);
+  gtk_widget_set_overflow(frame, GTK_OVERFLOW_HIDDEN);
+  GtkWidget *head = gtk_image_new();
+  gtk_image_set_pixel_size(GTK_IMAGE(head), 64);
+  set_player_head(self, GTK_IMAGE(head), state);
+  gtk_box_append(GTK_BOX(frame), head);
+  gtk_box_append(GTK_BOX(profile), frame);
+  GtkWidget *identity = gtk_box_new(GTK_ORIENTATION_VERTICAL, 6);
+  gtk_widget_set_hexpand(identity, TRUE);
+  gtk_widget_set_valign(identity, GTK_ALIGN_CENTER);
+  GtkWidget *heading = gtk_label_new(has_name ? name : "Unknown player");
+  gtk_label_set_xalign(GTK_LABEL(heading), 0);
+  gtk_label_set_ellipsize(GTK_LABEL(heading), PANGO_ELLIPSIZE_END);
+  gtk_widget_add_css_class(heading, "title-2");
+  gtk_box_append(GTK_BOX(identity), heading);
+  GtkWidget *chips = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 8);
+  GtkWidget *edition = gtk_label_new(state != NULL && state->platform != PLAYER_PLATFORM_UNKNOWN
+                                     ? platform_label(state->platform) : "Edition unknown");
+  gtk_widget_add_css_class(edition, "status-badge");
+  gtk_widget_add_css_class(edition, "player-platform-badge");
+  gtk_box_append(GTK_BOX(chips), edition);
+  GtkWidget *status = gtk_label_new(online ? "Online" : "Offline");
+  gtk_widget_add_css_class(status, "status-badge");
+  gtk_widget_add_css_class(status, online ? "player-online" : "player-platform-badge");
+  gtk_box_append(GTK_BOX(chips), status);
+  gtk_box_append(GTK_BOX(identity), chips);
+  gtk_box_append(GTK_BOX(profile), identity);
+  gtk_box_append(GTK_BOX(content), profile);
 
-  adw_alert_dialog_set_response_appearance(alert, "cancel", ADW_RESPONSE_DEFAULT);
-  adw_alert_dialog_set_response_appearance(alert, "ban", ADW_RESPONSE_DESTRUCTIVE);
-  adw_alert_dialog_set_response_appearance(alert, "ban_ip", ADW_RESPONSE_DESTRUCTIVE);
-  adw_alert_dialog_set_response_appearance(alert, "deop", ADW_RESPONSE_DESTRUCTIVE);
-  adw_alert_dialog_set_response_appearance(alert, "delete_data", ADW_RESPONSE_DESTRUCTIVE);
-  adw_dialog_set_can_close(ADW_DIALOG(dialog), TRUE);
+  AdwViewStack *pages = ADW_VIEW_STACK(adw_view_stack_new());
+  gtk_widget_set_vexpand(GTK_WIDGET(pages), TRUE);
+  AdwViewSwitcher *switcher = ADW_VIEW_SWITCHER(adw_view_switcher_new());
+  adw_view_switcher_set_stack(switcher, pages);
+  adw_view_switcher_set_policy(switcher, ADW_VIEW_SWITCHER_POLICY_WIDE);
+  gtk_box_append(GTK_BOX(content), GTK_WIDGET(switcher));
+  gtk_box_append(GTK_BOX(content), GTK_WIDGET(pages));
+  GtkWidget *overview = gtk_box_new(GTK_ORIENTATION_VERTICAL, 24);
+  GtkWidget *manage = gtk_box_new(GTK_ORIENTATION_VERTICAL, 24);
+  player_details_page(pages, "overview", "Overview", "avatar-default-symbolic", overview);
+  player_details_page(pages, "manage", "Manage", "preferences-system-symbolic", manage);
 
-  if (self->current == NULL) {
-    adw_alert_dialog_set_response_enabled(alert, "kick", FALSE);
-    adw_alert_dialog_set_response_enabled(alert, "ban", FALSE);
-    adw_alert_dialog_set_response_enabled(alert, "unban", FALSE);
-    adw_alert_dialog_set_response_enabled(alert, "op", FALSE);
-    adw_alert_dialog_set_response_enabled(alert, "deop", FALSE);
-    adw_alert_dialog_set_response_enabled(alert, "ban_ip", FALSE);
-    adw_alert_dialog_set_response_enabled(alert, "pardon_ip", FALSE);
-  } else {
-    gboolean running = pumpkin_server_get_running(self->current);
-    adw_alert_dialog_set_response_enabled(alert,
-                                          "ban",
-                                          running && has_name && !is_banned && !is_ip_banned);
-    adw_alert_dialog_set_response_enabled(alert, "unban", running && has_name && is_banned);
-    adw_alert_dialog_set_response_enabled(alert, "op", running && has_name && !is_op);
-    adw_alert_dialog_set_response_enabled(alert, "deop", running && has_name && is_op);
-    adw_alert_dialog_set_response_enabled(alert, "kick", running && has_name && is_online);
-    adw_alert_dialog_set_response_enabled(alert, "ban_ip",
-                                          running && !is_ip_banned && ((has_name && is_online) || has_last_ip));
-    adw_alert_dialog_set_response_enabled(alert, "pardon_ip",
-                                          running && is_ip_banned);
-  }
+  AdwPreferencesGroup *activity = ADW_PREFERENCES_GROUP(adw_preferences_group_new());
+  adw_preferences_group_set_title(activity, "Activity");
+  g_autofree char *playtime = format_duration(player_state_effective_playtime(state));
+  g_autofree char *first = format_unix_time(self, state != NULL ? state->first_joined_unix : 0);
+  g_autofree char *last = format_unix_time(self, state != NULL ? state->last_online_unix : 0);
+  AdwActionRow *playtime_row = player_info_row(activity, "Playtime", playtime);
+  AdwActionRow *seen_row = player_info_row(activity, "Last seen", online ? "Online now" : last);
+  player_info_row(activity, "Recorded since", first);
+  gtk_box_append(GTK_BOX(overview), GTK_WIDGET(activity));
 
-  if (name != NULL) {
-    g_object_set_data_full(G_OBJECT(dialog), "player-name", g_strdup(name), g_free);
+  AdwPreferencesGroup *account = ADW_PREFERENCES_GROUP(adw_preferences_group_new());
+  adw_preferences_group_set_title(account, "Identity");
+  player_info_row(account, "UUID", uuid);
+  player_info_row(account, "Last IP address", ip);
+  player_info_row(account, "Permissions", op_level < 0 ? "Player" :
+    (player_is_admin_from_op_level(op_level) ? "Admin" : "Operator"));
+  if (state != NULL && state->platform == PLAYER_PLATFORM_UNKNOWN)
+    adw_preferences_group_set_description(account,
+      "The server has not reported an edition for this player.");
+  else if (state != NULL && state->platform == PLAYER_PLATFORM_BEDROCK &&
+           (uuid == NULL || !g_str_has_prefix(uuid, "00000000-0000-0000-")))
+    adw_preferences_group_set_description(account,
+      "Pumpkin does not expose native Bedrock skins here yet.");
+  gtk_box_append(GTK_BOX(overview), GTK_WIDGET(account));
+
+  const char *data_keys[] = {"player-name", "player-uuid", "player-key", "player-last-ip"};
+  for (guint i = 0; i < G_N_ELEMENTS(data_keys); i++) {
+    const char *value = g_object_get_data(G_OBJECT(row), data_keys[i]);
+    if (value != NULL) g_object_set_data_full(G_OBJECT(dialog), data_keys[i], g_strdup(value), g_free);
   }
-  if (state_key != NULL) {
-    g_object_set_data_full(G_OBJECT(dialog), "player-key", g_strdup(state_key), g_free);
-  }
-  if (uuid != NULL) {
-    g_object_set_data_full(G_OBJECT(dialog), "player-uuid", g_strdup(uuid), g_free);
-  }
-  if (has_last_ip) {
-    g_object_set_data_full(G_OBJECT(dialog), "player-last-ip", g_strdup(last_ip), g_free);
-  }
-  g_object_set_data(G_OBJECT(dialog), "player-online", GINT_TO_POINTER(is_online ? 1 : 0));
-  g_object_set_data(G_OBJECT(dialog), "player-banned", GINT_TO_POINTER(is_banned ? 1 : 0));
-  g_object_set_data(G_OBJECT(dialog), "player-ip-banned", GINT_TO_POINTER(is_ip_banned ? 1 : 0));
+  g_object_set_data_full(G_OBJECT(dialog), "player-server", g_object_ref(self->current), g_object_unref);
+  g_object_set_data(G_OBJECT(dialog), "player-online", GINT_TO_POINTER(online));
+  g_object_set_data(G_OBJECT(dialog), "player-banned", GINT_TO_POINTER(banned));
+  g_object_set_data(G_OBJECT(dialog), "player-ip-banned", GINT_TO_POINTER(ip_banned));
   g_object_set_data(G_OBJECT(dialog), "player-op-level", GINT_TO_POINTER(op_level + 1));
 
-  adw_alert_dialog_choose(alert, GTK_WIDGET(self), NULL, on_player_action_confirmed, self);
+  AdwPreferencesGroup *management = ADW_PREFERENCES_GROUP(adw_preferences_group_new());
+  adw_preferences_group_set_title(management, "Manage player");
+  if (!running) adw_preferences_group_set_description(management,
+    "Start the server to use moderation actions.");
+  player_management_row(self, dialog, management, "Disconnect player", "The player can reconnect.",
+    "Kick", "kick", running && online && has_name, FALSE);
+  player_management_row(self, dialog, management, "Operator permissions",
+    op_level >= 0 ? "Remove elevated server permissions." : "Grant elevated server permissions.",
+    op_level >= 0 ? "Revoke" : "Grant", op_level >= 0 ? "deop" : "op",
+    running && has_name, FALSE);
+  player_management_row(self, dialog, management, "Player ban",
+    banned ? "Allow this account to rejoin." : "Block this account from joining.",
+    banned ? "Unban" : "Ban", banned ? "unban" : "ban",
+    running && has_name && (banned || !ip_banned), !banned);
+  player_management_row(self, dialog, management, "IP ban",
+    ip_banned ? "Allow connections from this address." : "Block connections from this address.",
+    ip_banned ? "Unban IP" : "Ban IP", ip_banned ? "pardon_ip" : "ban_ip",
+    running && (ip_banned || (ip != NULL && *ip != '\0') || (has_name && online)), !ip_banned);
+  gtk_box_append(GTK_BOX(manage), GTK_WIDGET(management));
+  AdwPreferencesGroup *history = ADW_PREFERENCES_GROUP(adw_preferences_group_new());
+  player_management_row(self, dialog, history, "Remove from history",
+    "Only clears tracking; world data is kept.", "Remove", "delete_data", !online, TRUE);
+  gtk_box_append(GTK_BOX(manage), GTK_WIDGET(history));
+
+  adw_toolbar_view_set_content(toolbar, content);
+  adw_dialog_set_child(dialog, GTK_WIDGET(toolbar));
+  PlayerDetailsLive *live = g_new0(PlayerDetailsLive, 1);
+  g_weak_ref_init(&live->window, self);
+  live->dialog = dialog;
+  live->playtime = playtime_row;
+  live->last_seen = seen_row;
+  live->status = GTK_LABEL(status);
+  live->edition = GTK_LABEL(edition);
+  g_object_set_data_full(G_OBJECT(dialog), "player-live", live, player_details_live_free);
+  g_signal_connect(dialog, "closed", G_CALLBACK(player_details_stop), live);
+  live->timer = g_timeout_add(1000, update_player_details, live);
+  adw_dialog_present(dialog, GTK_WIDGET(self));
 }
 
 static int
@@ -9387,6 +11989,9 @@ update_settings_form(PumpkinWindow *self)
   }
   self->settings_loading = TRUE;
   self->settings_invalid = FALSE;
+  if (self->config != NULL) {
+    adw_combo_row_set_selected(self->row_release_channel, (guint)pumpkin_config_get_release_channel(self->config));
+  }
   if (self->config != NULL && self->drop_date_format != NULL) {
     gtk_drop_down_set_selected(self->drop_date_format, (guint)pumpkin_config_get_date_format(self->config));
   }
@@ -9651,7 +12256,6 @@ select_server(PumpkinWindow *self, PumpkinServer *server)
   }
 
   self->last_proc_jiffies = 0;
-  self->last_proc_cpu_smoothed = 0.0;
   self->last_proc_pid = 0;
   reset_stats_history(self);
   apply_stats_sample_msec(self,
@@ -9670,13 +12274,6 @@ select_server(PumpkinWindow *self, PumpkinServer *server)
   self->last_player_list_request_at = 0;
   self->last_player_state_flush_at = 0;
   self->last_auto_update_eval_at = 0;
-  self->pending_auto_tps_lines = 0;
-  self->pending_auto_list_lines = 0;
-  self->pending_java_platform_hints = 0;
-  self->pending_bedrock_platform_hints = 0;
-  if (self->player_head_downloads != NULL) {
-    g_hash_table_remove_all(self->player_head_downloads);
-  }
   invalidate_player_list_signature(self);
 
   if (server != NULL) {
@@ -9705,6 +12302,7 @@ select_server(PumpkinWindow *self, PumpkinServer *server)
   update_details(self);
   update_settings_form(self);
   refresh_plugin_list(self);
+  refresh_marketplace_install_buttons(self);
   refresh_world_list(self);
   refresh_player_list(self);
   refresh_log_files(self);
@@ -9734,7 +12332,12 @@ select_server_row(PumpkinWindow *self, PumpkinServer *server)
     GtkListBoxRow *row = GTK_LIST_BOX_ROW(child);
     PumpkinServer *row_server = g_object_get_data(G_OBJECT(row), "server");
     if (row_server == server) {
-      gtk_list_box_select_row(self->server_list, row);
+      if (gtk_list_box_get_selected_row(self->server_list) == row && self->current != server) {
+        /* Selecting an already-selected row does not emit row-selected. */
+        on_server_selected(self->server_list, row, self);
+      } else {
+        gtk_list_box_select_row(self->server_list, row);
+      }
       return;
     }
     child = gtk_widget_get_next_sibling(child);
@@ -9785,6 +12388,9 @@ static void
 on_add_server(GtkButton *button, PumpkinWindow *self)
 {
   (void)button;
+  if (!ensure_local_hosting_supported(self)) {
+    return;
+  }
   AdwDialog *dialog = adw_alert_dialog_new("New Server", "Choose a unique server name.");
   AdwAlertDialog *alert = ADW_ALERT_DIALOG(dialog);
   adw_alert_dialog_add_response(alert, "cancel", "Cancel");
@@ -9890,37 +12496,6 @@ unique_import_dir(const char *base_dir, const char *name)
   return g_build_filename(base_dir, uuid, NULL);
 }
 
-static char *
-unique_import_file(const char *base_dir, const char *name)
-{
-  g_autofree char *base_name = g_path_get_basename(name);
-  g_autofree char *candidate = g_build_filename(base_dir, base_name, NULL);
-  if (!g_file_test(candidate, G_FILE_TEST_EXISTS)) {
-    return g_strdup(candidate);
-  }
-
-  const char *dot = g_strrstr(base_name, ".");
-  g_autofree char *stem = NULL;
-  g_autofree char *ext = NULL;
-  if (dot != NULL && dot != base_name) {
-    stem = g_strndup(base_name, (gsize)(dot - base_name));
-    ext = g_strdup(dot);
-  } else {
-    stem = g_strdup(base_name);
-    ext = g_strdup("");
-  }
-
-  for (guint i = 2; i < 1000; i++) {
-    g_autofree char *with_suffix = g_strdup_printf("%s-%u%s", stem, i, ext);
-    g_autofree char *path = g_build_filename(base_dir, with_suffix, NULL);
-    if (!g_file_test(path, G_FILE_TEST_EXISTS)) {
-      return g_strdup(path);
-    }
-  }
-
-  g_autofree char *uuid = g_uuid_string_random();
-  return g_build_filename(base_dir, uuid, NULL);
-}
 
 static gboolean
 path_is_within(const char *path, const char *base_dir)
@@ -9973,65 +12548,6 @@ files_from_drop_value(const GValue *value)
   return g_steal_pointer(&files);
 }
 
-static gboolean
-import_drop_files_to_dir(PumpkinWindow *self,
-                         GPtrArray *files,
-                         const char *dest_dir,
-                         gboolean directories_only,
-                         const char *kind_label)
-{
-  if (self->current == NULL || files == NULL || dest_dir == NULL) {
-    return FALSE;
-  }
-
-  gboolean any = FALSE;
-  for (guint i = 0; i < files->len; i++) {
-    GFile *file = g_ptr_array_index(files, i);
-    if (file == NULL) {
-      continue;
-    }
-
-    g_autofree char *path = g_file_get_path(file);
-    if (path == NULL) {
-      append_log(self, "Only local files can be imported.");
-      continue;
-    }
-
-    gboolean is_dir = g_file_test(path, G_FILE_TEST_IS_DIR);
-    if (directories_only && !is_dir) {
-      if (kind_label != NULL) {
-        g_autofree char *msg = g_strdup_printf("Only folders can be imported to %s.", kind_label);
-        append_log(self, msg);
-      }
-      continue;
-    }
-
-    g_autoptr(GError) copy_error = NULL;
-    if (is_dir) {
-      g_autofree char *target_dir = unique_import_dir(dest_dir, path);
-      if (!copy_tree(path, target_dir, &copy_error)) {
-        if (copy_error != NULL) {
-          append_log(self, copy_error->message);
-        }
-        continue;
-      }
-    } else {
-      g_autofree char *target_path = unique_import_file(dest_dir, path);
-      g_autoptr(GFile) src_file = g_file_new_for_path(path);
-      g_autoptr(GFile) dest_file = g_file_new_for_path(target_path);
-      if (!g_file_copy(src_file, dest_file, G_FILE_COPY_OVERWRITE, NULL, NULL, NULL, &copy_error)) {
-        if (copy_error != NULL) {
-          append_log(self, copy_error->message);
-        }
-        continue;
-      }
-    }
-
-    any = TRUE;
-  }
-
-  return any;
-}
 
 static gboolean
 import_plugin_files_to_dir(PumpkinWindow *self, GPtrArray *files, const char *dest_dir)
@@ -10092,6 +12608,7 @@ import_plugin_files_to_dir(PumpkinWindow *self, GPtrArray *files, const char *de
       }
       continue;
     }
+    copy_plugin_sidecar_if_present(self, path, target_path, TRUE);
     any = TRUE;
   }
 
@@ -10115,6 +12632,9 @@ static void
 on_import_server(GtkButton *button, PumpkinWindow *self)
 {
   (void)button;
+  if (!ensure_local_hosting_supported(self)) {
+    return;
+  }
   GtkFileDialog *dialog = gtk_file_dialog_new();
   gtk_file_dialog_set_title(dialog, "Import Server Folder");
   gtk_file_dialog_select_folder(dialog, GTK_WINDOW(self), NULL, on_import_server_done, self);
@@ -10217,56 +12737,6 @@ on_plugins_drop_leave(GtkDropTarget *target, PumpkinWindow *self)
   set_drop_highlight(GTK_WIDGET(self->plugin_list), FALSE);
 }
 
-static gboolean
-on_worlds_drop(GtkDropTarget *target, const GValue *value, double x, double y, PumpkinWindow *self)
-{
-  (void)target;
-  (void)x;
-  (void)y;
-  if (self->current == NULL) {
-    return FALSE;
-  }
-  if (pumpkin_server_get_running(self->current) ||
-      self->ui_state == UI_STATE_STARTING ||
-      self->ui_state == UI_STATE_RESTARTING) {
-    set_details_error(self, "Stop the server before modifying worlds.");
-    return FALSE;
-  }
-
-  g_autofree char *worlds_dir = pumpkin_server_get_worlds_dir(self->current);
-  if (worlds_dir == NULL) {
-    return FALSE;
-  }
-
-  g_autoptr(GPtrArray) files = files_from_drop_value(value);
-  if (files == NULL || files->len == 0) {
-    return FALSE;
-  }
-
-  gboolean imported = import_drop_files_to_dir(self, files, worlds_dir, TRUE, "Worlds");
-  if (imported) {
-    refresh_world_list(self);
-  }
-  set_drop_highlight(GTK_WIDGET(self->world_list), FALSE);
-  return imported;
-}
-
-static GdkDragAction
-on_worlds_drop_enter(GtkDropTarget *target, double x, double y, PumpkinWindow *self)
-{
-  (void)target;
-  (void)x;
-  (void)y;
-  set_drop_highlight(GTK_WIDGET(self->world_list), TRUE);
-  return GDK_ACTION_COPY;
-}
-
-static void
-on_worlds_drop_leave(GtkDropTarget *target, PumpkinWindow *self)
-{
-  (void)target;
-  set_drop_highlight(GTK_WIDGET(self->world_list), FALSE);
-}
 
 static void
 set_hover_delete_button_visible(GtkWidget *button, gboolean visible)
@@ -10367,22 +12837,9 @@ static void
 on_remove_server(GtkButton *button, PumpkinWindow *self)
 {
   (void)button;
-  if (self->current == NULL) {
-    return;
+  if (self->current != NULL) {
+    on_overview_remove_clicked(NULL, self);
   }
-
-  g_autofree char *removed_id = g_strdup(pumpkin_server_get_id(self->current));
-  pumpkin_server_store_remove_selected(self->store);
-  if (removed_id != NULL && *removed_id != '\0') {
-    if (networks_prune_server(self, removed_id)) {
-      refresh_overview_network_list(self);
-    }
-  }
-  clear_list_box(self->server_list);
-  load_server_list(self);
-  update_overview(self);
-  update_details(self);
-  refresh_overview_list(self);
 }
 
 static void
@@ -10402,59 +12859,161 @@ download_context_free(DownloadContext *ctx)
   g_free(ctx);
 }
 
-static gboolean
-install_server_from_binary_path(PumpkinWindow *self,
-                                PumpkinServer *server,
-                                const char *src_binary_path,
-                                const char *installed_url,
-                                const char *build_id,
-                                const char *build_label,
-                                const char *success_log,
-                                const char *success_status)
+static void
+finish_download_application(DownloadContext *ctx, const GError *error)
 {
-  if (self == NULL || server == NULL || src_binary_path == NULL || *src_binary_path == '\0') {
-    return FALSE;
+  PumpkinWindow *self = ctx->self;
+  PumpkinServer *server = ctx->server;
+  if (ctx->maintenance_acquired) {
+    pumpkin_server_end_maintenance(server);
+    ctx->maintenance_acquired = FALSE;
   }
-  if (!binary_file_is_valid(src_binary_path)) {
-    append_log_for_server(self, server, "Install source is invalid; skipping.");
-    set_details_status_for_server(self, server, "Install failed", 5);
-    return FALSE;
-  }
-
-  g_autofree char *bin = pumpkin_server_get_bin_path(server);
-  g_autoptr(GError) copy_error = NULL;
-  if (!copy_binary(src_binary_path, bin, &copy_error)) {
-    if (copy_error != NULL) {
-      append_log_for_server(self, server, copy_error->message);
+  if (self->disposing) {
+    if (!ctx->use_cache && ctx->tmp_path != NULL) {
+      g_remove(ctx->tmp_path);
     }
-    set_details_status_for_server(self, server, "Install failed", 5);
-    return FALSE;
+    download_context_free(ctx);
+    return;
   }
-  if (!binary_file_is_valid(bin)) {
-    append_log_for_server(self, server, "Installed binary is invalid.");
-    set_details_status_for_server(self, server, "Install failed", 5);
-    g_remove(bin);
-    return FALSE;
+  DownloadProgressState *state = get_download_progress_state(self, server, FALSE);
+  if (state != NULL) {
+    state->active = FALSE;
   }
-
-  append_log_for_server(self, server, success_log != NULL ? success_log : "Installed from local cache");
-  if (success_status != NULL && *success_status != '\0') {
-    set_details_status_for_server(self, server, success_status, 3);
+  if (!ctx->use_cache && ctx->tmp_path != NULL) {
+    g_remove(ctx->tmp_path);
   }
-  pumpkin_server_set_installed_url(server, installed_url);
-  pumpkin_server_set_installed_build_id(server, build_id);
-  if (build_label != NULL && *build_label != '\0') {
-    g_autofree char *normalized = normalize_build_label(self, build_label);
-    pumpkin_server_set_installed_build_label(server, normalized);
-  } else {
-    g_autofree char *local_label = build_label_from_binary_path(self, bin);
-    pumpkin_server_set_installed_build_label(server, local_label);
+  if (error != NULL) {
+    append_log_for_server(self, server, error->message);
+    set_details_status_for_server(self, server, error->message, 8);
   }
-  pumpkin_server_save(server, NULL);
+  set_download_busy(self, FALSE);
   update_overview(self);
   refresh_overview_list(self);
   update_details(self);
-  return TRUE;
+  download_context_free(ctx);
+}
+
+static void
+on_binary_install_done(GObject *source, GAsyncResult *result, gpointer data)
+{
+  (void)source;
+  DownloadContext *ctx = data;
+  g_autoptr(GError) error = NULL;
+  if (!pumpkin_binary_install_finish(result, &error)) {
+    finish_download_application(ctx, error);
+    return;
+  }
+  PumpkinServer *server = ctx->server;
+  pumpkin_server_set_installed_url(server, ctx->used_url);
+  pumpkin_server_set_installed_build_id(server, ctx->used_build_id);
+  if (ctx->used_build_label != NULL && *ctx->used_build_label != '\0') {
+    pumpkin_server_set_installed_build_label(server, ctx->used_build_label);
+  } else if (!ctx->self->disposing) {
+    g_autofree char *label = build_label_from_binary_path(ctx->self, ctx->server_bin);
+    pumpkin_server_set_installed_build_label(server, label);
+  }
+  gboolean metadata_saved = pumpkin_server_save(server, &error);
+  if (!metadata_saved) {
+    if (!ctx->self->disposing) {
+      append_log_for_server(ctx->self, server, error->message);
+    }
+    g_clear_error(&error);
+  }
+  if (ctx->self->disposing) {
+    finish_download_application(ctx, NULL);
+    return;
+  }
+  g_autofree char *previous = g_strconcat(ctx->server_bin, ".previous", NULL);
+  append_log_for_server(ctx->self, server, g_file_test(previous, G_FILE_TEST_EXISTS) ?
+    "[SMPK] Installation complete. The previous executable is retained as .previous." :
+    "[SMPK] Installation complete.");
+  pumpkin_server_end_maintenance(server);
+  ctx->maintenance_acquired = FALSE;
+  DownloadProgressState *state = get_download_progress_state(ctx->self, server, FALSE);
+  if (state != NULL) {
+    state->active = FALSE;
+  }
+  if (ctx->restart_after_download) {
+    if (!start_server_internal(ctx->self, server, FALSE, TRUE)) {
+      g_set_error_literal(&error, G_IO_ERROR, G_IO_ERROR_FAILED,
+                          "Update installed, but the server could not be restarted. See the console for details.");
+      finish_download_application(ctx, error);
+      return;
+    }
+  }
+  set_details_status_for_server(ctx->self, server, metadata_saved ? "Installation complete" :
+    "Installed, but installation metadata could not be saved", metadata_saved ? 3 : 8);
+  finish_download_application(ctx, NULL);
+}
+
+static void
+on_install_server_stopped(GObject *source, GAsyncResult *result, gpointer data)
+{
+  DownloadContext *ctx = data;
+  g_autoptr(GError) error = NULL;
+  if (!pumpkin_server_stop_finish(PUMPKIN_SERVER(source), result, &error)) {
+    finish_download_application(ctx, error);
+    return;
+  }
+  if (ctx->self->disposing) {
+    finish_download_application(ctx, NULL);
+    return;
+  }
+  const char *path = ctx->use_cache ? ctx->dest_path : ctx->tmp_path;
+  pumpkin_binary_install_async(path, ctx->server_bin, NULL, on_binary_install_done, ctx);
+}
+
+static void
+apply_downloaded_binary(DownloadContext *ctx)
+{
+  if (ctx->self->disposing) {
+    finish_download_application(ctx, NULL);
+    return;
+  }
+  const char *path = ctx->use_cache ? ctx->dest_path : ctx->tmp_path;
+  g_autoptr(GError) error = NULL;
+  if (!binary_file_is_valid(path)) {
+    g_set_error_literal(&error, G_IO_ERROR, G_IO_ERROR_INVALID_DATA,
+                        "Downloaded binary is invalid; the existing installation was not changed");
+    finish_download_application(ctx, error);
+    return;
+  }
+  if (!pumpkin_server_begin_maintenance(ctx->server, &error)) {
+    finish_download_application(ctx, error);
+    return;
+  }
+  ctx->maintenance_acquired = TRUE;
+  /* A manual stop during download takes precedence over automatic restarting. */
+  ctx->restart_after_download = ctx->restart_after_download &&
+    pumpkin_server_get_running(ctx->server) && !pumpkin_server_get_stopping(ctx->server);
+  if (pumpkin_server_get_running(ctx->server)) {
+    append_log_for_server(ctx->self, ctx->server, "[SMPK] Download verified; stopping safely before installation.");
+    if (ctx->self->current == ctx->server) {
+      ctx->self->user_stop_requested = TRUE;
+      ctx->self->ui_state = UI_STATE_STOPPING;
+    }
+  }
+  pumpkin_server_stop_async(ctx->server, NULL, on_install_server_stopped, ctx);
+  update_details(ctx->self);
+}
+
+static void
+apply_cached_binary(PumpkinWindow *self, PumpkinServer *server,
+                     const char *path, const char *url,
+                     const char *build_id, const char *build_label,
+                     gboolean restart_after_download)
+{
+  DownloadContext *ctx = g_new0(DownloadContext, 1);
+  ctx->self = g_object_ref(self);
+  ctx->server = g_object_ref(server);
+  ctx->dest_path = g_strdup(path);
+  ctx->server_bin = pumpkin_server_get_bin_path(server);
+  ctx->used_url = g_strdup(url);
+  ctx->used_build_id = g_strdup(build_id);
+  ctx->used_build_label = normalize_build_label(self, build_label);
+  ctx->use_cache = TRUE;
+  ctx->restart_after_download = restart_after_download;
+  apply_downloaded_binary(ctx);
 }
 
 static void
@@ -10490,18 +13049,8 @@ on_wait_for_shared_cache_tick(gpointer data)
       g_remove(ctx->cache_path);
       return G_SOURCE_CONTINUE;
     }
-    DownloadProgressState *state = get_download_progress_state(self, server, FALSE);
-    if (state != NULL) {
-      state->active = FALSE;
-    }
-    install_server_from_binary_path(self,
-                                    server,
-                                    ctx->cache_path,
-                                    ctx->url,
-                                    ctx->build_id,
-                                    ctx->build_label,
-                                    "Installed from shared cache",
-                                    "Installed from cache");
+    apply_cached_binary(self, server, ctx->cache_path, ctx->url,
+                         ctx->build_id, ctx->build_label, ctx->restart_after_download);
     cache_wait_context_free(ctx);
     return G_SOURCE_REMOVE;
   }
@@ -10532,18 +13081,25 @@ start_download_for_server(PumpkinWindow *self,
   if (server == NULL || url == NULL || *url == '\0') {
     return;
   }
+  if (pumpkin_server_get_maintenance(server)) {
+    set_details_status_for_server(self, server, "Wait for server maintenance to finish", 5);
+    return;
+  }
   if (server_download_active(self, server)) {
     set_details_status_for_server(self, server, "Install/update already in progress", 3);
     return;
   }
 
+  if (!pumpkin_release_is_managed_url(pumpkin_server_get_download_url(server))) {
+    url = pumpkin_server_get_download_url(server);
+  }
   gboolean using_latest = (self->latest_url != NULL && g_strcmp0(url, self->latest_url) == 0);
   const char *resolved_build_id = using_latest ? self->latest_build_id : NULL;
   const char *resolved_build_label = using_latest ? self->latest_build_label : NULL;
   const char *cache_identity = using_latest ? latest_build_identity(self) : resolved_build_id;
 
   g_autofree char *bin = pumpkin_server_get_bin_path(server);
-  gboolean use_cache = !force_no_cache && use_download_cache(self);
+  gboolean use_cache = !force_no_cache && cache_identity != NULL && use_download_cache(self);
   g_autofree char *cache_path = use_cache ? cache_path_for_download(self, url, cache_identity) : NULL;
   g_autofree char *tmp = NULL;
   if (cache_path != NULL) {
@@ -10561,30 +13117,13 @@ start_download_for_server(PumpkinWindow *self,
   refresh_overview_list(self);
   update_details(self);
 
-  if (pumpkin_server_get_running(server)) {
-    append_log_for_server(self, server, "Stopping server before install/update...");
-    pumpkin_server_stop(server);
-  }
-
   if (cache_path != NULL && g_file_test(cache_path, G_FILE_TEST_EXISTS)) {
     if (!binary_file_is_valid(cache_path)) {
       append_log_for_server(self, server, "Ignoring invalid cached binary");
       g_remove(cache_path);
     } else {
-      install_server_from_binary_path(self,
-                                      server,
-                                      cache_path,
-                                      url,
-                                      resolved_build_id,
-                                      resolved_build_label,
-                                      "Installed from local cache",
-                                      "Installed from cache");
-      if (state != NULL) {
-        state->active = FALSE;
-      }
-      refresh_overview_list(self);
-      update_details(self);
-      set_download_busy(self, FALSE);
+      apply_cached_binary(self, server, cache_path, url,
+                           resolved_build_id, resolved_build_label, restart_after_download);
       return;
     }
   }
@@ -10643,225 +13182,140 @@ on_download_done(GObject *source, GAsyncResult *res, gpointer user_data)
 {
   (void)source;
   DownloadContext *ctx = user_data;
-  PumpkinWindow *self = ctx->self;
-  PumpkinServer *server = ctx->server;
   g_autoptr(GError) error = NULL;
-  const char *downloaded_binary_path = NULL;
-
   if (!pumpkin_download_file_finish(res, &error)) {
-    append_log_for_server(self, server, error->message);
-    set_details_status_for_server(self, server, "Download failed", 5);
     if (ctx->tmp_path != NULL) {
       g_remove(ctx->tmp_path);
     }
-    DownloadProgressState *state = get_download_progress_state(self, server, FALSE);
-    if (state != NULL) {
-      state->active = FALSE;
-    }
-    refresh_overview_list(self);
-    set_download_busy(self, FALSE);
-    update_details(self);
-    download_context_free(ctx);
+    finish_download_application(ctx, error);
     return;
   }
-
-  if (server == NULL) {
-    update_details(self);
-    download_context_free(ctx);
-    return;
-  }
-
-  if (ctx->use_cache && ctx->tmp_path != NULL && ctx->dest_path != NULL) {
-    g_chmod(ctx->tmp_path, 0755);
-    if (g_rename(ctx->tmp_path, ctx->dest_path) != 0) {
-      g_autofree char *msg = g_strdup_printf("Failed to replace binary: %s", g_strerror(errno));
-      g_autofree char *diag = describe_replace_paths(ctx->tmp_path, ctx->dest_path);
-      append_log_for_server(self, server, msg);
-      if (diag != NULL) {
-        append_log_for_server(self, server, diag);
-      }
-      set_details_status_for_server(self, server, "Download failed", 5);
-      g_remove(ctx->tmp_path);
-      DownloadProgressState *state = get_download_progress_state(self, server, FALSE);
-      if (state != NULL) {
-        state->active = FALSE;
-      }
-      refresh_overview_list(self);
-      set_download_busy(self, FALSE);
-      update_details(self);
-      download_context_free(ctx);
-      return;
-    }
-  }
-
-  downloaded_binary_path = ctx->use_cache ? ctx->dest_path : ctx->tmp_path;
-  if (downloaded_binary_path != NULL) {
-    g_chmod(downloaded_binary_path, 0755);
-  }
-
-  if (downloaded_binary_path != NULL && !binary_file_is_valid(downloaded_binary_path)) {
-    append_log_for_server(self, server, "Downloaded binary is invalid");
-    g_autofree char *diag = describe_invalid_binary_file(downloaded_binary_path);
-    if (diag != NULL) {
-      append_log_for_server(self, server, diag);
-    }
-    set_details_status_for_server(self, server, "Download failed", 5);
-    g_remove(downloaded_binary_path);
-    DownloadProgressState *state = get_download_progress_state(self, server, FALSE);
-    if (state != NULL) {
-      state->active = FALSE;
-    }
-    refresh_overview_list(self);
-    set_download_busy(self, FALSE);
-    update_details(self);
-    download_context_free(ctx);
-    return;
-  }
-
-  if (ctx->use_cache && ctx->server_bin != NULL && ctx->dest_path != NULL) {
-    g_autoptr(GError) copy_error = NULL;
-    if (!copy_binary(ctx->dest_path, ctx->server_bin, &copy_error)) {
-      if (copy_error != NULL) {
-        append_log_for_server(self, server, copy_error->message);
-      } else {
-        append_log_for_server(self, server, "Failed to copy cached binary to server");
-      }
-      set_details_status_for_server(self, server, "Install failed", 5);
-      if (ctx->tmp_path != NULL) {
-        g_remove(ctx->tmp_path);
-      }
-      DownloadProgressState *state = get_download_progress_state(self, server, FALSE);
-      if (state != NULL) {
-        state->active = FALSE;
-      }
-      refresh_overview_list(self);
-      set_download_busy(self, FALSE);
-      update_details(self);
-      download_context_free(ctx);
-      return;
-    }
-    if (!binary_file_is_valid(ctx->server_bin)) {
-      append_log_for_server(self, server, "Installed binary from cache is invalid");
-      set_details_status_for_server(self, server, "Install failed", 5);
-      g_remove(ctx->server_bin);
-      DownloadProgressState *state = get_download_progress_state(self, server, FALSE);
-      if (state != NULL) {
-        state->active = FALSE;
-      }
-      refresh_overview_list(self);
-      set_download_busy(self, FALSE);
-      update_details(self);
-      download_context_free(ctx);
-      return;
-    }
-  }
-  if (!ctx->use_cache && ctx->tmp_path != NULL) {
-    if (!install_server_from_binary_path(self,
-                                         server,
-                                         ctx->tmp_path,
-                                         ctx->used_url,
-                                         ctx->used_build_id,
-                                         ctx->used_build_label,
-                                         "Download complete",
-                                         "")) {
-      if (ctx->tmp_path != NULL) {
-        g_remove(ctx->tmp_path);
-      }
-      DownloadProgressState *state = get_download_progress_state(self, server, FALSE);
-      if (state != NULL) {
-        state->active = FALSE;
-      }
-      refresh_overview_list(self);
-      set_download_busy(self, FALSE);
-      update_details(self);
-      download_context_free(ctx);
-      return;
-    }
+  if (!binary_file_is_valid(ctx->tmp_path)) {
+    g_autofree char *diagnostic = describe_invalid_binary_file(ctx->tmp_path);
+    append_log_for_server(ctx->self, ctx->server, diagnostic);
+    g_set_error_literal(&error, G_IO_ERROR, G_IO_ERROR_INVALID_DATA,
+                        "Downloaded binary is invalid; the server was not stopped");
     g_remove(ctx->tmp_path);
+    finish_download_application(ctx, error);
+    return;
+  }
+  if (ctx->use_cache && g_rename(ctx->tmp_path, ctx->dest_path) != 0) {
+    g_set_error(&error, G_IO_ERROR, g_io_error_from_errno(errno),
+                "Cannot store downloaded binary in cache: %s", g_strerror(errno));
+    g_remove(ctx->tmp_path);
+    finish_download_application(ctx, error);
+    return;
+  }
+  apply_downloaded_binary(ctx);
+}
+
+typedef struct {
+  PumpkinWindow *self;
+  guint generation;
+} LatestResolveContext;
+
+static void
+invalidate_latest_release(PumpkinWindow *self)
+{
+  ++self->latest_resolve_generation;
+  if (self->latest_resolve_cancellable != NULL) {
+    g_cancellable_cancel(self->latest_resolve_cancellable);
+    g_clear_object(&self->latest_resolve_cancellable);
+  }
+  self->latest_resolve_in_flight = FALSE;
+  g_clear_pointer(&self->latest_url, g_free);
+  g_clear_pointer(&self->latest_build_id, g_free);
+  g_clear_pointer(&self->latest_build_label, g_free);
+  g_clear_pointer(&self->latest_error, g_free);
+}
+
+static gboolean
+apply_release_channel_selection(PumpkinWindow *self)
+{
+  PumpkinReleaseChannel channel = adw_combo_row_get_selected(self->row_release_channel) == 1 ?
+    PUMPKIN_RELEASE_STABLE : PUMPKIN_RELEASE_NIGHTLY;
+  if (self->config == NULL || channel == pumpkin_config_get_release_channel(self->config)) {
+    return TRUE;
+  }
+  if (any_download_active(self) || self->auto_update_server != NULL || self->auto_update_countdown_id != 0) {
+    gboolean was_loading = self->settings_loading;
+    self->settings_loading = TRUE;
+    adw_combo_row_set_selected(self->row_release_channel, (guint)pumpkin_config_get_release_channel(self->config));
+    self->settings_loading = was_loading;
+    set_details_status(self, "Finish the current install or update before changing release channels", 5);
+    return FALSE;
   }
 
-  set_download_busy(self, FALSE);
-  if (ctx->use_cache) {
-    append_log_for_server(self, server, "Download complete (cached)");
-  }
-  DownloadProgressState *state = get_download_progress_state(self, server, FALSE);
-  if (state != NULL) {
-    state->active = FALSE;
-  }
-  refresh_overview_list(self);
-  if (ctx->use_cache) {
-    pumpkin_server_set_installed_url(server, ctx->used_url);
-    pumpkin_server_set_installed_build_id(server, ctx->used_build_id);
-    if (ctx->used_build_label != NULL && *ctx->used_build_label != '\0') {
-      pumpkin_server_set_installed_build_label(server, ctx->used_build_label);
-    } else {
-      g_autofree char *local_label = build_label_from_binary_path(self, ctx->server_bin);
-      pumpkin_server_set_installed_build_label(server, local_label);
-    }
-    pumpkin_server_save(server, NULL);
-  }
-  if (ctx->restart_after_download) {
-    if (pumpkin_server_get_running(server)) {
-      if (self->current == server) {
-        self->restart_requested = TRUE;
-        self->restart_pending = TRUE;
-        self->ui_state = UI_STATE_RESTARTING;
-        self->user_stop_requested = TRUE;
-      }
-      pumpkin_server_stop(server);
-    } else {
-      g_autoptr(GError) start_error = NULL;
-      if (self->current == server) {
-        self->ui_state = UI_STATE_STARTING;
-        self->user_stop_requested = FALSE;
-        set_console_warning(self, NULL, FALSE);
-      }
-      if (!pumpkin_server_start(server, &start_error)) {
-        set_details_status_for_server(self, server, "Update installed but restart failed", 5);
-        if (self->current == server) {
-          set_details_error(self, start_error != NULL ? start_error->message : "Failed to restart after update");
-          self->ui_state = UI_STATE_ERROR;
-        }
-      } else {
-        set_server_running_hint(self, server, TRUE);
-        if (self->current == server) {
-          refresh_plugin_list(self);
-          refresh_world_list(self);
-          refresh_player_list(self);
-          refresh_log_files(self);
-        }
-      }
+  pumpkin_config_set_release_channel(self->config, channel);
+  g_autofree char *url = pumpkin_release_default_url(channel);
+  GListModel *model = get_server_model(self);
+  for (guint i = 0; model != NULL && i < g_list_model_get_n_items(model); ++i) {
+    g_autoptr(PumpkinServer) server = g_list_model_get_item(model, i);
+    if (pumpkin_release_is_managed_url(pumpkin_server_get_download_url(server))) {
+      pumpkin_server_set_download_url(server, url);
+      pumpkin_server_save(server, NULL);
     }
   }
-  update_overview(self);
+  if (pumpkin_release_is_managed_url(gtk_editable_get_text(GTK_EDITABLE(self->entry_download_url)))) {
+    gboolean was_loading = self->settings_loading;
+    self->settings_loading = TRUE;
+    gtk_editable_set_text(GTK_EDITABLE(self->entry_download_url), url);
+    self->settings_loading = was_loading;
+  }
+  pumpkin_config_save(self->config, NULL);
+  invalidate_latest_release(self);
   refresh_overview_list(self);
   update_details(self);
-  download_context_free(ctx);
+  trigger_latest_resolve(self);
+  return TRUE;
+}
+
+static void
+on_release_channel_changed(GObject *object, GParamSpec *pspec, PumpkinWindow *self)
+{
+  (void)object;
+  (void)pspec;
+  if (self->settings_loading || self->disposing || self->config == NULL) {
+    return;
+  }
+  apply_release_channel_selection(self);
+  mark_settings_dirty(self);
 }
 
 static void
 on_latest_only_resolve_done(GObject *source, GAsyncResult *res, gpointer user_data)
 {
   (void)source;
-  PumpkinWindow *self = PUMPKIN_WINDOW(user_data);
-  self->latest_resolve_in_flight = FALSE;
+  LatestResolveContext *ctx = user_data;
+  g_autoptr(PumpkinWindow) self = ctx->self;
+  guint generation = ctx->generation;
+  g_free(ctx);
   g_autoptr(GError) error = NULL;
 
   PumpkinDownloadResult result_code = PUMPKIN_DOWNLOAD_OK;
   PumpkinResolvedDownload *resolved = pumpkin_resolve_latest_finish(res, &result_code, &error);
+  if (self->disposing || generation != self->latest_resolve_generation) {
+    pumpkin_resolved_download_free(resolved);
+    return;
+  }
+  self->latest_resolve_in_flight = FALSE;
+  g_clear_object(&self->latest_resolve_cancellable);
   if (resolved == NULL || resolved->url == NULL) {
-    if (error != NULL) {
-      g_autofree char *msg = g_strdup_printf("Update check failed: %s", error->message);
+    const char *message = error != NULL ? error->message : "Resolver returned no download URL";
+    if (g_strcmp0(self->latest_error, message) != 0) {
+      g_autofree char *msg = g_strdup_printf("Update check failed: %s", message);
       append_log(self, msg);
-    } else {
-      append_log(self, "Update check failed: resolver returned no URL.");
     }
+    g_free(self->latest_error);
+    self->latest_error = g_strdup(message);
+    pumpkin_resolved_download_free(resolved);
     update_check_updates_badge(self);
     update_details(self);
     return;
   }
   (void)result_code;
 
+  g_clear_pointer(&self->latest_error, g_free);
   g_clear_pointer(&self->latest_url, g_free);
   self->latest_url = g_strdup(resolved->url);
   g_clear_pointer(&self->latest_build_id, g_free);
@@ -10873,29 +13327,42 @@ on_latest_only_resolve_done(GObject *source, GAsyncResult *res, gpointer user_da
   update_details(self);
   maybe_trigger_auto_update(self);
 
-  if (self->config != NULL) {
-    pumpkin_config_set_default_download_url(self->config, resolved->url);
-    pumpkin_config_save(self->config, NULL);
-  }
-
   pumpkin_resolved_download_free(resolved);
 }
 
 static void
 trigger_latest_resolve(PumpkinWindow *self)
 {
-  if (self == NULL || self->latest_resolve_in_flight) {
+  if (self == NULL || self->disposing || self->config == NULL || self->latest_resolve_in_flight) {
+    return;
+  }
+  if (any_download_active(self) ||
+      self->auto_update_server != NULL ||
+      self->auto_update_countdown_id != 0) {
     return;
   }
   self->latest_resolve_in_flight = TRUE;
+  self->latest_resolve_cancellable = g_cancellable_new();
+  LatestResolveContext *ctx = g_new0(LatestResolveContext, 1);
+  ctx->self = g_object_ref(self);
+  ctx->generation = ++self->latest_resolve_generation;
   update_check_updates_badge(self);
-  pumpkin_resolve_latest_async(NULL, on_latest_only_resolve_done, self);
+  pumpkin_resolve_channel_async(pumpkin_config_get_release_channel(self->config),
+    self->latest_resolve_cancellable, on_latest_only_resolve_done, ctx);
 }
 
 static gboolean
 poll_latest_release_tick(gpointer data)
 {
   PumpkinWindow *self = PUMPKIN_WINDOW(data);
+  if (self == NULL) {
+    return G_SOURCE_REMOVE;
+  }
+  if (any_download_active(self) ||
+      self->auto_update_server != NULL ||
+      self->auto_update_countdown_id != 0) {
+    return G_SOURCE_CONTINUE;
+  }
   trigger_latest_resolve(self);
   return G_SOURCE_CONTINUE;
 }
@@ -10913,8 +13380,12 @@ open_folder(PumpkinWindow *self, const char *path)
 static void
 on_overview_remove_clicked(GtkButton *button, PumpkinWindow *self)
 {
-  PumpkinServer *server = g_object_get_data(G_OBJECT(button), "server");
+  PumpkinServer *server = button != NULL ? g_object_get_data(G_OBJECT(button), "server") : self->current;
   if (server == NULL) {
+    return;
+  }
+  if (pumpkin_server_get_running(server) || server_download_active(self, server) || pumpkin_server_get_maintenance(server)) {
+    set_details_status(self, "Stop the server and finish maintenance before deleting it", 5);
     return;
   }
 
@@ -10927,22 +13398,24 @@ on_overview_remove_clicked(GtkButton *button, PumpkinWindow *self)
   adw_alert_dialog_set_close_response(alert, "cancel");
   adw_alert_dialog_set_response_appearance(alert, "delete", ADW_RESPONSE_DESTRUCTIVE);
   g_object_set_data_full(G_OBJECT(dialog), "server", g_object_ref(server), g_object_unref);
-  g_object_set_data(G_OBJECT(dialog), "window", self);
-  adw_alert_dialog_choose(alert, GTK_WIDGET(self), NULL, on_overview_remove_confirmed, self);
+  adw_alert_dialog_choose(alert, GTK_WIDGET(self), NULL, on_overview_remove_confirmed, g_object_ref(self));
 }
 
 static void
 on_overview_remove_confirmed(GObject *dialog, GAsyncResult *res, gpointer user_data)
 {
-  (void)user_data;
+  g_autoptr(PumpkinWindow) self = PUMPKIN_WINDOW(user_data);
   PumpkinServer *server = g_object_get_data(G_OBJECT(dialog), "server");
-  PumpkinWindow *self = g_object_get_data(G_OBJECT(dialog), "window");
-  if (server == NULL || self == NULL) {
+  const char *response = adw_alert_dialog_choose_finish(ADW_ALERT_DIALOG(dialog), res);
+  if (server == NULL || self->disposing) {
     return;
   }
 
-  const char *response = adw_alert_dialog_choose_finish(ADW_ALERT_DIALOG(dialog), res);
   if (response == NULL || g_strcmp0(response, "delete") != 0) {
+    return;
+  }
+  if (pumpkin_server_get_running(server) || server_download_active(self, server) || pumpkin_server_get_maintenance(server)) {
+    set_details_status(self, "Server deletion cancelled: the server or maintenance is now running", 5);
     return;
   }
 
@@ -10992,64 +13465,14 @@ on_network_details_back(GtkButton *button, PumpkinWindow *self)
   adw_view_stack_set_visible_child_name(self->view_stack, "overview");
 }
 
-static void
-on_world_delete_clicked(GtkButton *button, PumpkinWindow *self)
-{
-  if (self->current == NULL || pumpkin_server_get_running(self->current)) {
-    return;
-  }
-  if (self->ui_state == UI_STATE_STARTING || self->ui_state == UI_STATE_RESTARTING) {
-    set_details_error(self, "Wait for the server to finish starting/restarting.");
-    return;
-  }
-
-  const char *path = g_object_get_data(G_OBJECT(button), "world-path");
-  if (path == NULL) {
-    return;
-  }
-
-  g_autofree char *name = g_path_get_basename(path);
-  g_autofree char *title = g_strdup_printf("Delete world \"%s\"?", name != NULL ? name : "world");
-  AdwDialog *dialog = adw_alert_dialog_new(title, "This permanently removes the world folder.");
-  AdwAlertDialog *alert = ADW_ALERT_DIALOG(dialog);
-  adw_alert_dialog_add_response(alert, "cancel", "Cancel");
-  adw_alert_dialog_add_response(alert, "delete", "Delete");
-  adw_alert_dialog_set_default_response(alert, "cancel");
-  adw_alert_dialog_set_close_response(alert, "cancel");
-  adw_alert_dialog_set_response_appearance(alert, "delete", ADW_RESPONSE_DESTRUCTIVE);
-  g_object_set_data_full(G_OBJECT(dialog), "world-path", g_strdup(path), g_free);
-  adw_alert_dialog_choose(alert, GTK_WIDGET(self), NULL, on_world_delete_confirmed, self);
-}
-
-static void
-on_world_delete_confirmed(GObject *dialog, GAsyncResult *res, gpointer user_data)
-{
-  PumpkinWindow *self = PUMPKIN_WINDOW(user_data);
-  const char *response = adw_alert_dialog_choose_finish(ADW_ALERT_DIALOG(dialog), res);
-  if (response == NULL || g_strcmp0(response, "delete") != 0) {
-    return;
-  }
-
-  const char *path = g_object_get_data(G_OBJECT(dialog), "world-path");
-  if (self == NULL || self->current == NULL || path == NULL) {
-    return;
-  }
-
-  g_autoptr(GError) error = NULL;
-  if (!pumpkin_server_store_remove_tree(path, &error)) {
-    if (error != NULL) {
-      append_log(self, error->message);
-    }
-    return;
-  }
-
-  refresh_world_list(self);
-}
 
 static void
 on_details_install(GtkButton *button, PumpkinWindow *self)
 {
   (void)button;
+  if (!ensure_local_hosting_supported(self)) {
+    return;
+  }
   if (self->current == NULL) {
     return;
   }
@@ -11085,17 +13508,15 @@ static void
 on_details_update(GtkButton *button, PumpkinWindow *self)
 {
   (void)button;
+  if (!ensure_local_hosting_supported(self)) {
+    return;
+  }
   if (self->current == NULL || self->latest_url == NULL) {
     return;
   }
   if (any_download_active(self) || server_download_active(self, self->current)) {
     return;
   }
-  if (pumpkin_server_get_running(self->current)) {
-    set_details_error(self, "Stop the server before updating.");
-    return;
-  }
-
   g_autofree char *bin = pumpkin_server_get_bin_path(self->current);
   if (!g_file_test(bin, G_FILE_TEST_EXISTS)) {
     return;
@@ -11118,19 +13539,24 @@ on_details_update(GtkButton *button, PumpkinWindow *self)
   g_autofree char *message = g_strdup_printf("Updating Pumpkin binary: %s -> %s", from, to);
   append_log_for_server(self, self->current, message);
 
-  start_download_for_server(self, self->current, self->latest_url, FALSE, FALSE);
+  start_download_for_server(self, self->current, self->latest_url, FALSE,
+                            pumpkin_server_get_running(self->current));
 }
 
 static void
 on_details_check_updates(GtkButton *button, PumpkinWindow *self)
 {
   (void)button;
+  if (!ensure_local_hosting_supported(self)) {
+    return;
+  }
   if (self->current == NULL) {
     return;
   }
   if (self->latest_resolve_in_flight) {
     return;
   }
+  if (!pumpkin_refresh_button_begin(button)) return;
   trigger_latest_resolve(self);
 }
 
@@ -11148,7 +13574,10 @@ static gboolean
 log_matches_filter(GDateTime *mtime, const char *name, int filter_index, const char *query)
 {
   if (query != NULL && *query != '\0') {
-    if (name == NULL || g_strrstr(g_ascii_strdown(name, -1), g_ascii_strdown(query, -1)) == NULL) {
+    g_autofree char *name_folded = name != NULL ? g_ascii_strdown(name, -1) : NULL;
+    g_autofree char *query_folded = g_ascii_strdown(query, -1);
+    if (name_folded == NULL || query_folded == NULL ||
+        g_strrstr(name_folded, query_folded) == NULL) {
       return FALSE;
     }
   }
@@ -11172,6 +13601,25 @@ log_matches_filter(GDateTime *mtime, const char *name, int filter_index, const c
   return TRUE;
 }
 
+static int
+compare_log_rows(GtkListBoxRow *left, GtkListBoxRow *right, gpointer user_data)
+{
+  (void)user_data;
+  const gint64 *left_time = g_object_get_data(G_OBJECT(left), "log-mtime");
+  const gint64 *right_time = g_object_get_data(G_OBJECT(right), "log-mtime");
+  if (*left_time != *right_time) {
+    return *left_time > *right_time ? -1 : 1;
+  }
+  return g_strcmp0(g_object_get_data(G_OBJECT(right), "log-path"),
+                  g_object_get_data(G_OBJECT(left), "log-path"));
+}
+
+static void
+on_refresh_logs(GtkButton *button, PumpkinWindow *self)
+{
+  if (pumpkin_refresh_button_begin(button)) refresh_log_files(self);
+}
+
 static void
 refresh_log_files(PumpkinWindow *self)
 {
@@ -11182,6 +13630,8 @@ refresh_log_files(PumpkinWindow *self)
   clear_list_box(self->log_files_list);
   GtkTextBuffer *buffer = gtk_text_view_get_buffer(self->log_file_view);
   gtk_text_buffer_set_text(buffer, "", -1);
+  gtk_label_set_text(self->log_file_title, "Session archive");
+  gtk_label_set_text(self->log_file_summary, "No sessions match your filters");
 
   if (self->current == NULL) {
     return;
@@ -11195,7 +13645,7 @@ refresh_log_files(PumpkinWindow *self)
 
   int filter_index = 0;
   if (self->log_filter != NULL) {
-    filter_index = gtk_drop_down_get_selected(self->log_filter);
+    filter_index = (int)gtk_drop_down_get_selected(self->log_filter);
   }
 
   const char *query = NULL;
@@ -11211,37 +13661,88 @@ refresh_log_files(PumpkinWindow *self)
     }
 
     g_autoptr(GFile) file = g_file_new_for_path(path);
-    g_autoptr(GFileInfo) info = g_file_query_info(file, G_FILE_ATTRIBUTE_TIME_MODIFIED, 0, NULL, NULL);
+    g_autoptr(GFileInfo) info = g_file_query_info(file,
+      G_FILE_ATTRIBUTE_TIME_MODIFIED "," G_FILE_ATTRIBUTE_STANDARD_SIZE, 0, NULL, NULL);
     g_autoptr(GDateTime) mtime = NULL;
     if (info != NULL) {
       guint64 mtime_unix = g_file_info_get_attribute_uint64(info, G_FILE_ATTRIBUTE_TIME_MODIFIED);
       mtime = g_date_time_new_from_unix_local((gint64)mtime_unix);
     }
 
-    if (!log_matches_filter(mtime, entry, filter_index, query)) {
+    /* Session filenames carry the start time; mtime describes the final write. */
+    int year, month, day, hour, minute, second;
+    g_autoptr(GDateTime) started = NULL;
+    if (sscanf(entry, "session-%4d%2d%2d-%2d%2d%2d", &year, &month, &day, &hour, &minute, &second) == 6) {
+      started = g_date_time_new_local(year, month, day, hour, minute, (double)second);
+    }
+    g_autofree char *when = started != NULL ? g_date_time_format(started, date_time_pattern_for_config(self)) : NULL;
+    g_autofree char *clock = started != NULL ? g_date_time_format(started, "%H:%M:%S") : NULL;
+    g_autofree char *search_text = g_strdup_printf("%s %s %s", entry,
+      when != NULL ? when : "", clock != NULL ? clock : "");
+    if (!log_matches_filter(started != NULL ? started : mtime, search_text, filter_index, query)) {
       continue;
     }
 
     GtkWidget *row = gtk_list_box_row_new();
-    GtkWidget *box = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 8);
-    GtkWidget *label = gtk_label_new(entry);
+    gtk_widget_set_tooltip_text(row, entry);
+    GtkWidget *box = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 12);
+    gtk_widget_add_css_class(box, "log-session-row");
+    GtkWidget *icon = gtk_image_new_from_icon_name("text-x-generic-symbolic");
+    gtk_widget_add_css_class(icon, "dim-label");
+    gtk_box_append(GTK_BOX(box), icon);
+    GtkWidget *text = gtk_box_new(GTK_ORIENTATION_VERTICAL, 4);
+    gtk_widget_set_hexpand(text, TRUE);
+    gtk_box_append(GTK_BOX(box), text);
+    g_autofree char *title = started != NULL ? g_date_time_format(started,
+      pumpkin_config_get_time_format(self->config) == PUMPKIN_TIME_FORMAT_12H ? "%I:%M:%S %p" : "%H:%M:%S") : g_strdup(entry);
+    GtkWidget *label = gtk_label_new(title);
     gtk_label_set_xalign(GTK_LABEL(label), 0.0);
-    gtk_widget_set_hexpand(label, TRUE);
-    gtk_box_append(GTK_BOX(box), label);
-
-    if (mtime != NULL) {
-      g_autofree char *when = g_date_time_format(mtime, date_time_pattern_for_config(self));
-      GtkWidget *time_label = gtk_label_new(when);
-      gtk_widget_add_css_class(time_label, "dim-label");
-      gtk_box_append(GTK_BOX(box), time_label);
-    }
+    gtk_label_set_ellipsize(GTK_LABEL(label), PANGO_ELLIPSIZE_END);
+    gtk_widget_add_css_class(label, "heading");
+    gtk_box_append(GTK_BOX(text), label);
+    g_autofree char *size = g_format_size(info != NULL ? (guint64)g_file_info_get_size(info) : 0);
+    PumpkinDateFormat date_format = pumpkin_config_get_date_format(self->config);
+    g_autofree char *date = started != NULL ? g_date_time_format(started,
+      date_format == PUMPKIN_DATE_FORMAT_YMD ? "%Y-%m-%d" :
+      date_format == PUMPKIN_DATE_FORMAT_MDY ? "%m/%d/%Y" : "%d.%m.%Y") : g_strdup("Log file");
+    g_autofree char *metadata = g_strdup_printf("%s  ·  %s", date, size);
+    GtkWidget *summary = gtk_label_new(metadata);
+    gtk_label_set_xalign(GTK_LABEL(summary), 0.0);
+    gtk_widget_add_css_class(summary, "dim-label");
+    gtk_widget_add_css_class(summary, "caption");
+    gtk_box_append(GTK_BOX(text), summary);
 
     gtk_list_box_row_set_child(GTK_LIST_BOX_ROW(row), box);
     g_object_set_data_full(G_OBJECT(row), "log-path", g_strdup(path), g_free);
+    g_object_set_data_full(G_OBJECT(row), "log-title", started != NULL ?
+      g_strdup_printf("%s  ·  %s", date, title) : g_strdup(title), g_free);
+    g_object_set_data_full(G_OBJECT(row), "log-size", g_strdup(size), g_free);
+    gint64 *sort_time = g_new(gint64, 1);
+    *sort_time = started != NULL ? g_date_time_to_unix(started) : (mtime != NULL ? g_date_time_to_unix(mtime) : 0);
+    g_object_set_data_full(G_OBJECT(row), "log-mtime", sort_time, g_free);
     gtk_list_box_append(self->log_files_list, row);
   }
 
   g_dir_close(dir);
+  GtkListBoxRow *selected = NULL;
+  for (GtkWidget *child = gtk_widget_get_first_child(GTK_WIDGET(self->log_files_list)); child != NULL;
+       child = gtk_widget_get_next_sibling(child)) {
+    if (!GTK_IS_LIST_BOX_ROW(child)) {
+      continue;
+    }
+    if (g_strcmp0(g_object_get_data(G_OBJECT(child), "log-path"), self->current_log_path) == 0) {
+      selected = GTK_LIST_BOX_ROW(child);
+      break;
+    }
+  }
+  if (selected == NULL) {
+    selected = gtk_list_box_get_row_at_index(self->log_files_list, 0);
+  }
+  if (selected != NULL) {
+    gtk_list_box_select_row(self->log_files_list, selected);
+  } else {
+    g_clear_pointer(&self->current_log_path, g_free);
+  }
 }
 
 
@@ -11265,6 +13766,10 @@ on_log_level_filter_changed(GObject *object, GParamSpec *pspec, PumpkinWindow *s
     if (self->log_files_list != NULL) {
       GtkWidget *child = gtk_widget_get_first_child(GTK_WIDGET(self->log_files_list));
       while (child != NULL) {
+        if (!GTK_IS_LIST_BOX_ROW(child)) {
+          child = gtk_widget_get_next_sibling(child);
+          continue;
+        }
         GtkListBoxRow *candidate = GTK_LIST_BOX_ROW(child);
         const char *path = g_object_get_data(G_OBJECT(candidate), "log-path");
         if (path != NULL && g_strcmp0(path, self->current_log_path) == 0) {
@@ -11300,22 +13805,30 @@ on_log_file_activated(GtkListBox *box, GtkListBoxRow *row, PumpkinWindow *self)
     return;
   }
 
+  gtk_label_set_text(self->log_file_title, g_object_get_data(G_OBJECT(row), "log-title"));
+  g_autofree char *filename = g_path_get_basename(path);
+  g_autofree char *summary = g_strdup_printf("%s  ·  %s", filename,
+    (const char *)g_object_get_data(G_OBJECT(row), "log-size"));
+  gtk_label_set_text(self->log_file_summary, summary);
+
   g_free(self->current_log_path);
   self->current_log_path = g_strdup(path);
 
   g_autoptr(GError) error = NULL;
   g_autofree char *contents = NULL;
   if (!g_file_get_contents(path, &contents, NULL, &error)) {
+    gtk_label_set_text(self->log_file_summary, error->message);
     return;
   }
 
   GtkTextBuffer *buffer = gtk_text_view_get_buffer(self->log_file_view);
   gtk_text_buffer_set_text(buffer, "", -1);
+  ensure_log_buffer_tags(buffer);
   GtkTextIter end;
   gtk_text_buffer_get_end_iter(buffer, &end);
   int level_index = 0;
   if (self->log_level_filter != NULL) {
-    level_index = gtk_drop_down_get_selected(self->log_level_filter);
+    level_index = (int)gtk_drop_down_get_selected(self->log_level_filter);
   }
   char *saveptr = NULL;
   char *line = strtok_r(contents, "\n", &saveptr);
@@ -11326,16 +13839,17 @@ on_log_file_activated(GtkListBox *box, GtkListBoxRow *row, PumpkinWindow *self)
     }
 
     ConsoleLevel level = CONSOLE_LEVEL_OTHER;
-    g_autofree char *display = format_console_line(self, line, &level);
+    g_autofree char *display = format_log_line(self, line, &level);
     if (display == NULL || *display == '\0') {
       line = strtok_r(NULL, "\n", &saveptr);
       continue;
     }
 
-    if (console_level_matches_log_filter(level, level_index) &&
-        log_line_matches_level(display, level_index)) {
+    if (console_level_matches_log_filter(level, level_index)) {
+      int offset = gtk_text_iter_get_offset(&end);
       gtk_text_buffer_insert(buffer, &end, display, -1);
       gtk_text_buffer_insert(buffer, &end, "\n", -1);
+      apply_console_inline_tags(buffer, offset, display, level);
     }
     line = strtok_r(NULL, "\n", &saveptr);
   }
@@ -11379,9 +13893,69 @@ queue_log_file_scroll_to_end(PumpkinWindow *self)
 }
 
 static void
-on_open_plugins(GtkButton *button, PumpkinWindow *self)
+on_import_plugin_done(GObject *source, GAsyncResult *res, gpointer user_data)
+{
+  PumpkinWindow *self = PUMPKIN_WINDOW(user_data);
+  if (self == NULL || self->current == NULL) {
+    return;
+  }
+
+  g_autoptr(GError) error = NULL;
+  GListModel *model = gtk_file_dialog_open_multiple_finish(GTK_FILE_DIALOG(source), res, &error);
+  if (model == NULL) {
+    if (error != NULL && error->code != GTK_DIALOG_ERROR_DISMISSED) {
+      append_log(self, error->message);
+    }
+    return;
+  }
+
+  g_autoptr(GPtrArray) files = g_ptr_array_new_with_free_func(g_object_unref);
+  guint n = g_list_model_get_n_items(model);
+  for (guint i = 0; i < n; i++) {
+    GFile *file = g_list_model_get_item(model, i);
+    if (file != NULL) {
+      g_ptr_array_add(files, file);
+    }
+  }
+
+  g_autofree char *plugins_dir = pumpkin_server_get_plugins_dir(self->current);
+  if (import_plugin_files_to_dir(self, files, plugins_dir)) {
+    refresh_plugin_list(self);
+    set_details_status(self, "Plugin import finished", 3);
+  }
+  g_object_unref(model);
+}
+
+static void
+on_import_plugin_clicked(GtkButton *button, PumpkinWindow *self)
 {
   (void)button;
+  if (self == NULL || self->current == NULL) {
+    return;
+  }
+
+  GtkFileDialog *dialog = gtk_file_dialog_new();
+  gtk_file_dialog_set_title(dialog, "Import Plugins");
+  GtkFileFilter *filter = gtk_file_filter_new();
+  gtk_file_filter_set_name(filter, "Pumpkin plugins");
+  gtk_file_filter_add_suffix(filter, "so");
+  gtk_file_filter_add_suffix(filter, "wasm");
+  GListStore *filters = g_list_store_new(GTK_TYPE_FILE_FILTER);
+  g_list_store_append(filters, filter);
+  gtk_file_dialog_set_filters(dialog, G_LIST_MODEL(filters));
+  gtk_file_dialog_open_multiple(dialog, GTK_WINDOW(self), NULL, on_import_plugin_done, self);
+  g_object_unref(filters);
+  g_object_unref(filter);
+  g_object_unref(dialog);
+}
+
+static void
+on_open_plugins(GtkButton *button, PumpkinWindow *self)
+{
+  GtkWidget *popover = gtk_widget_get_ancestor(GTK_WIDGET(button), GTK_TYPE_POPOVER);
+  if (popover != NULL) {
+    gtk_popover_popdown(GTK_POPOVER(popover));
+  }
   if (self->current == NULL) {
     return;
   }
@@ -11498,26 +14072,14 @@ on_open_players(GtkButton *button, PumpkinWindow *self)
   open_folder(self, dir);
 }
 
-static void
-on_open_worlds(GtkButton *button, PumpkinWindow *self)
-{
-  (void)button;
-  if (self->current == NULL) {
-    return;
-  }
-  g_autofree char *default_world = g_build_filename(pumpkin_server_get_data_dir(self->current), "world", NULL);
-  if (g_file_test(default_world, G_FILE_TEST_IS_DIR)) {
-    open_folder(self, default_world);
-    return;
-  }
-  g_autofree char *dir = pumpkin_server_get_worlds_dir(self->current);
-  open_folder(self, dir);
-}
 
 static void
 save_settings_impl(PumpkinWindow *self, gboolean restart_server)
 {
   gboolean restart_after_save = FALSE;
+  if (!apply_release_channel_selection(self)) {
+    return;
+  }
 
   if (self->config != NULL) {
     if (self->switch_use_cache != NULL) {
@@ -11529,7 +14091,6 @@ save_settings_impl(PumpkinWindow *self, gboolean restart_server)
     if (self->switch_autostart_on_boot != NULL) {
       gboolean autostart = gtk_switch_get_active(self->switch_autostart_on_boot);
       pumpkin_config_set_autostart_on_boot(self->config, autostart);
-      pumpkin_config_manage_autostart_desktop(autostart);
     }
     if (self->switch_start_minimized != NULL) {
       pumpkin_config_set_start_minimized(self->config, gtk_switch_get_active(self->switch_start_minimized));
@@ -11537,6 +14098,7 @@ save_settings_impl(PumpkinWindow *self, gboolean restart_server)
     if (self->switch_auto_start_servers != NULL) {
       pumpkin_config_set_auto_start_servers_enabled(self->config, gtk_switch_get_active(self->switch_auto_start_servers));
     }
+    save_startup_preferences(self);
     /* Save per-server auto-start settings from list */
     if (self->autostart_server_list != NULL && self->store != NULL) {
       GListModel *model = get_server_model(self);
@@ -11550,6 +14112,7 @@ save_settings_impl(PumpkinWindow *self, gboolean restart_server)
       }
     }
     pumpkin_config_save(self->config, NULL);
+    pumpkin_config_manage_autostart_desktop(pumpkin_config_get_autostart_on_boot(self->config));
     if (self->switch_run_in_background != NULL) {
       GApplication *app = g_application_get_default();
       if (PUMPKIN_IS_APP(app)) {
@@ -11756,9 +14319,26 @@ on_save_settings(GtkButton *button, PumpkinWindow *self)
 }
 
 static void
+on_main_view_changed(GObject *object, GParamSpec *pspec, PumpkinWindow *self)
+{
+  (void)object;
+  (void)pspec;
+  gboolean server_visible = g_strcmp0(adw_view_stack_get_visible_child_name(self->view_stack),
+                                      "details") == 0;
+  gtk_widget_set_visible(GTK_WIDGET(self->server_header_controls), server_visible);
+#if !defined(G_OS_WIN32)
+  gtk_widget_set_visible(GTK_WIDGET(self->app_header_title), !server_visible);
+#endif
+}
+
+static void
 pumpkin_window_init(PumpkinWindow *self)
 {
   gtk_widget_init_template(GTK_WIDGET(self));
+  pumpkin_window_enable_dialog_dismissal(GTK_WINDOW(self));
+  g_signal_connect(self->view_stack, "notify::visible-child-name",
+                    G_CALLBACK(on_main_view_changed), self);
+  on_main_view_changed(NULL, NULL, self);
 #if defined(G_OS_WIN32)
   g_signal_connect(self, "realize", G_CALLBACK(on_windows_window_realize), self);
 #endif
@@ -11777,8 +14357,23 @@ pumpkin_window_init(PumpkinWindow *self)
   if (self->details_stack != NULL) {
     self->last_details_page = g_strdup(adw_view_stack_get_visible_child_name(self->details_stack));
   }
+  self->market_page = 1;
+  self->market_limit = 25;
+  self->marketplace_loading = FALSE;
+  update_marketplace_account_button(self);
+  MarketplaceCredentialContext *credential_ctx = marketplace_credential_context_new(self);
+  pumpkin_marketplace_credentials_load_async(on_marketplace_credentials_loaded, credential_ctx);
+  if (self->plugins_stack != NULL) {
+    adw_view_stack_set_visible_child_name(self->plugins_stack, "marketplace_plugins");
+  }
   if (self->btn_save_settings != NULL) {
     gtk_widget_set_sensitive(GTK_WIDGET(self->btn_save_settings), FALSE);
+  }
+  if (self->btn_marketplace_sort_order != NULL) {
+    gtk_toggle_button_set_active(self->btn_marketplace_sort_order, FALSE);
+    gtk_button_set_icon_name(GTK_BUTTON(self->btn_marketplace_sort_order),
+                             "view-sort-descending-symbolic");
+    gtk_widget_set_tooltip_text(GTK_WIDGET(self->btn_marketplace_sort_order), "Sort descending");
   }
 
   if (self->plugin_list != NULL) {
@@ -11790,19 +14385,12 @@ pumpkin_window_init(PumpkinWindow *self)
     g_signal_connect(drop, "drop", G_CALLBACK(on_plugins_drop), self);
     gtk_widget_add_controller(GTK_WIDGET(self->plugin_list), GTK_EVENT_CONTROLLER(drop));
   }
-  if (self->world_list != NULL) {
-    gtk_widget_set_vexpand(GTK_WIDGET(self->world_list), TRUE);
-    gtk_widget_set_hexpand(GTK_WIDGET(self->world_list), TRUE);
-    GtkDropTarget *drop = gtk_drop_target_new(GDK_TYPE_FILE_LIST, GDK_ACTION_COPY);
-    g_signal_connect(drop, "enter", G_CALLBACK(on_worlds_drop_enter), self);
-    g_signal_connect(drop, "leave", G_CALLBACK(on_worlds_drop_leave), self);
-    g_signal_connect(drop, "drop", G_CALLBACK(on_worlds_drop), self);
-    gtk_widget_add_controller(GTK_WIDGET(self->world_list), GTK_EVENT_CONTROLLER(drop));
-  }
+  pumpkin_window_worlds_setup(self);
 
   self->store = pumpkin_server_store_new();
   networks_load(self);
   load_server_list(self);
+  apply_android_runtime_mode(self);
 
   g_signal_connect(self->server_list, "row-selected", G_CALLBACK(on_server_selected), self);
   if (self->btn_servers_back != NULL) {
@@ -11870,6 +14458,7 @@ pumpkin_window_init(PumpkinWindow *self)
                      G_CALLBACK(on_reset_network_icon_clicked), self);
   }
   g_signal_connect(self->entry_command, "activate", G_CALLBACK(on_send_command), self);
+  setup_console_autoscroll(self);
   if (self->entry_command != NULL) {
     GtkEventController *entry_keys = gtk_event_controller_key_new();
     g_signal_connect(entry_keys, "key-pressed", G_CALLBACK(on_command_entry_key_pressed), self);
@@ -11892,6 +14481,17 @@ pumpkin_window_init(PumpkinWindow *self)
   if (self->player_search != NULL) {
     g_signal_connect(self->player_search, "search-changed", G_CALLBACK(on_player_search_changed), self);
   }
+  g_signal_connect(self->whitelist_list, "row-activated", G_CALLBACK(on_player_row_activated), self);
+  g_signal_connect(self->banned_list, "row-activated", G_CALLBACK(on_player_row_activated), self);
+  g_signal_connect(self->player_presence_filter, "notify::selected",
+                   G_CALLBACK(on_player_presence_filter_changed), self);
+  g_signal_connect(self->btn_player_reset_filters, "clicked", G_CALLBACK(on_player_filters_reset), self);
+  set_player_list_placeholder(self->player_list, "No matching players",
+    "Players appear here when they join your server. Try changing the search or status filter.");
+  set_player_list_placeholder(self->whitelist_list, "Whitelist is empty",
+    "Whitelisted players will appear here.");
+  set_player_list_placeholder(self->banned_list, "No banned players",
+    "Player and IP bans will appear here.");
   if (self->player_sort_dropdown != NULL) {
     g_signal_connect(self->player_sort_dropdown, "notify::selected",
                      G_CALLBACK(on_player_sort_dropdown_changed), self);
@@ -11904,17 +14504,61 @@ pumpkin_window_init(PumpkinWindow *self)
     g_signal_connect(self->players_stack, "notify::visible-child-name",
                      G_CALLBACK(on_players_stack_visible_child_changed), self);
   }
+  if (self->plugins_stack != NULL) {
+    g_signal_connect(self->plugins_stack, "notify::visible-child-name",
+                     G_CALLBACK(on_plugins_stack_visible_child_changed), self);
+  }
   self->player_sort_field = 0;
   self->player_sort_ascending = FALSE;
   update_player_sort_controls(self);
   update_player_search_placeholder(self);
   g_signal_connect(self->btn_open_plugins, "clicked", G_CALLBACK(on_open_plugins), self);
+  if (self->btn_marketplace_account != NULL) {
+    g_signal_connect(self->btn_marketplace_account, "clicked",
+                     G_CALLBACK(on_marketplace_account_clicked), self);
+  }
+  if (self->btn_import_plugin != NULL) {
+    g_signal_connect(self->btn_import_plugin, "clicked", G_CALLBACK(on_import_plugin_clicked), self);
+  }
   if (self->btn_plugins_marketplace != NULL) {
     g_signal_connect(self->btn_plugins_marketplace, "clicked",
                      G_CALLBACK(on_plugins_marketplace_clicked), self);
   }
+  if (self->marketplace_search_entry != NULL) {
+    g_signal_connect(self->marketplace_search_entry, "activate",
+                     G_CALLBACK(on_marketplace_search_activate), self);
+  }
+  if (self->marketplace_category_entry != NULL) {
+    g_signal_connect(self->marketplace_category_entry, "activate",
+                     G_CALLBACK(on_marketplace_search_activate), self);
+  }
+  if (self->marketplace_type_dropdown != NULL) {
+    g_signal_connect(self->marketplace_type_dropdown, "notify::selected",
+                     G_CALLBACK(on_marketplace_type_changed), self);
+  }
+  if (self->marketplace_sort_dropdown != NULL) {
+    g_signal_connect(self->marketplace_sort_dropdown, "notify::selected",
+                     G_CALLBACK(on_marketplace_sort_changed), self);
+  }
+  if (self->btn_marketplace_sort_order != NULL) {
+    g_signal_connect(self->btn_marketplace_sort_order, "toggled",
+                     G_CALLBACK(on_marketplace_sort_order_toggled), self);
+  }
+  if (self->btn_marketplace_refresh != NULL) {
+    g_signal_connect(self->btn_marketplace_refresh, "clicked",
+                     G_CALLBACK(on_plugins_marketplace_clicked), self);
+  }
+  g_signal_connect(self->btn_marketplace_retry, "clicked",
+                    G_CALLBACK(on_plugins_marketplace_clicked), self);
+  if (self->btn_marketplace_prev != NULL) {
+    g_signal_connect(self->btn_marketplace_prev, "clicked",
+                     G_CALLBACK(on_marketplace_prev_clicked), self);
+  }
+  if (self->btn_marketplace_next != NULL) {
+    g_signal_connect(self->btn_marketplace_next, "clicked",
+                     G_CALLBACK(on_marketplace_next_clicked), self);
+  }
   g_signal_connect(self->btn_open_players, "clicked", G_CALLBACK(on_open_players), self);
-  g_signal_connect(self->btn_open_worlds, "clicked", G_CALLBACK(on_open_worlds), self);
   g_signal_connect(self->btn_save_settings, "clicked", G_CALLBACK(on_save_settings), self);
   if (self->btn_save_domains != NULL) {
     g_signal_connect(self->btn_save_domains, "clicked", G_CALLBACK(on_save_domains), self);
@@ -11940,6 +14584,7 @@ pumpkin_window_init(PumpkinWindow *self)
     g_signal_connect(self->details_stack, "notify::visible-child-name",
                      G_CALLBACK(on_details_stack_changed), self);
   }
+  setup_details_sidebar(self);
   if (self->entry_server_name != NULL) {
     g_signal_connect(self->entry_server_name, "changed", G_CALLBACK(on_settings_changed), self);
   }
@@ -12011,6 +14656,10 @@ pumpkin_window_init(PumpkinWindow *self)
     g_signal_connect(self->switch_start_minimized, "notify::active",
                      G_CALLBACK(on_settings_switch_changed), self);
   }
+  g_signal_connect(self->row_start_expanded, "notify::active", G_CALLBACK(on_settings_switch_changed), self);
+  g_signal_connect(self->row_start_mode, "notify::selected", G_CALLBACK(on_settings_switch_changed), self);
+  g_signal_connect(self->row_release_channel, "notify::selected", G_CALLBACK(on_release_channel_changed), self);
+  g_signal_connect(self->row_start_monitor, "notify::selected", G_CALLBACK(on_settings_switch_changed), self);
   if (self->switch_auto_start_servers != NULL) {
     g_signal_connect(self->switch_auto_start_servers, "notify::active",
                      G_CALLBACK(on_settings_switch_changed), self);
@@ -12056,8 +14705,16 @@ pumpkin_window_init(PumpkinWindow *self)
     g_signal_connect(self->log_level_filter, "notify::selected", G_CALLBACK(on_log_level_filter_changed), self);
   }
   if (self->log_files_list != NULL) {
-    g_signal_connect(self->log_files_list, "row-activated", G_CALLBACK(on_log_file_activated), self);
+    gtk_list_box_set_sort_func(self->log_files_list, compare_log_rows, NULL, NULL);
+    GtkWidget *empty = gtk_label_new("No sessions found");
+    gtk_widget_add_css_class(empty, "dim-label");
+    gtk_widget_set_margin_top(empty, 24);
+    gtk_widget_set_margin_bottom(empty, 24);
+    gtk_list_box_set_placeholder(self->log_files_list, empty);
+    g_signal_connect(self->log_files_list, "row-selected", G_CALLBACK(on_log_file_activated), self);
   }
+  pumpkin_refresh_button_setup(self->btn_refresh_logs);
+  g_signal_connect(self->btn_refresh_logs, "clicked", G_CALLBACK(on_refresh_logs), self);
   if (self->btn_open_logs != NULL) {
     g_signal_connect(self->btn_open_logs, "clicked", G_CALLBACK(on_open_logs), self);
   }
@@ -12100,13 +14757,21 @@ pumpkin_window_init(PumpkinWindow *self)
   }
 
   self->config = pumpkin_config_load(NULL);
+  self->settings_loading = TRUE;
+  adw_combo_row_set_selected(self->row_release_channel, (guint)pumpkin_config_get_release_channel(self->config));
+  self->settings_loading = FALSE;
+  adw_switch_row_set_active(self->row_start_expanded, pumpkin_config_get_start_expanded(self->config));
+  adw_combo_row_set_selected(self->row_start_mode, (guint)pumpkin_config_get_start_mode(self->config));
+  populate_startup_monitors(self, pumpkin_config_get_start_monitor(self->config));
+  g_signal_connect_object(gdk_display_get_monitors(gtk_widget_get_display(GTK_WIDGET(self))), "items-changed",
+                          G_CALLBACK(on_startup_monitors_changed), self, 0);
   self->live_player_names = g_hash_table_new_full(g_str_hash, g_str_equal, g_free, g_free);
   self->platform_hint_by_ip = g_hash_table_new_full(g_str_hash, g_str_equal, g_free, NULL);
   self->player_states = g_hash_table_new_full(g_str_hash, g_str_equal, g_free, (GDestroyNotify)player_state_free);
   self->player_states_by_uuid = g_hash_table_new_full(g_str_hash, g_str_equal, g_free, NULL);
   self->player_states_by_name = g_hash_table_new_full(g_str_hash, g_str_equal, g_free, NULL);
   self->deleted_player_keys = g_hash_table_new_full(g_str_hash, g_str_equal, g_free, NULL);
-  self->player_head_downloads = g_hash_table_new_full(g_str_hash, g_str_equal, g_free, NULL);
+  self->market_preview_downloads = g_hash_table_new_full(g_str_hash, g_str_equal, g_free, NULL);
   self->player_state_dirty = FALSE;
   self->last_player_state_flush_at = g_get_monotonic_time();
   self->console_buffers = g_hash_table_new_full(g_direct_hash, g_direct_equal, g_object_unref, g_object_unref);
@@ -12128,8 +14793,11 @@ pumpkin_window_init(PumpkinWindow *self)
         guint n = g_list_model_get_n_items(model);
         for (guint i = 0; i < n; i++) {
           PumpkinServer *server = g_list_model_get_item(model, i);
-          pumpkin_server_set_download_url(server, url);
-          pumpkin_server_save(server, NULL);
+          if (pumpkin_release_is_managed_url(pumpkin_server_get_download_url(server))) {
+            g_autofree char *channel_url = pumpkin_release_default_url(pumpkin_config_get_release_channel(self->config));
+            pumpkin_server_set_download_url(server, channel_url);
+            pumpkin_server_save(server, NULL);
+          }
           g_object_unref(server);
         }
       }
@@ -12172,7 +14840,8 @@ pumpkin_window_init(PumpkinWindow *self)
   update_check_updates_badge(self);
   trigger_latest_resolve(self);
   if (self->latest_poll_id == 0) {
-    self->latest_poll_id = g_timeout_add_seconds(60, poll_latest_release_tick, self);
+    /* Public GitHub API access is limited to 60 requests/hour per IP. */
+    self->latest_poll_id = g_timeout_add_seconds(5 * 60, poll_latest_release_tick, self);
   }
   if (self->ddns_timer_id == 0) {
     self->ddns_timer_id = g_timeout_add_seconds(DDNS_TICK_SECONDS, ddns_tick, self);
@@ -12206,23 +14875,61 @@ pumpkin_window_init(PumpkinWindow *self)
   self->clk_tck = sysconf(_SC_CLK_TCK);
 #endif
   self->stats_sample_msec = DEFAULT_STATS_SAMPLE_MSEC;
+  self->stats_hover_layer = GTK_FIXED(g_object_ref_sink(gtk_fixed_new()));
+  gtk_widget_set_can_target(GTK_WIDGET(self->stats_hover_layer), FALSE);
+  self->stats_hover_label = GTK_LABEL(g_object_ref_sink(gtk_label_new(NULL)));
+  gtk_widget_set_visible(GTK_WIDGET(self->stats_hover_label), FALSE);
+  gtk_widget_set_can_target(GTK_WIDGET(self->stats_hover_label), FALSE);
+  gtk_widget_set_halign(GTK_WIDGET(self->stats_hover_label), GTK_ALIGN_START);
+  gtk_widget_set_valign(GTK_WIDGET(self->stats_hover_label), GTK_ALIGN_START);
+  gtk_label_set_xalign(self->stats_hover_label, 0.0f);
+  gtk_widget_add_css_class(GTK_WIDGET(self->stats_hover_label), "stats-hover-tooltip");
+  gtk_fixed_put(self->stats_hover_layer, GTK_WIDGET(self->stats_hover_label), 0, 0);
+  gtk_overlay_add_overlay(GTK_OVERLAY(gtk_widget_get_parent(GTK_WIDGET(self->stats_graph_usage))),
+                          GTK_WIDGET(self->stats_hover_layer));
+  gtk_overlay_set_clip_overlay(GTK_OVERLAY(gtk_widget_get_parent(GTK_WIDGET(self->stats_graph_usage))),
+                               GTK_WIDGET(self->stats_hover_layer), TRUE);
   reset_stats_history(self);
   if (self->stats_graph_usage != NULL) {
     gtk_drawing_area_set_draw_func(self->stats_graph_usage, stats_graph_draw_usage, self, NULL);
+    gtk_accessible_update_property(GTK_ACCESSIBLE(self->stats_graph_usage),
+                                   GTK_ACCESSIBLE_PROPERTY_LABEL, "CPU usage history", -1);
   }
-  if (self->stats_graph_players != NULL) {
-    gtk_drawing_area_set_draw_func(self->stats_graph_players, stats_graph_draw_players, self, NULL);
+  if (self->stats_graph_ram != NULL) {
+    gtk_drawing_area_set_draw_func(self->stats_graph_ram, stats_graph_draw_ram, self, NULL);
+    gtk_accessible_update_property(GTK_ACCESSIBLE(self->stats_graph_ram),
+                                   GTK_ACCESSIBLE_PROPERTY_LABEL, "Memory usage history", -1);
   }
   if (self->stats_graph_disk != NULL) {
     gtk_drawing_area_set_draw_func(self->stats_graph_disk, stats_graph_draw_disk, self, NULL);
   }
+  for (int metric = 0; metric < 3; metric++) {
+    setup_stats_hover(self, metric);
+  }
   restart_stats_refresh_timer(self);
+  show_marketplace_page(self, NULL, FALSE);
+  pumpkin_window_minimap_setup(self);
 }
 
 static void
 pumpkin_window_dispose(GObject *object)
 {
   PumpkinWindow *self = PUMPKIN_WINDOW(object);
+  self->disposing = TRUE;
+  invalidate_latest_release(self);
+  pumpkin_window_worlds_shutdown(self);
+  pumpkin_window_minimap_shutdown(self);
+  g_signal_handlers_disconnect_by_func(gdk_display_get_monitors(gtk_widget_get_display(GTK_WIDGET(self))),
+                                        on_startup_monitors_changed, self);
+  ++self->marketplace_request_generation;
+  if (self->marketplace_request_cancellable != NULL) {
+    g_cancellable_cancel(self->marketplace_request_cancellable);
+    g_clear_object(&self->marketplace_request_cancellable);
+  }
+  if (self->market_cache_request_cancellable != NULL) {
+    g_cancellable_cancel(self->market_cache_request_cancellable);
+    g_clear_object(&self->market_cache_request_cancellable);
+  }
   if (self->current != NULL) {
     player_states_mark_all_offline(self);
     player_states_save(self, self->current);
@@ -12260,6 +14967,10 @@ pumpkin_window_dispose(GObject *object)
     g_ptr_array_unref(self->command_history);
     self->command_history = NULL;
   }
+  if (self->market_plugin_cache != NULL) {
+    g_ptr_array_unref(self->market_plugin_cache);
+    self->market_plugin_cache = NULL;
+  }
   if (self->networks != NULL) {
     g_ptr_array_unref(self->networks);
     self->networks = NULL;
@@ -12290,9 +15001,9 @@ pumpkin_window_dispose(GObject *object)
     g_hash_table_destroy(self->deleted_player_keys);
     self->deleted_player_keys = NULL;
   }
-  if (self->player_head_downloads != NULL) {
-    g_hash_table_destroy(self->player_head_downloads);
-    self->player_head_downloads = NULL;
+  if (self->market_preview_downloads != NULL) {
+    g_hash_table_destroy(self->market_preview_downloads);
+    self->market_preview_downloads = NULL;
   }
   g_clear_pointer(&self->pending_details_page, g_free);
   g_clear_pointer(&self->pending_view_page, g_free);
@@ -12302,6 +15013,8 @@ pumpkin_window_dispose(GObject *object)
   g_clear_pointer(&self->latest_url, g_free);
   g_clear_pointer(&self->latest_build_id, g_free);
   g_clear_pointer(&self->latest_build_label, g_free);
+  g_clear_pointer(&self->market_cache_error, g_free);
+  clear_marketplace_access_token(self);
   g_clear_pointer(&self->auto_update_last_schedule_server_id, g_free);
   g_clear_pointer(&self->auto_update_last_attempt_server_id, g_free);
   g_clear_pointer(&self->auto_update_last_attempt_build_id, g_free);
@@ -12313,10 +15026,11 @@ pumpkin_window_dispose(GObject *object)
     g_source_remove(self->stats_refresh_id);
     self->stats_refresh_id = 0;
   }
-  if (self->status_timeout_id != 0) {
-    g_source_remove(self->status_timeout_id);
-    self->status_timeout_id = 0;
-  }
+  g_clear_object(&self->stats_hover_label);
+  g_clear_object(&self->stats_hover_layer);
+  g_clear_pointer(&self->startup_monitor_ids, g_ptr_array_unref);
+  g_clear_object(&self->details_error_toast);
+  g_clear_object(&self->details_status_toast);
   if (self->download_progress_revealer != NULL) {
     gtk_revealer_set_reveal_child(self->download_progress_revealer, FALSE);
   }
@@ -12364,227 +15078,7 @@ pumpkin_window_dispose(GObject *object)
 static void
 update_live_player_names(PumpkinWindow *self, const char *line)
 {
-  if (self == NULL || self->live_player_names == NULL || self->player_states == NULL || line == NULL) {
-    return;
-  }
-
-  g_autofree char *clean = pumpkin_strip_ansi(line);
-  const char *check = clean != NULL ? clean : line;
-  PlayerPlatform platform_hint = platform_from_line(check);
-
-  g_autoptr(GRegex) accepted_java_re =
-    g_regex_new("accepted\\s+connection\\s+from\\s+java\\s+edition:\\s*([^\\s]+)",
-                G_REGEX_CASELESS, 0, NULL);
-  g_autoptr(GMatchInfo) accepted_java_match = NULL;
-  if (g_regex_match(accepted_java_re, check, 0, &accepted_java_match)) {
-    g_autofree char *addr = g_match_info_fetch(accepted_java_match, 1);
-    g_autofree char *ip = extract_ip_from_socket_text(addr);
-    remember_platform_hint_for_ip(self, ip, PLAYER_PLATFORM_JAVA);
-    if (self->pending_java_platform_hints < 1024) {
-      self->pending_java_platform_hints++;
-    }
-    return;
-  }
-
-  g_autoptr(GRegex) accepted_bedrock_re =
-    g_regex_new("accepted\\s+connection\\s+from\\s+bedrock\\s+edition:\\s*([^\\s]+)|\\bbedrock\\b.*\\bfrom\\s+([^\\s]+)",
-                G_REGEX_CASELESS, 0, NULL);
-  g_autoptr(GMatchInfo) accepted_bedrock_match = NULL;
-  if (g_regex_match(accepted_bedrock_re, check, 0, &accepted_bedrock_match)) {
-    g_autofree char *addr1 = g_match_info_fetch(accepted_bedrock_match, 1);
-    g_autofree char *addr2 = g_match_info_fetch(accepted_bedrock_match, 2);
-    const char *addr = (addr1 != NULL && *addr1 != '\0') ? addr1 : addr2;
-    g_autofree char *ip = extract_ip_from_socket_text(addr);
-    remember_platform_hint_for_ip(self, ip, PLAYER_PLATFORM_BEDROCK);
-    if (self->pending_bedrock_platform_hints < 1024) {
-      self->pending_bedrock_platform_hints++;
-    }
-    return;
-  }
-
-  g_autofree char *lower_check = g_ascii_strdown(check, -1);
-  if (lower_check != NULL &&
-      strstr(lower_check, "bedrock") != NULL &&
-      (strstr(lower_check, "status_have_all_packs") != NULL ||
-       strstr(lower_check, "login") != NULL)) {
-    if (self->pending_bedrock_platform_hints < 1024) {
-      self->pending_bedrock_platform_hints++;
-    }
-  }
-
-  g_autoptr(GRegex) login_addr_re =
-    g_regex_new("(?:^|\\s|:\\s*)([^\\s\\[]+)\\[/([^\\]]+)\\]\\s+logged\\s+in\\b",
-                G_REGEX_CASELESS, 0, NULL);
-  g_autoptr(GMatchInfo) login_addr_match = NULL;
-  if (g_regex_match(login_addr_re, check, 0, &login_addr_match)) {
-    g_autofree char *name = g_match_info_fetch(login_addr_match, 1);
-    g_autofree char *addr = g_match_info_fetch(login_addr_match, 2);
-    if (name != NULL) {
-      g_strstrip(name);
-    }
-    g_autofree char *ip = extract_ip_from_socket_text(addr);
-    if (platform_hint == PLAYER_PLATFORM_UNKNOWN) {
-      platform_hint = platform_hint_for_ip(self, ip);
-    }
-    if (platform_hint == PLAYER_PLATFORM_UNKNOWN) {
-      platform_hint = take_pending_platform_hint(self);
-    }
-    if (platform_hint == PLAYER_PLATFORM_UNKNOWN) {
-      platform_hint = PLAYER_PLATFORM_JAVA;
-    }
-    if (name != NULL && *name != '\0') {
-      allow_deleted_player_tracking(self, NULL, name);
-      PlayerState *state = ensure_player_state(self, NULL, name, TRUE);
-      if (state != NULL && ip != NULL && *ip != '\0' && g_strcmp0(state->last_ip, ip) != 0) {
-        g_free(state->last_ip);
-        state->last_ip = g_strdup(ip);
-        player_states_set_dirty(self);
-      }
-      player_state_mark_online(self, state, platform_hint);
-      return;
-    }
-  }
-
-  if (pumpkin_is_player_list_snapshot_line(check)) {
-    g_autoptr(GHashTable) present = g_hash_table_new_full(g_str_hash, g_str_equal, g_free, NULL);
-    int count_value = -1;
-    g_autofree char *names_csv = NULL;
-    gboolean parsed_snapshot = pumpkin_parse_player_list_snapshot_line(check, &count_value, &names_csv);
-
-    if (!parsed_snapshot) {
-      g_autoptr(GRegex) count_re = g_regex_new("there\\s+are\\s+([0-9]+)", G_REGEX_CASELESS, 0, NULL);
-      g_autoptr(GMatchInfo) count_match = NULL;
-      if (g_regex_match(count_re, check, 0, &count_match)) {
-        g_autofree char *count_txt = g_match_info_fetch(count_match, 1);
-        if (count_txt != NULL) {
-          count_value = (int)strtol(count_txt, NULL, 10);
-        }
-      }
-    }
-
-    if (count_value >= 0) {
-      self->list_snapshot_players = count_value;
-      self->list_snapshot_updated_at = g_get_monotonic_time();
-    }
-    g_autoptr(GRegex) max_re = g_regex_new("max\\s+of\\s+([0-9]+)", G_REGEX_CASELESS, 0, NULL);
-    g_autoptr(GMatchInfo) max_match = NULL;
-    if (max_re != NULL && g_regex_match(max_re, check, 0, &max_match)) {
-      g_autofree char *max_txt = g_match_info_fetch(max_match, 1);
-      if (max_txt != NULL) {
-        int snapshot_max = (int)strtol(max_txt, NULL, 10);
-        if (snapshot_max >= 0) {
-          self->list_snapshot_max_players = snapshot_max;
-        }
-      }
-    }
-
-    gboolean has_name_list = names_csv != NULL && *names_csv != '\0';
-    if (has_name_list) {
-      g_auto(GStrv) split = g_strsplit(names_csv, ",", -1);
-      for (int i = 0; split[i] != NULL; i++) {
-        g_autofree char *name = g_strdup(split[i]);
-        g_strstrip(name);
-        if (name[0] == '\0') {
-          continue;
-        }
-        g_autofree char *name_key = normalized_key(name);
-        if (name_key == NULL) {
-          continue;
-        }
-        g_hash_table_add(present, g_strdup(name_key));
-        allow_deleted_player_tracking(self, NULL, name);
-        PlayerState *state = ensure_player_state(self, NULL, name, TRUE);
-        PlayerPlatform state_platform = platform_hint;
-        if (state_platform == PLAYER_PLATFORM_UNKNOWN) {
-          state_platform = take_pending_platform_hint(self);
-        }
-        if (state_platform == PLAYER_PLATFORM_UNKNOWN) {
-          state_platform = PLAYER_PLATFORM_JAVA;
-        }
-        player_state_mark_online(self, state, state_platform);
-      }
-    }
-
-    if (count_value == 0 || has_name_list) {
-      GHashTableIter iter;
-      gpointer key = NULL;
-      gpointer value = NULL;
-      g_hash_table_iter_init(&iter, self->player_states);
-      while (g_hash_table_iter_next(&iter, &key, &value)) {
-        PlayerState *state = value;
-        if (state == NULL || !state->online) {
-          continue;
-        }
-        g_autofree char *name_key = normalized_key(state->name);
-        if (name_key == NULL || !g_hash_table_contains(present, name_key)) {
-          player_state_mark_offline(self, state);
-        }
-      }
-    }
-    return;
-  }
-
-  if (strstr(check, "UUID: ") != NULL) {
-    const char *uuid_pos = strstr(check, "UUID: ");
-    const char *name_pos = strstr(check, "name=");
-    if (uuid_pos != NULL && name_pos != NULL) {
-      uuid_pos += strlen("UUID: ");
-      name_pos += strlen("name=");
-      const char *uuid_end = uuid_pos;
-      while (*uuid_end != '\0' && !g_ascii_isspace(*uuid_end)) {
-        uuid_end++;
-      }
-      const char *name_end = name_pos;
-      while (*name_end != '\0' && *name_end != ' ' && *name_end != ',' && *name_end != ')') {
-        name_end++;
-      }
-      if (uuid_end > uuid_pos && name_end > name_pos) {
-        g_autofree char *uuid = g_strndup(uuid_pos, (gsize)(uuid_end - uuid_pos));
-        g_autofree char *name = g_strndup(name_pos, (gsize)(name_end - name_pos));
-        if (platform_hint == PLAYER_PLATFORM_UNKNOWN) {
-          platform_hint = platform_guess_from_uuid(uuid);
-        }
-        if (platform_hint == PLAYER_PLATFORM_UNKNOWN) {
-          platform_hint = take_pending_platform_hint(self);
-        }
-        if (platform_hint == PLAYER_PLATFORM_UNKNOWN) {
-          platform_hint = PLAYER_PLATFORM_JAVA;
-        }
-        allow_deleted_player_tracking(self, uuid, name);
-        PlayerState *state = ensure_player_state(self, uuid, name, TRUE);
-        player_state_mark_online(self, state, platform_hint);
-        return;
-      }
-    }
-  }
-
-  g_autofree char *joined_name = extract_name_before_suffix(check, " joined the game");
-  if (joined_name != NULL && *joined_name != '\0') {
-    if (platform_hint == PLAYER_PLATFORM_UNKNOWN) {
-      platform_hint = take_pending_platform_hint(self);
-    }
-    if (platform_hint == PLAYER_PLATFORM_UNKNOWN) {
-      platform_hint = PLAYER_PLATFORM_JAVA;
-    }
-    allow_deleted_player_tracking(self, NULL, joined_name);
-    PlayerState *state = ensure_player_state(self, NULL, joined_name, TRUE);
-    player_state_mark_online(self, state, platform_hint);
-    return;
-  }
-
-  g_autofree char *left_name = extract_name_before_suffix(check, " left the game");
-  if (left_name != NULL && *left_name != '\0') {
-    PlayerState *state = ensure_player_state(self, NULL, left_name, FALSE);
-    if (state != NULL) {
-      player_state_mark_offline(self, state);
-    } else {
-      g_hash_table_remove(self->live_player_names, left_name);
-    }
-    return;
-  }
-
-  /* Do not infer players from generic chat-like "<name>" fragments.
-   * It can match command or diagnostic lines and create fake players. */
+  player_states_consume_log(self, line);
 }
 
 static void
@@ -12602,14 +15096,21 @@ pumpkin_window_class_init(PumpkinWindowClass *class)
 #endif
 
   gtk_widget_class_bind_template_child(widget_class, PumpkinWindow, view_stack);
-  gtk_widget_class_bind_template_child(widget_class, PumpkinWindow, details_switcher);
+  gtk_widget_class_bind_template_child(widget_class, PumpkinWindow, details_split_view);
+  gtk_widget_class_bind_template_child(widget_class, PumpkinWindow, details_sidebar);
+  gtk_widget_class_bind_template_child(widget_class, PumpkinWindow, btn_details_sidebar_toggle);
+  gtk_widget_class_bind_template_child(widget_class, PumpkinWindow, plugins_switcher);
   gtk_widget_class_bind_template_child(widget_class, PumpkinWindow, players_switcher);
+  gtk_widget_class_bind_template_child(widget_class, PumpkinWindow, plugins_stack);
   gtk_widget_class_bind_template_child(widget_class, PumpkinWindow, players_stack);
   gtk_widget_class_bind_template_child(widget_class, PumpkinWindow, overview_page_box);
   gtk_widget_class_bind_template_child(widget_class, PumpkinWindow, overview_header_row);
   gtk_widget_class_bind_template_child(widget_class, PumpkinWindow, details_page_box);
+  gtk_widget_class_bind_template_child(widget_class, PumpkinWindow, minimap_settings_group);
   gtk_widget_class_bind_template_child(widget_class, PumpkinWindow, details_header_row);
   gtk_widget_class_bind_template_child(widget_class, PumpkinWindow, details_identity_row);
+  gtk_widget_class_bind_template_child(widget_class, PumpkinWindow, server_header_controls);
+  gtk_widget_class_bind_template_child(widget_class, PumpkinWindow, app_header_title);
   gtk_widget_class_bind_template_child(widget_class, PumpkinWindow, network_details_page_box);
   gtk_widget_class_bind_template_child(widget_class, PumpkinWindow, network_details_header_row);
   gtk_widget_class_bind_template_child(widget_class, PumpkinWindow, network_details_identity_row);
@@ -12632,23 +15133,43 @@ pumpkin_window_class_init(PumpkinWindowClass *class)
   gtk_widget_class_bind_template_child(widget_class, PumpkinWindow, label_sponsor_heart);
   gtk_widget_class_bind_template_child(widget_class, PumpkinWindow, btn_remove_server);
   gtk_widget_class_bind_template_child(widget_class, PumpkinWindow, btn_open_plugins);
+  gtk_widget_class_bind_template_child(widget_class, PumpkinWindow, btn_marketplace_account);
+  gtk_widget_class_bind_template_child(widget_class, PumpkinWindow, btn_import_plugin);
   gtk_widget_class_bind_template_child(widget_class, PumpkinWindow, btn_plugins_marketplace);
+  gtk_widget_class_bind_template_child(widget_class, PumpkinWindow, btn_marketplace_refresh);
+  gtk_widget_class_bind_template_child(widget_class, PumpkinWindow, btn_marketplace_retry);
+  gtk_widget_class_bind_template_child(widget_class, PumpkinWindow, btn_marketplace_prev);
+  gtk_widget_class_bind_template_child(widget_class, PumpkinWindow, btn_marketplace_next);
   gtk_widget_class_bind_template_child(widget_class, PumpkinWindow, btn_open_players);
-  gtk_widget_class_bind_template_child(widget_class, PumpkinWindow, btn_open_worlds);
   gtk_widget_class_bind_template_child(widget_class, PumpkinWindow, btn_save_settings);
 
+  gtk_widget_class_bind_template_child(widget_class, PumpkinWindow, marketplace_search_entry);
+  gtk_widget_class_bind_template_child(widget_class, PumpkinWindow, marketplace_category_entry);
+  gtk_widget_class_bind_template_child(widget_class, PumpkinWindow, marketplace_type_dropdown);
+  gtk_widget_class_bind_template_child(widget_class, PumpkinWindow, marketplace_sort_dropdown);
+  gtk_widget_class_bind_template_child(widget_class, PumpkinWindow, btn_marketplace_sort_order);
+  gtk_widget_class_bind_template_child(widget_class, PumpkinWindow, marketplace_status_label);
+  gtk_widget_class_bind_template_child(widget_class, PumpkinWindow, marketplace_spinner);
+  gtk_widget_class_bind_template_child(widget_class, PumpkinWindow, marketplace_list);
   gtk_widget_class_bind_template_child(widget_class, PumpkinWindow, plugin_list);
   gtk_widget_class_bind_template_child(widget_class, PumpkinWindow, plugin_drop_hint);
-  gtk_widget_class_bind_template_child(widget_class, PumpkinWindow, world_list);
-  gtk_widget_class_bind_template_child(widget_class, PumpkinWindow, world_drop_hint);
+  gtk_widget_class_bind_template_child(widget_class, PumpkinWindow, world_page);
   gtk_widget_class_bind_template_child(widget_class, PumpkinWindow, player_list);
   gtk_widget_class_bind_template_child(widget_class, PumpkinWindow, player_search);
+  gtk_widget_class_bind_template_child(widget_class, PumpkinWindow, player_heading);
+  gtk_widget_class_bind_template_child(widget_class, PumpkinWindow, ip_bans_list);
+  gtk_widget_class_bind_template_child(widget_class, PumpkinWindow, player_summary);
+  gtk_widget_class_bind_template_child(widget_class, PumpkinWindow, player_presence_filter);
+  gtk_widget_class_bind_template_child(widget_class, PumpkinWindow, btn_player_reset_filters);
   gtk_widget_class_bind_template_child(widget_class, PumpkinWindow, player_sort_dropdown);
   gtk_widget_class_bind_template_child(widget_class, PumpkinWindow, btn_player_sort_order);
   gtk_widget_class_bind_template_child(widget_class, PumpkinWindow, whitelist_list);
   gtk_widget_class_bind_template_child(widget_class, PumpkinWindow, banned_list);
   gtk_widget_class_bind_template_child(widget_class, PumpkinWindow, log_files_list);
   gtk_widget_class_bind_template_child(widget_class, PumpkinWindow, log_file_view);
+  gtk_widget_class_bind_template_child(widget_class, PumpkinWindow, log_file_title);
+  gtk_widget_class_bind_template_child(widget_class, PumpkinWindow, log_file_summary);
+  gtk_widget_class_bind_template_child(widget_class, PumpkinWindow, btn_refresh_logs);
   gtk_widget_class_bind_template_child(widget_class, PumpkinWindow, log_filter);
   gtk_widget_class_bind_template_child(widget_class, PumpkinWindow, log_level_filter);
   gtk_widget_class_bind_template_child(widget_class, PumpkinWindow, log_search);
@@ -12660,14 +15181,12 @@ pumpkin_window_class_init(PumpkinWindowClass *class)
   gtk_widget_class_bind_template_child(widget_class, PumpkinWindow, label_srv_ram);
   gtk_widget_class_bind_template_child(widget_class, PumpkinWindow, stats_row);
   gtk_widget_class_bind_template_child(widget_class, PumpkinWindow, stats_graph_usage);
-  gtk_widget_class_bind_template_child(widget_class, PumpkinWindow, stats_graph_players);
+  gtk_widget_class_bind_template_child(widget_class, PumpkinWindow, stats_graph_ram);
   gtk_widget_class_bind_template_child(widget_class, PumpkinWindow, stats_graph_disk);
   gtk_widget_class_bind_template_child(widget_class, PumpkinWindow, label_stats_cpu);
   gtk_widget_class_bind_template_child(widget_class, PumpkinWindow, label_stats_ram);
   gtk_widget_class_bind_template_child(widget_class, PumpkinWindow, label_stats_disk);
   gtk_widget_class_bind_template_child(widget_class, PumpkinWindow, label_stats_players);
-  gtk_widget_class_bind_template_child(widget_class, PumpkinWindow, console_warning_revealer);
-  gtk_widget_class_bind_template_child(widget_class, PumpkinWindow, console_warning_label);
 
   gtk_widget_class_bind_template_child(widget_class, PumpkinWindow, details_title);
   gtk_widget_class_bind_template_child(widget_class, PumpkinWindow, details_server_icon);
@@ -12675,10 +15194,7 @@ pumpkin_window_class_init(PumpkinWindowClass *class)
   gtk_widget_class_bind_template_child(widget_class, PumpkinWindow, network_details_status);
   gtk_widget_class_bind_template_child(widget_class, PumpkinWindow, network_details_icon);
   gtk_widget_class_bind_template_child(widget_class, PumpkinWindow, details_stack);
-  gtk_widget_class_bind_template_child(widget_class, PumpkinWindow, details_error_revealer);
-  gtk_widget_class_bind_template_child(widget_class, PumpkinWindow, details_error);
-  gtk_widget_class_bind_template_child(widget_class, PumpkinWindow, details_status_revealer);
-  gtk_widget_class_bind_template_child(widget_class, PumpkinWindow, details_status);
+  gtk_widget_class_bind_template_child(widget_class, PumpkinWindow, notifications_overlay);
   gtk_widget_class_bind_template_child(widget_class, PumpkinWindow, download_progress_revealer);
   gtk_widget_class_bind_template_child(widget_class, PumpkinWindow, download_progress);
   gtk_widget_class_bind_template_child(widget_class, PumpkinWindow, btn_details_back);
@@ -12760,6 +15276,10 @@ pumpkin_window_class_init(PumpkinWindowClass *class)
   gtk_widget_class_bind_template_child(widget_class, PumpkinWindow, switch_detailed_overview_cards);
   gtk_widget_class_bind_template_child(widget_class, PumpkinWindow, switch_autostart_on_boot);
   gtk_widget_class_bind_template_child(widget_class, PumpkinWindow, switch_start_minimized);
+  gtk_widget_class_bind_template_child(widget_class, PumpkinWindow, row_start_expanded);
+  gtk_widget_class_bind_template_child(widget_class, PumpkinWindow, row_start_mode);
+  gtk_widget_class_bind_template_child(widget_class, PumpkinWindow, row_release_channel);
+  gtk_widget_class_bind_template_child(widget_class, PumpkinWindow, row_start_monitor);
   gtk_widget_class_bind_template_child(widget_class, PumpkinWindow, switch_auto_start_servers);
   gtk_widget_class_bind_template_child(widget_class, PumpkinWindow, drop_date_format);
   gtk_widget_class_bind_template_child(widget_class, PumpkinWindow, drop_time_format);
@@ -12838,7 +15358,7 @@ auto_start_server_timeout_cb(gpointer user_data)
 void
 pumpkin_window_schedule_auto_start_servers(PumpkinWindow *self)
 {
-  if (self == NULL || self->store == NULL) {
+  if (self == NULL || self->store == NULL || !pumpkin_platform_supports_local_hosting()) {
     return;
   }
 
@@ -12877,7 +15397,7 @@ pumpkin_window_schedule_auto_start_servers(PumpkinWindow *self)
 void
 pumpkin_window_stop_all_servers(PumpkinWindow *self)
 {
-  if (self == NULL || self->store == NULL) {
+  if (self == NULL || self->store == NULL || !pumpkin_platform_supports_local_hosting()) {
     return;
   }
   if (self->auto_update_server != NULL) {
@@ -12926,7 +15446,8 @@ pumpkin_window_get_review_prompt_shown(PumpkinWindow *self)
 void
 pumpkin_window_select_server(PumpkinWindow *self, const char *id_or_name)
 {
-  if (self == NULL || id_or_name == NULL || *id_or_name == '\0') {
+  if (self == NULL || id_or_name == NULL || *id_or_name == '\0' ||
+      !pumpkin_platform_supports_local_hosting()) {
     return;
   }
   if (self->store == NULL) {

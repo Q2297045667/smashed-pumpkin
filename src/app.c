@@ -1,7 +1,9 @@
 #include "app.h"
 #include "app-config.h"
 #include "config.h"
+#include "platform.h"
 #include "window.h"
+#include "window-startup.h"
 
 #include <stdint.h>
 #include <string.h>
@@ -214,6 +216,10 @@ maybe_present_review_prompt(PumpkinApp *self, GtkWindow *win)
   if (self == NULL || win == NULL || self->review_prompt_shown) {
     return;
   }
+  if (!pumpkin_platform_supports_review_prompt()) {
+    self->review_prompt_shown = TRUE;
+    return;
+  }
   if (!PUMPKIN_IS_WINDOW(win)) {
     return;
   }
@@ -395,6 +401,12 @@ pumpkin_app_activate(GApplication *app)
   if (win == NULL) {
     win = GTK_WINDOW(pumpkin_window_new(ADW_APPLICATION(app)));
     gtk_window_set_default_icon_name(APP_ID);
+    PumpkinConfig *config = pumpkin_config_load(NULL);
+    if (pumpkin_config_should_expand_on_startup(config)) {
+      self->start_minimized = FALSE;
+    }
+    pumpkin_window_apply_startup(win, config);
+    pumpkin_config_free(config);
   }
 #if defined(G_OS_WIN32)
   ensure_tray_control_window(self);
@@ -447,19 +459,17 @@ pumpkin_app_about_action(GSimpleAction *action,
   if (is_de) {
     adw_about_dialog_set_release_notes(
       about,
-      "<p>Neuerungen</p>"
       "<ul>"
-      "<li>Windows-Portierung.</li>"
-      "</ul>"
-      "<p>Vielen Dank für euer Feedback. Es hilft der Entwicklung direkt weiter.</p>");
+      "<li>Interaktive Minimap mit Spieleranzeige, Blickrichtung, Spieler-Tracking und Weltenwechsel.</li>"
+      "<li>Pumpkin Marketplace: Plugins durchsuchen, installieren und aktualisieren.</li>"
+      "</ul>");
   } else {
     adw_about_dialog_set_release_notes(
       about,
-      "<p>What’s new</p>"
       "<ul>"
-      "<li>Windows port.</li>"
-      "</ul>"
-      "<p>Thank you for your feedback. It directly helps development.</p>");
+      "<li>Interactive minimap with player markers, viewing direction, player tracking and world switching.</li>"
+      "<li>Pumpkin Marketplace: browse, install and update plugins.</li>"
+      "</ul>");
   }
   adw_about_dialog_set_developer_name(about, "Rotstein");
   adw_about_dialog_set_comments(about,
@@ -530,13 +540,14 @@ pumpkin_app_command_line(GApplication *app, GApplicationCommandLine *command_lin
       server_name = argv[i] + strlen("--server-name=");
     }
   }
-  g_strfreev(argv);
-
   if (should_quit) {
+    g_strfreev(argv);
     g_action_group_activate_action(G_ACTION_GROUP(app), "quit", NULL);
     return 0;
   }
 
+  gboolean server_requested = (server_id != NULL && *server_id != '\0') ||
+                              (server_name != NULL && *server_name != '\0');
   if (server_id != NULL && *server_id != '\0') {
     g_free(self->pending_server_id);
     self->pending_server_id = g_strdup(server_id);
@@ -544,12 +555,12 @@ pumpkin_app_command_line(GApplication *app, GApplicationCommandLine *command_lin
     g_free(self->pending_server_id);
     self->pending_server_id = g_strdup(server_name);
   }
+  g_strfreev(argv);
+
   if (got_minimized) {
     self->start_minimized = TRUE;
   }
-  if (show_requested ||
-      (server_id != NULL && *server_id != '\0') ||
-      (server_name != NULL && *server_name != '\0')) {
+  if (show_requested || server_requested) {
     self->start_minimized = FALSE;
   }
   g_application_activate(app);
@@ -572,7 +583,8 @@ pumpkin_app_startup(GApplication *app)
   /* Auto-start servers on launch */
   PumpkinConfig *config = pumpkin_config_load(NULL);
   if (config != NULL) {
-    if (pumpkin_config_get_autostart_on_boot(config) &&
+    if (pumpkin_platform_supports_local_hosting() &&
+        pumpkin_config_get_autostart_on_boot(config) &&
         pumpkin_config_get_auto_start_servers_enabled(config)) {
       PUMPKIN_APP(app)->auto_start_pending = TRUE;
     }

@@ -3,6 +3,7 @@
 #include "window-internal.h"
 
 void player_state_free(PlayerState *state);
+void player_states_consume_log(PumpkinWindow *self, const char *line);
 guint64 player_state_effective_playtime(const PlayerState *state);
 void player_states_set_dirty(PumpkinWindow *self);
 void allow_deleted_player_tracking(PumpkinWindow *self, const char *uuid, const char *name);
@@ -19,4 +20,3 @@ PlayerPlatform platform_guess_from_uuid(const char *uuid);
 char *extract_ip_from_socket_text(const char *text);
 void remember_platform_hint_for_ip(PumpkinWindow *self, const char *ip, PlayerPlatform platform);
 PlayerPlatform platform_hint_for_ip(PumpkinWindow *self, const char *ip);
-PlayerPlatform take_pending_platform_hint(PumpkinWindow *self);

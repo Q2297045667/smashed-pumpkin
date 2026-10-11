@@ -1,12 +1,11 @@
 #include "config.h"
 #include "download.h"
+#include "release-metadata.h"
+#include <string.h>
 
 #include <libsoup/soup.h>
 #include <gio/gio.h>
 #include <stdio.h>
-
-#define PUMPKIN_DOWNLOAD_PAGE "https://pumpkinmc.org/download/"
-#define PUMPKIN_DOWNLOAD_API_URL "https://api.github.com/repos/Pumpkin-MC/Pumpkin/releases/tags/nightly"
 
 typedef struct {
   char *url;
@@ -24,9 +23,8 @@ typedef struct {
 
 typedef struct {
   SoupSession *session;
-  char *resolved_url;
-  gboolean used_fallback;
-  SoupMessage *metadata_message;
+  SoupMessage *message;
+  PumpkinReleaseChannel channel;
 } ResolveState;
 
 static SoupSession *shared_session = NULL;
@@ -78,22 +76,9 @@ resolve_state_free(ResolveState *state)
   if (state == NULL) {
     return;
   }
-  g_clear_pointer(&state->resolved_url, g_free);
   g_clear_object(&state->session);
-  g_clear_object(&state->metadata_message);
+  g_clear_object(&state->message);
   g_free(state);
-}
-
-void
-pumpkin_resolved_download_free(PumpkinResolvedDownload *resolved)
-{
-  if (resolved == NULL) {
-    return;
-  }
-  g_clear_pointer(&resolved->url, g_free);
-  g_clear_pointer(&resolved->build_id, g_free);
-  g_clear_pointer(&resolved->build_label, g_free);
-  g_free(resolved);
 }
 
 static void on_read_chunk(GObject *source, GAsyncResult *res, gpointer user_data);
@@ -221,12 +206,30 @@ pumpkin_download_file_async(const char *url,
                             GAsyncReadyCallback callback,
                             gpointer user_data)
 {
+  pumpkin_download_file_authorized_async(url, dest_path, NULL, cancellable,
+                                         progress_cb, progress_data, callback, user_data);
+}
+
+void
+pumpkin_download_file_authorized_async(const char *url,
+                                       const char *dest_path,
+                                       const char *authorization,
+                                       GCancellable *cancellable,
+                                       PumpkinDownloadProgress progress_cb,
+                                       gpointer progress_data,
+                                       GAsyncReadyCallback callback,
+                                       gpointer user_data)
+{
   GTask *task = g_task_new(NULL, cancellable, callback, user_data);
   DownloadState *state = g_new0(DownloadState, 1);
   state->url = g_strdup(url);
   state->dest = g_strdup(dest_path);
   state->session = g_object_ref(get_shared_session());
   state->message = soup_message_new("GET", url);
+  if (authorization != NULL && *authorization != '\0') {
+    soup_message_headers_append(soup_message_get_request_headers(state->message),
+                                "Authorization", authorization);
+  }
   state->progress_cb = progress_cb;
   state->progress_data = progress_data;
   state->total = -1;
@@ -244,299 +247,6 @@ pumpkin_download_file_finish(GAsyncResult *result, GError **error)
   return g_task_propagate_boolean(G_TASK(result), error);
 }
 
-static const char *
-expected_asset_name(void)
-{
-#if defined(G_OS_WIN32)
-#if defined(_M_ARM64) || defined(__aarch64__) || defined(__arm64__)
-  return "pumpkin-ARM64-Windows.exe";
-#else
-  return "pumpkin-X64-Windows.exe";
-#endif
-#elif defined(__APPLE__)
-#if defined(__aarch64__) || defined(__arm64__)
-  return "pumpkin-ARM64-macOS";
-#else
-  return "pumpkin-X64-macOS";
-#endif
-#else
-#if defined(__aarch64__) || defined(__arm64__)
-  return "pumpkin-ARM64-Linux";
-#else
-  return "pumpkin-X64-Linux";
-#endif
-#endif
-}
-
-static char *
-extract_asset_url(const char *html, const char *asset_name)
-{
-  if (html == NULL || asset_name == NULL) {
-    return NULL;
-  }
-
-  g_autofree char *escaped = g_regex_escape_string(asset_name, -1);
-  g_autofree char *pattern = g_strdup_printf(
-    "https://github\\.com/Pumpkin-MC/Pumpkin/releases/download/[^\"\\s]*?/%s",
-    escaped);
-  g_autoptr(GRegex) regex = g_regex_new(pattern, G_REGEX_CASELESS, 0, NULL);
-  g_autoptr(GMatchInfo) match = NULL;
-
-  if (!g_regex_match(regex, html, 0, &match)) {
-    return NULL;
-  }
-
-  return g_match_info_fetch(match, 0);
-}
-
-static char *
-extract_asset_url_from_release_json(const char *json, const char *asset_name)
-{
-  if (json == NULL || asset_name == NULL) {
-    return NULL;
-  }
-
-  g_autofree char *escaped_name = g_regex_escape_string(asset_name, -1);
-  g_autofree char *pattern = g_strdup_printf(
-    "\"name\"\\s*:\\s*\"%s\"(?s:.*?)\"browser_download_url\"\\s*:\\s*\"([^\"]+)\"",
-    escaped_name);
-  g_autoptr(GRegex) regex = g_regex_new(pattern, G_REGEX_CASELESS, 0, NULL);
-  g_autoptr(GMatchInfo) match = NULL;
-
-  if (!g_regex_match(regex, json, 0, &match)) {
-    return NULL;
-  }
-
-  return g_match_info_fetch(match, 1);
-}
-
-static gboolean
-url_matches_keywords(const char *url, const char *const *os_keywords, const char *const *arch_keywords)
-{
-  if (url == NULL || os_keywords == NULL || arch_keywords == NULL) {
-    return FALSE;
-  }
-  g_autofree char *lower = g_ascii_strdown(url, -1);
-
-  gboolean os_match = FALSE;
-  for (int i = 0; os_keywords[i] != NULL; i++) {
-    if (strstr(lower, os_keywords[i]) != NULL) {
-      os_match = TRUE;
-      break;
-    }
-  }
-  if (!os_match) {
-    return FALSE;
-  }
-
-  for (int i = 0; arch_keywords[i] != NULL; i++) {
-    if (strstr(lower, arch_keywords[i]) != NULL) {
-      return TRUE;
-    }
-  }
-
-  return FALSE;
-}
-
-static const char *const *
-expected_os_keywords(void)
-{
-#if defined(G_OS_WIN32)
-  static const char *const keywords[] = { "windows", "win", NULL };
-  return keywords;
-#elif defined(__APPLE__)
-  static const char *const keywords[] = { "macos", "mac", "osx", "darwin", NULL };
-  return keywords;
-#else
-  static const char *const keywords[] = { "linux", NULL };
-  return keywords;
-#endif
-}
-
-static const char *const *
-expected_arch_keywords(void)
-{
-#if defined(_M_ARM64) || defined(__aarch64__) || defined(__arm64__)
-  static const char *const keywords[] = { "arm64", "aarch64", NULL };
-  return keywords;
-#else
-  static const char *const keywords[] = { "x64", "x86_64", "amd64", NULL };
-  return keywords;
-#endif
-}
-
-static char *
-extract_best_platform_url(const char *html)
-{
-  if (html == NULL) {
-    return NULL;
-  }
-
-  const char *const *os_kw = expected_os_keywords();
-  const char *const *arch_kw = expected_arch_keywords();
-
-  g_autoptr(GRegex) regex = g_regex_new(
-    "https://github\\.com/Pumpkin-MC/Pumpkin/releases/download/[^\"\\s]*?/[^\"\\s]+",
-    G_REGEX_CASELESS, 0, NULL);
-  g_autoptr(GMatchInfo) match = NULL;
-
-  if (!g_regex_match(regex, html, 0, &match)) {
-    return NULL;
-  }
-
-  while (g_match_info_matches(match)) {
-    g_autofree char *url = g_match_info_fetch(match, 0);
-    if (url != NULL && url_matches_keywords(url, os_kw, arch_kw)) {
-      return g_strdup(url);
-    }
-    g_match_info_next(match, NULL);
-  }
-
-  return NULL;
-}
-
-static char *
-fallback_nightly_url(void)
-{
-  const char *asset = expected_asset_name();
-  if (asset == NULL) {
-    return NULL;
-  }
-  return g_strdup_printf("https://github.com/Pumpkin-MC/Pumpkin/releases/download/nightly/%s", asset);
-}
-
-static int
-month_to_num(const char *month)
-{
-  if (month == NULL) {
-    return 0;
-  }
-  if (g_ascii_strcasecmp(month, "Jan") == 0) return 1;
-  if (g_ascii_strcasecmp(month, "Feb") == 0) return 2;
-  if (g_ascii_strcasecmp(month, "Mar") == 0) return 3;
-  if (g_ascii_strcasecmp(month, "Apr") == 0) return 4;
-  if (g_ascii_strcasecmp(month, "May") == 0) return 5;
-  if (g_ascii_strcasecmp(month, "Jun") == 0) return 6;
-  if (g_ascii_strcasecmp(month, "Jul") == 0) return 7;
-  if (g_ascii_strcasecmp(month, "Aug") == 0) return 8;
-  if (g_ascii_strcasecmp(month, "Sep") == 0) return 9;
-  if (g_ascii_strcasecmp(month, "Oct") == 0) return 10;
-  if (g_ascii_strcasecmp(month, "Nov") == 0) return 11;
-  if (g_ascii_strcasecmp(month, "Dec") == 0) return 12;
-  return 0;
-}
-
-static char *
-normalize_etag(const char *etag)
-{
-  if (etag == NULL) {
-    return NULL;
-  }
-
-  const char *start = etag;
-  while (g_ascii_isspace(*start)) {
-    start++;
-  }
-  if (g_str_has_prefix(start, "W/")) {
-    start += 2;
-    while (g_ascii_isspace(*start)) {
-      start++;
-    }
-  }
-
-  g_autofree char *tmp = g_strdup(start);
-  g_strstrip(tmp);
-
-  gsize len = strlen(tmp);
-  if (len >= 2 && tmp[0] == '"' && tmp[len - 1] == '"') {
-    tmp[len - 1] = '\0';
-    return g_strdup(tmp + 1);
-  }
-
-  return g_strdup(tmp);
-}
-
-static char *
-build_label_from_last_modified(const char *last_modified)
-{
-  if (last_modified == NULL || *last_modified == '\0') {
-    return NULL;
-  }
-
-  char weekday[4] = { 0 };
-  char month[4] = { 0 };
-  char tz[4] = { 0 };
-  int day = 0;
-  int year = 0;
-  int hour = 0;
-  int minute = 0;
-  int second = 0;
-  int parsed = sscanf(last_modified, "%3[^,], %d %3s %d %d:%d:%d %3s",
-                      weekday, &day, month, &year, &hour, &minute, &second, tz);
-  int month_num = month_to_num(month);
-  if (parsed == 8 && month_num > 0 && year > 0 && day > 0) {
-    return g_strdup_printf("Build %04d-%02d-%02d %02d:%02d UTC",
-                           year, month_num, day, hour, minute);
-  }
-
-  return g_strdup_printf("Build %s", last_modified);
-}
-
-static void
-fill_build_metadata(SoupMessageHeaders *headers, PumpkinResolvedDownload *resolved)
-{
-  if (headers == NULL || resolved == NULL) {
-    return;
-  }
-
-  const char *etag = soup_message_headers_get_one(headers, "ETag");
-  const char *last_modified = soup_message_headers_get_one(headers, "Last-Modified");
-
-  g_clear_pointer(&resolved->build_id, g_free);
-  resolved->build_id = normalize_etag(etag);
-  if (resolved->build_id == NULL && last_modified != NULL) {
-    resolved->build_id = g_strdup(last_modified);
-  }
-
-  g_clear_pointer(&resolved->build_label, g_free);
-  resolved->build_label = build_label_from_last_modified(last_modified);
-  if (resolved->build_label == NULL && resolved->build_id != NULL) {
-    resolved->build_label = g_strdup_printf("Build %s", resolved->build_id);
-  }
-}
-
-static void on_resolve_metadata_ready(GObject *source, GAsyncResult *res, gpointer user_data);
-
-static char *
-resolve_asset_url_from_payload(const char *payload, gboolean *used_fallback)
-{
-  if (used_fallback != NULL) {
-    *used_fallback = FALSE;
-  }
-
-  const char *asset = expected_asset_name();
-
-  g_autofree char *url = extract_asset_url_from_release_json(payload, asset);
-  if (url != NULL) {
-    return g_steal_pointer(&url);
-  }
-
-  url = extract_asset_url(payload, asset);
-  if (url != NULL) {
-    return g_steal_pointer(&url);
-  }
-
-  url = extract_best_platform_url(payload);
-  if (url != NULL) {
-    return g_steal_pointer(&url);
-  }
-
-  if (used_fallback != NULL) {
-    *used_fallback = TRUE;
-  }
-  return fallback_nightly_url();
-}
-
 static void
 on_resolve_ready(GObject *source, GAsyncResult *res, gpointer user_data)
 {
@@ -544,104 +254,74 @@ on_resolve_ready(GObject *source, GAsyncResult *res, gpointer user_data)
   GTask *task = G_TASK(user_data);
   ResolveState *state = g_task_get_task_data(task);
   g_autoptr(GError) error = NULL;
-
   g_autoptr(GBytes) bytes = soup_session_send_and_read_finish(state->session, res, &error);
   if (bytes == NULL) {
-    g_autofree char *fallback = fallback_nightly_url();
-    if (fallback != NULL) {
-      PumpkinResolvedDownload *resolved = g_new0(PumpkinResolvedDownload, 1);
-      resolved->url = g_strdup(fallback);
-      resolved->result_code = PUMPKIN_DOWNLOAD_FALLBACK_USED;
-      g_task_return_pointer(task, resolved, (GDestroyNotify)pumpkin_resolved_download_free);
-    } else {
-      g_task_return_error(task, g_steal_pointer(&error));
-    }
+    g_task_return_error(task, g_steal_pointer(&error));
     g_object_unref(task);
     return;
   }
-
+  guint status = soup_message_get_status(state->message);
+  if (status != SOUP_STATUS_OK) {
+    g_task_return_new_error(task, G_IO_ERROR, G_IO_ERROR_FAILED,
+      status == 403 || status == 429 ? "GitHub update check was rate limited (HTTP %u). Try again later." :
+      "Pumpkin update check failed (HTTP %u). No other release channel was selected.", status);
+    g_object_unref(task);
+    return;
+  }
   gsize size = 0;
   const char *data = g_bytes_get_data(bytes, &size);
-  g_autofree char *payload = g_strndup(data, size);
-  gboolean used_fallback = FALSE;
-  g_autofree char *resolved = resolve_asset_url_from_payload(payload, &used_fallback);
-  if (resolved == NULL) {
-    const char *asset = expected_asset_name();
-    g_task_return_new_error(task, G_IO_ERROR, G_IO_ERROR_FAILED,
-                            "Failed to find download URL for %s", asset);
+  if (size == 0 || size > 2 * 1024 * 1024 || memchr(data, '\0', size) != NULL) {
+    g_task_return_new_error(task, G_IO_ERROR, G_IO_ERROR_INVALID_DATA, "GitHub returned an empty, oversized or binary release response");
     g_object_unref(task);
     return;
   }
-
-  state->used_fallback = used_fallback;
-  g_clear_pointer(&state->resolved_url, g_free);
-  state->resolved_url = g_strdup(resolved);
-
-  g_clear_object(&state->metadata_message);
-  state->metadata_message = soup_message_new("HEAD", state->resolved_url);
-  if (state->metadata_message == NULL) {
-    PumpkinResolvedDownload *resolved = g_new0(PumpkinResolvedDownload, 1);
-    resolved->url = g_strdup(state->resolved_url);
-    resolved->result_code = state->used_fallback ? PUMPKIN_DOWNLOAD_FALLBACK_USED : PUMPKIN_DOWNLOAD_OK;
+  g_autofree char *json = g_strndup(data, size);
+  PumpkinResolvedDownload *resolved = pumpkin_release_parse_metadata(json, state->channel, pumpkin_release_asset_name(), &error);
+  if (resolved != NULL) {
     g_task_return_pointer(task, resolved, (GDestroyNotify)pumpkin_resolved_download_free);
-    g_object_unref(task);
-    return;
+  } else {
+    g_task_return_error(task, g_steal_pointer(&error));
   }
-
-  soup_session_send_and_read_async(state->session, state->metadata_message, G_PRIORITY_DEFAULT,
-                                   g_task_get_cancellable(task), on_resolve_metadata_ready, task);
-}
-
-static void
-on_resolve_metadata_ready(GObject *source, GAsyncResult *res, gpointer user_data)
-{
-  (void)source;
-  GTask *task = G_TASK(user_data);
-  ResolveState *state = g_task_get_task_data(task);
-  g_autoptr(GError) error = NULL;
-
-  g_autoptr(GBytes) ignored = soup_session_send_and_read_finish(state->session, res, &error);
-  (void)ignored;
-
-  PumpkinResolvedDownload *resolved = g_new0(PumpkinResolvedDownload, 1);
-  resolved->url = g_strdup(state->resolved_url);
-  resolved->result_code = state->used_fallback ? PUMPKIN_DOWNLOAD_FALLBACK_USED : PUMPKIN_DOWNLOAD_OK;
-
-  if (error == NULL && state->metadata_message != NULL) {
-    SoupMessageHeaders *headers = soup_message_get_response_headers(state->metadata_message);
-    fill_build_metadata(headers, resolved);
-  }
-
-  g_task_return_pointer(task, resolved, (GDestroyNotify)pumpkin_resolved_download_free);
   g_object_unref(task);
 }
 
 void
-pumpkin_resolve_latest_async(GCancellable *cancellable,
-                             GAsyncReadyCallback callback,
-                             gpointer user_data)
+pumpkin_resolve_channel_async(PumpkinReleaseChannel channel, GCancellable *cancellable,
+                              GAsyncReadyCallback callback, gpointer user_data)
 {
   GTask *task = g_task_new(NULL, cancellable, callback, user_data);
+  if (g_task_return_error_if_cancelled(task)) {
+    g_object_unref(task);
+    return;
+  }
+  if (channel != PUMPKIN_RELEASE_NIGHTLY && channel != PUMPKIN_RELEASE_STABLE) {
+    g_task_return_new_error(task, G_IO_ERROR, G_IO_ERROR_INVALID_ARGUMENT, "Unknown Pumpkin release channel");
+    g_object_unref(task);
+    return;
+  }
   ResolveState *state = g_new0(ResolveState, 1);
-  state->session = g_object_ref(get_shared_session());
+  state->channel = channel;
+  state->session = soup_session_new_with_options("user-agent", APP_NAME "/" APP_VERSION, "timeout", 30, NULL);
+  const char *api = channel == PUMPKIN_RELEASE_STABLE ?
+    "https://api.github.com/repos/Pumpkin-MC/Pumpkin/releases/latest" :
+    "https://api.github.com/repos/Pumpkin-MC/Pumpkin/releases/tags/nightly";
+  state->message = soup_message_new("GET", api);
+  SoupMessageHeaders *headers = soup_message_get_request_headers(state->message);
+  soup_message_headers_append(headers, "Accept", "application/vnd.github+json");
+  soup_message_headers_append(headers, "X-GitHub-Api-Version", "2026-03-10");
+  soup_message_headers_append(headers, "Cache-Control", "no-cache");
   g_task_set_task_data(task, state, (GDestroyNotify)resolve_state_free);
+  soup_session_send_and_read_async(state->session, state->message, G_PRIORITY_DEFAULT, cancellable, on_resolve_ready, task);
+}
 
-  SoupMessage *msg = soup_message_new("GET", PUMPKIN_DOWNLOAD_API_URL);
-  soup_message_headers_append(soup_message_get_request_headers(msg),
-                              "Accept",
-                              "application/vnd.github+json");
-  soup_message_headers_append(soup_message_get_request_headers(msg),
-                              "X-GitHub-Api-Version",
-                              "2022-11-28");
-  soup_session_send_and_read_async(state->session, msg, G_PRIORITY_DEFAULT, cancellable,
-                                   on_resolve_ready, task);
-  g_object_unref(msg);
+void
+pumpkin_resolve_latest_async(GCancellable *cancellable, GAsyncReadyCallback callback, gpointer user_data)
+{
+  pumpkin_resolve_channel_async(PUMPKIN_RELEASE_NIGHTLY, cancellable, callback, user_data);
 }
 
 PumpkinResolvedDownload *
-pumpkin_resolve_latest_finish(GAsyncResult *result,
-                              PumpkinDownloadResult *result_code,
-                              GError **error)
+pumpkin_resolve_latest_finish(GAsyncResult *result, PumpkinDownloadResult *result_code, GError **error)
 {
   PumpkinResolvedDownload *resolved = g_task_propagate_pointer(G_TASK(result), error);
   if (resolved != NULL && result_code != NULL) {

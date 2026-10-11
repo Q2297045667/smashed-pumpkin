@@ -1,5 +1,8 @@
 #define _GNU_SOURCE
+#include "platform.h"
 #include "server.h"
+#include "release-channel.h"
+#include "server-command-tracker.h"
 
 #include <gio/gio.h>
 #include <glib/gstdio.h>
@@ -22,6 +25,10 @@
 #endif
 #endif
 
+#ifndef PUMPKIN_STOP_TIMEOUT_SECONDS
+#define PUMPKIN_STOP_TIMEOUT_SECONDS 30
+#endif
+
 enum {
   SERVER_STATS_SAMPLE_MSEC_DEFAULT = 200,
   SERVER_STATS_SAMPLE_MSEC_MIN = 2,
@@ -31,27 +38,13 @@ enum {
   SERVER_DDNS_INTERVAL_SECONDS_MAX = 86400
 };
 
-static const char *
+static char *
 default_download_url(void)
 {
-#if defined(G_OS_WIN32)
-#if defined(_M_ARM64) || defined(__aarch64__) || defined(__arm64__)
-  return "https://github.com/Pumpkin-MC/Pumpkin/releases/download/nightly/pumpkin-ARM64-Windows.exe";
+#if defined(__ANDROID__)
+  return g_strdup("");
 #else
-  return "https://github.com/Pumpkin-MC/Pumpkin/releases/download/nightly/pumpkin-X64-Windows.exe";
-#endif
-#elif defined(__APPLE__)
-#if defined(__aarch64__) || defined(__arm64__)
-  return "https://github.com/Pumpkin-MC/Pumpkin/releases/download/nightly/pumpkin-ARM64-macOS";
-#else
-  return "https://github.com/Pumpkin-MC/Pumpkin/releases/download/nightly/pumpkin-X64-macOS";
-#endif
-#else
-#if defined(__aarch64__) || defined(__arm64__)
-  return "https://github.com/Pumpkin-MC/Pumpkin/releases/download/nightly/pumpkin-ARM64-Linux";
-#else
-  return "https://github.com/Pumpkin-MC/Pumpkin/releases/download/nightly/pumpkin-X64-Linux";
-#endif
+  return pumpkin_release_default_url(PUMPKIN_RELEASE_NIGHTLY);
 #endif
 }
 
@@ -92,6 +85,10 @@ struct _PumpkinServer {
   gboolean auto_start_on_launch;
   int auto_start_delay;
   gboolean stop_requested;
+  gboolean maintenance_active;
+  gboolean stop_timed_out;
+  guint stop_source_id;
+  GCancellable *stop_cancellable;
   guint restart_source_id;
 #if defined(G_OS_WIN32)
   HANDLE job_handle;
@@ -112,10 +109,27 @@ G_DEFINE_FINAL_TYPE(PumpkinServer, pumpkin_server, G_TYPE_OBJECT)
 
 enum {
   LOG_LINE,
+  SESSION_STARTED,
+  STATE_CHANGED,
+  PREPARE_START,
   LAST_SIGNAL
 };
 
 static guint signals[LAST_SIGNAL];
+
+static void
+clear_stop_request(PumpkinServer *self)
+{
+  if (self->stop_source_id != 0) {
+    g_source_remove(self->stop_source_id);
+    self->stop_source_id = 0;
+  }
+  if (self->stop_cancellable != NULL) {
+    g_cancellable_cancel(self->stop_cancellable);
+    g_clear_object(&self->stop_cancellable);
+  }
+  self->stop_timed_out = FALSE;
+}
 
 static void
 pumpkin_server_finalize(GObject *object)
@@ -139,6 +153,8 @@ pumpkin_server_finalize(GObject *object)
   g_clear_object(&self->process);
   g_clear_object(&self->stdout_dis);
   g_clear_object(&self->stderr_dis);
+  g_clear_object(&self->stdin_stream);
+  clear_stop_request(self);
   g_clear_object(&self->log_stream);
   g_clear_pointer(&self->log_path, g_free);
 #if defined(G_OS_WIN32)
@@ -181,6 +197,12 @@ pumpkin_server_class_init(PumpkinServerClass *class)
     1,
     G_TYPE_STRING
   );
+  signals[SESSION_STARTED] = g_signal_new("session-started", G_TYPE_FROM_CLASS(class),
+    G_SIGNAL_RUN_LAST, 0, NULL, NULL, g_cclosure_marshal_VOID__VOID, G_TYPE_NONE, 0);
+  signals[STATE_CHANGED] = g_signal_new("state-changed", G_TYPE_FROM_CLASS(class),
+    G_SIGNAL_RUN_LAST, 0, NULL, NULL, g_cclosure_marshal_VOID__VOID, G_TYPE_NONE, 0);
+  signals[PREPARE_START] = g_signal_new("prepare-start", G_TYPE_FROM_CLASS(class),
+    G_SIGNAL_RUN_LAST, 0, NULL, NULL, g_cclosure_marshal_VOID__VOID, G_TYPE_NONE, 0);
 }
 
 static void
@@ -193,8 +215,8 @@ pumpkin_server_init(PumpkinServer *self)
   self->max_cpu_cores = 0;
   self->max_ram_mb = 0;
   self->stats_sample_msec = SERVER_STATS_SAMPLE_MSEC_DEFAULT;
-  self->auto_restart = FALSE;
-  self->auto_restart_delay = 10000;
+  self->auto_restart = TRUE;
+  self->auto_restart_delay = PUMPKIN_AUTO_RESTART_DELAY_DEFAULT_MS;
   self->auto_update_enabled = FALSE;
   self->auto_update_use_schedule = FALSE;
   self->auto_update_hour = 1;
@@ -219,8 +241,8 @@ pumpkin_server_init(PumpkinServer *self)
 static int
 get_system_max_cores(void)
 {
-  int cores = g_get_num_processors();
-  return cores > 0 ? cores : 0;
+  guint cores = g_get_num_processors();
+  return cores > G_MAXINT ? G_MAXINT : (int)cores;
 }
 
 static int
@@ -354,6 +376,33 @@ server_ini_path(const char *dir)
 
 static gboolean
 ensure_dir(const char *path, GError **error);
+
+static void
+configure_java_runtime_env(GSubprocessLauncher *launcher)
+{
+#if defined(G_OS_WIN32)
+  (void)launcher;
+#else
+  if (launcher == NULL) {
+    return;
+  }
+
+  if (!g_file_test("/app/jre/bin/java", G_FILE_TEST_EXISTS)) {
+    return;
+  }
+
+  g_subprocess_launcher_setenv(launcher, "JAVA_HOME", "/app/jre", TRUE);
+  g_subprocess_launcher_setenv(launcher, "JDK_HOME", "/app/jre", TRUE);
+
+  const char *existing_path = g_getenv("PATH");
+  if (existing_path == NULL || *existing_path == '\0') {
+    g_subprocess_launcher_setenv(launcher, "PATH", "/app/jre/bin:/app/bin:/usr/bin", TRUE);
+  } else if (!g_str_has_prefix(existing_path, "/app/jre/bin:")) {
+    g_autofree char *combined = g_strdup_printf("/app/jre/bin:%s", existing_path);
+    g_subprocess_launcher_setenv(launcher, "PATH", combined, TRUE);
+  }
+#endif
+}
 
 static char *
 toml_replace_or_append(const char *contents, const char *key, const char *value_literal)
@@ -510,7 +559,7 @@ pumpkin_server_new(const char *id, const char *name)
   PumpkinServer *self = g_object_new(PUMPKIN_TYPE_SERVER, NULL);
   self->id = g_strdup(id);
   self->name = g_strdup(name);
-  self->download_url = g_strdup(default_download_url());
+  self->download_url = default_download_url();
   self->rcon_host = g_strdup("127.0.0.1");
   return self;
 }
@@ -552,7 +601,7 @@ pumpkin_server_load(const char *dir, GError **error)
   g_clear_pointer(&self->download_url, g_free);
   self->download_url = g_key_file_get_string(keyfile, "server", "download_url", NULL);
   if (self->download_url == NULL) {
-    self->download_url = g_strdup(default_download_url());
+    self->download_url = default_download_url();
   }
 
   g_clear_pointer(&self->installed_url, g_free);
@@ -665,7 +714,7 @@ pumpkin_server_load(const char *dir, GError **error)
     self->auto_restart_delay *= 1000;
   }
   if (self->auto_restart_delay <= 0) {
-    self->auto_restart_delay = 10000;
+    self->auto_restart_delay = PUMPKIN_AUTO_RESTART_DELAY_DEFAULT_MS;
   }
 
   if (g_key_file_has_key(keyfile, "server", "auto_update_enabled", NULL)) {
@@ -997,13 +1046,17 @@ void
 pumpkin_server_set_auto_restart(PumpkinServer *self, gboolean enabled)
 {
   self->auto_restart = enabled;
+  if (!enabled && self->restart_source_id != 0) {
+    g_source_remove(self->restart_source_id);
+    self->restart_source_id = 0;
+  }
 }
 
 void
-pumpkin_server_set_auto_restart_delay(PumpkinServer *self, int seconds)
+pumpkin_server_set_auto_restart_delay(PumpkinServer *self, int milliseconds)
 {
-  if (seconds > 0) {
-    self->auto_restart_delay = seconds;
+  if (milliseconds > 0) {
+    self->auto_restart_delay = milliseconds;
   }
 }
 
@@ -1254,6 +1307,7 @@ auto_restart_cb(gpointer data)
 {
   PumpkinServer *srv = PUMPKIN_SERVER(data);
   srv->restart_source_id = 0;
+  if (!srv->auto_restart || srv->stop_requested) return G_SOURCE_REMOVE;
   srv->stop_requested = FALSE;
   g_autoptr(GError) err = NULL;
   if (!pumpkin_server_start(srv, &err)) {
@@ -1261,7 +1315,6 @@ auto_restart_cb(gpointer data)
       g_signal_emit(srv, signals[LOG_LINE], 0, err->message);
     }
   }
-  g_object_unref(srv);
   return G_SOURCE_REMOVE;
 }
 
@@ -1299,7 +1352,6 @@ append_log_line(PumpkinServer *self, const char *line)
     return;
   }
 
-  ensure_log_stream(self);
   if (self->log_stream == NULL) {
     return;
   }
@@ -1309,6 +1361,45 @@ append_log_line(PumpkinServer *self, const char *line)
   g_output_stream_write_all(self->log_stream, "\n", 1, NULL, NULL, &error);
   g_output_stream_flush(self->log_stream, NULL, NULL);
 }
+
+static void
+log_session_event(PumpkinServer *self, const char *message)
+{
+  g_autoptr(GDateTime) now = g_date_time_new_now_utc();
+  g_autofree char *timestamp = g_date_time_format_iso8601(now);
+  g_autofree char *line = g_strdup_printf("%s INFO smashed_pumpkin: %s", timestamp, message);
+  append_log_line(self, line);
+}
+
+static void
+emit_server_notice(PumpkinServer *self, const char *level, const char *message)
+{
+  g_autoptr(GDateTime) now = g_date_time_new_now_utc();
+  g_autofree char *timestamp = g_date_time_format_iso8601(now);
+  g_autofree char *archived = g_strdup_printf("%s %s smashed_pumpkin: %s", timestamp, level, message);
+  append_log_line(self, archived);
+  g_autofree char *console = g_strdup_printf("[SMPK] [%s] %s", level, message);
+  g_signal_emit(self, signals[LOG_LINE], 0, console);
+}
+
+static void
+begin_log_session(PumpkinServer *self)
+{
+  g_clear_object(&self->log_stream);
+  ensure_log_stream(self);
+  log_session_event(self, "Server session started");
+  /* Reset attached consoles before any output from the new process is delivered. */
+  g_signal_emit(self, signals[SESSION_STARTED], 0);
+  if (self->log_stream == NULL) {
+    g_signal_emit(self, signals[LOG_LINE], 0,
+      "[WARN] Session logging is unavailable. Check the logs folder permissions.");
+  }
+}
+
+typedef struct {
+  PumpkinServer *server;
+  GOutputStream *log_stream;
+} OutputReader;
 
 static char *
 normalize_process_output_line(const char *line, gsize length)
@@ -1376,32 +1467,43 @@ static void
 read_line_cb(GObject *source, GAsyncResult *res, gpointer user_data)
 {
   GDataInputStream *dis = G_DATA_INPUT_STREAM(source);
-  PumpkinServer *self = PUMPKIN_SERVER(user_data);
+  OutputReader *reader = user_data;
+  PumpkinServer *self = reader->server;
   gsize length = 0;
   g_autofree char *raw_line = g_data_input_stream_read_line_finish(dis, res, &length, NULL);
   if (raw_line == NULL) {
-    g_object_unref(self);
+    g_clear_object(&reader->log_stream);
+    g_object_unref(reader->server);
+    g_free(reader);
     return;
   }
 
   g_autofree char *line = normalize_process_output_line(raw_line, length);
   if (line == NULL) {
-    read_stream_line(dis, self, NULL);
-    g_object_unref(self);
+    g_data_input_stream_read_line_async(dis, G_PRIORITY_DEFAULT, NULL, read_line_cb, reader);
     return;
   }
 
-  append_log_line(self, line);
-  g_signal_emit(self, signals[LOG_LINE], 0, line);
-  read_stream_line(dis, self, NULL);
-  g_object_unref(self);
+  /* Late output must stay in its original session, even across a rapid restart. */
+  if (reader->log_stream != NULL) {
+    g_autofree char *record = g_strconcat(line, "\n", NULL);
+    g_output_stream_write_all(reader->log_stream, record, strlen(record), NULL, NULL, NULL);
+    g_output_stream_flush(reader->log_stream, NULL, NULL);
+  }
+  if (dis == self->stdout_dis || dis == self->stderr_dis) {
+    g_signal_emit(self, signals[LOG_LINE], 0, line);
+  }
+  g_data_input_stream_read_line_async(dis, G_PRIORITY_DEFAULT, NULL, read_line_cb, reader);
 }
 
 static void
 read_stream_line(GDataInputStream *dis, PumpkinServer *self, const char *label)
 {
   (void)label;
-  g_data_input_stream_read_line_async(dis, G_PRIORITY_DEFAULT, NULL, read_line_cb, g_object_ref(self));
+  OutputReader *reader = g_new0(OutputReader, 1);
+  reader->server = g_object_ref(self);
+  reader->log_stream = self->log_stream != NULL ? g_object_ref(self->log_stream) : NULL;
+  g_data_input_stream_read_line_async(dis, G_PRIORITY_DEFAULT, NULL, read_line_cb, reader);
 }
 
 static void
@@ -1411,11 +1513,13 @@ pumpkin_server_attach_output(PumpkinServer *self)
   GInputStream *stderr_stream = g_subprocess_get_stderr_pipe(self->process);
 
   if (stdout_stream != NULL) {
+    g_clear_object(&self->stdout_dis);
     self->stdout_dis = g_data_input_stream_new(stdout_stream);
     read_stream_line(self->stdout_dis, self, "stdout");
   }
 
   if (stderr_stream != NULL) {
+    g_clear_object(&self->stderr_dis);
     self->stderr_dis = g_data_input_stream_new(stderr_stream);
     read_stream_line(self->stderr_dis, self, "stderr");
   }
@@ -1425,6 +1529,8 @@ pumpkin_server_attach_output(PumpkinServer *self)
 static void
 pumpkin_server_handle_exit(PumpkinServer *self, const char *message)
 {
+  clear_stop_request(self);
+  log_session_event(self, message != NULL ? message : "Server process exited");
   g_clear_object(&self->process);
   g_clear_object(&self->stdout_dis);
   g_clear_object(&self->stderr_dis);
@@ -1453,11 +1559,13 @@ pumpkin_server_handle_exit(PumpkinServer *self, const char *message)
   }
 
   if (self->auto_restart && !self->stop_requested) {
-    guint delay = self->auto_restart_delay > 0 ? (guint)self->auto_restart_delay : 10000;
+    guint delay = self->auto_restart_delay > 0 ? (guint)self->auto_restart_delay : PUMPKIN_AUTO_RESTART_DELAY_DEFAULT_MS;
     g_signal_emit(self, signals[LOG_LINE], 0, "Auto-restart scheduled");
-    self->restart_source_id = g_timeout_add(delay, auto_restart_cb, g_object_ref(self));
+    self->restart_source_id = g_timeout_add_full(G_PRIORITY_DEFAULT, delay,
+      auto_restart_cb, g_object_ref(self), g_object_unref);
   }
 
+  g_signal_emit(self, signals[STATE_CHANGED], 0);
   g_signal_emit(self, signals[LOG_LINE], 0, message != NULL ? message : "Server process exited");
 }
 
@@ -1563,6 +1671,7 @@ pumpkin_server_start_windows(PumpkinServer *self,
   stdout_read = NULL;
   stderr_read = NULL;
 
+  begin_log_session(self);
   read_stream_line(self->stdout_dis, self, "stdout");
   read_stream_line(self->stderr_dis, self, "stderr");
   self->process_watch_source_id = g_timeout_add(500, process_watch_cb, g_object_ref(self));
@@ -1603,6 +1712,7 @@ pumpkin_server_start_windows(PumpkinServer *self,
     }
   }
 
+  g_signal_emit(self, signals[STATE_CHANGED], 0);
   return TRUE;
 
 fail:
@@ -1623,8 +1733,12 @@ process_wait_cb(GObject *source, GAsyncResult *res, gpointer user_data)
   PumpkinServer *self = PUMPKIN_SERVER(user_data);
   g_autoptr(GError) error = NULL;
 
+  gboolean waited = g_subprocess_wait_finish(G_SUBPROCESS(source), res, &error);
+  clear_stop_request(self);
+  log_session_event(self, "Server process exited");
+
   g_clear_object(&self->process);
-  self->stdin_stream = NULL;
+  g_clear_object(&self->stdin_stream);
   self->pid = 0;
   if (self->log_stream != NULL) {
     g_output_stream_flush(self->log_stream, NULL, NULL);
@@ -1637,24 +1751,42 @@ process_wait_cb(GObject *source, GAsyncResult *res, gpointer user_data)
   }
 
   if (self->auto_restart && !self->stop_requested) {
-    guint delay = self->auto_restart_delay > 0 ? (guint)self->auto_restart_delay : 10000;
+    guint delay = self->auto_restart_delay > 0 ? (guint)self->auto_restart_delay : PUMPKIN_AUTO_RESTART_DELAY_DEFAULT_MS;
     g_signal_emit(self, signals[LOG_LINE], 0, "Auto-restart scheduled");
-    self->restart_source_id = g_timeout_add(delay, auto_restart_cb, g_object_ref(self));
+    self->restart_source_id = g_timeout_add_full(G_PRIORITY_DEFAULT, delay,
+      auto_restart_cb, g_object_ref(self), g_object_unref);
   }
 
-  if (!g_subprocess_wait_finish(G_SUBPROCESS(source), res, &error)) {
+  if (!waited) {
     if (error != NULL) {
       g_signal_emit(self, signals[LOG_LINE], 0, error->message);
     }
   } else {
     g_signal_emit(self, signals[LOG_LINE], 0, "Server process exited");
   }
+  g_signal_emit(self, signals[STATE_CHANGED], 0);
+  g_object_unref(self);
 }
 #endif
 
 gboolean
 pumpkin_server_start(PumpkinServer *self, GError **error)
 {
+  if (self->maintenance_active) {
+    g_set_error_literal(error, G_IO_ERROR, G_IO_ERROR_BUSY, "Server maintenance is in progress");
+    return FALSE;
+  }
+  if (pumpkin_server_get_stopping(self)) {
+    g_set_error_literal(error, G_IO_ERROR, G_IO_ERROR_BUSY, "Server is still stopping");
+    return FALSE;
+  }
+#if defined(__ANDROID__)
+  g_set_error(error,
+              G_IO_ERROR,
+              G_IO_ERROR_NOT_SUPPORTED,
+              "Local Pumpkin hosting is not supported on Android yet");
+  return FALSE;
+#else
   if (self->process != NULL
 #if defined(G_OS_WIN32)
       || self->process_handle != NULL
@@ -1663,7 +1795,9 @@ pumpkin_server_start(PumpkinServer *self, GError **error)
     return TRUE;
   }
 
+  clear_stop_request(self);
   self->stop_requested = FALSE;
+  pumpkin_command_tracking_reset(G_OBJECT(self));
   if (self->restart_source_id != 0) {
     g_source_remove(self->restart_source_id);
     self->restart_source_id = 0;
@@ -1678,8 +1812,10 @@ pumpkin_server_start(PumpkinServer *self, GError **error)
   if (!sync_pumpkin_basic_configuration(self, error)) {
     return FALSE;
   }
+  /* All start paths, including the backend's crash restart, share this hook.
+   * Handlers may perform bounded local preparation while the process is stopped. */
+  g_signal_emit(self, signals[PREPARE_START], 0);
 
-  ensure_log_stream(self);
   g_autofree char *data_dir = pumpkin_server_get_data_dir(self);
   int max_cpu = clamp_cpu_cores(self->max_cpu_cores);
   int max_ram = clamp_ram_mb(self->max_ram_mb);
@@ -1692,6 +1828,7 @@ pumpkin_server_start(PumpkinServer *self, GError **error)
     G_SUBPROCESS_FLAGS_STDOUT_PIPE | G_SUBPROCESS_FLAGS_STDERR_PIPE | G_SUBPROCESS_FLAGS_STDIN_PIPE
   );
   g_subprocess_launcher_set_cwd(launcher, data_dir);
+  configure_java_runtime_env(launcher);
   if (max_cpu > 0) {
     g_autofree char *num = g_strdup_printf("%d", max_cpu);
     g_subprocess_launcher_setenv(launcher, "RAYON_NUM_THREADS", num, TRUE);
@@ -1711,43 +1848,144 @@ pumpkin_server_start(PumpkinServer *self, GError **error)
     return FALSE;
   }
 
-  self->stdin_stream = g_subprocess_get_stdin_pipe(self->process);
+  self->stdin_stream = g_object_ref(g_subprocess_get_stdin_pipe(self->process));
   const char *pid_str = g_subprocess_get_identifier(self->process);
   if (pid_str != NULL) {
     self->pid = (int)g_ascii_strtoll(pid_str, NULL, 10);
   } else {
     self->pid = 0;
   }
+  begin_log_session(self);
   pumpkin_server_attach_output(self);
-  g_subprocess_wait_async(self->process, NULL, process_wait_cb, self);
+  g_subprocess_wait_async(self->process, NULL, process_wait_cb, g_object_ref(self));
+  g_signal_emit(self, signals[STATE_CHANGED], 0);
   return TRUE;
 #endif
+#endif
+}
+
+static gboolean
+stop_deadline_cb(gpointer data)
+{
+  PumpkinServer *self = PUMPKIN_SERVER(data);
+  self->stop_source_id = 0;
+  if (pumpkin_server_get_running(self)) {
+    self->stop_timed_out = TRUE;
+    g_cancellable_cancel(self->stop_cancellable);
+    g_signal_emit(self, signals[STATE_CHANGED], 0);
+    g_autofree char *message = g_strdup_printf(
+      "Server has not stopped after %d seconds. Wait or explicitly force stop; data may still be saving.",
+      PUMPKIN_STOP_TIMEOUT_SECONDS);
+    emit_server_notice(self, "WARN", message);
+  }
+  return G_SOURCE_REMOVE;
+}
+
+static void
+stop_written_cb(GObject *source, GAsyncResult *result, gpointer data)
+{
+  g_autoptr(PumpkinServer) self = PUMPKIN_SERVER(data);
+  g_autoptr(GError) error = NULL;
+  if (!g_output_stream_write_all_finish(G_OUTPUT_STREAM(source), result, NULL, &error) &&
+      self->stdin_stream == G_OUTPUT_STREAM(source) &&
+      pumpkin_server_get_stopping(self) &&
+      !g_error_matches(error, G_IO_ERROR, G_IO_ERROR_CANCELLED)) {
+    self->stop_timed_out = TRUE;
+    g_signal_emit(self, signals[STATE_CHANGED], 0);
+    g_autofree char *message = g_strdup_printf("Cannot send stop command: %s. Force stop requires confirmation.", error->message);
+    emit_server_notice(self, "ERROR", message);
+  }
 }
 
 void
 pumpkin_server_stop(PumpkinServer *self)
 {
-  if (self->process == NULL
-#if defined(G_OS_WIN32)
-      && self->process_handle == NULL
-#endif
-  ) {
-    return;
-  }
-
-  self->stop_requested = TRUE;
+  g_return_if_fail(PUMPKIN_IS_SERVER(self));
   if (self->restart_source_id != 0) {
     g_source_remove(self->restart_source_id);
     self->restart_source_id = 0;
   }
+  if (!pumpkin_server_get_running(self) || self->stop_requested) {
+    self->stop_requested = TRUE;
+    return;
+  }
 
+  self->stop_requested = TRUE;
+  self->stop_cancellable = g_cancellable_new();
+  self->stop_source_id = g_timeout_add_seconds_full(G_PRIORITY_DEFAULT, PUMPKIN_STOP_TIMEOUT_SECONDS,
+    stop_deadline_cb, g_object_ref(self), g_object_unref);
+  emit_server_notice(self, "INFO", "Stopping server: waiting for saved data and process exit.");
+  if (self->stdin_stream == NULL) {
+    self->stop_timed_out = TRUE;
+    g_signal_emit(self, signals[STATE_CHANGED], 0);
+    emit_server_notice(self, "ERROR", "Server input is unavailable. Force stop requires confirmation.");
+    return;
+  }
+  /* The static buffer remains valid until the asynchronous write completes. */
+  g_output_stream_write_all_async(self->stdin_stream, "stop\n", 5,
+    G_PRIORITY_DEFAULT, self->stop_cancellable, stop_written_cb, g_object_ref(self));
+  g_signal_emit(self, signals[STATE_CHANGED], 0);
+}
+
+void
+pumpkin_server_force_stop(PumpkinServer *self)
+{
+  g_return_if_fail(PUMPKIN_IS_SERVER(self));
+  pumpkin_server_stop(self);
+  if (!pumpkin_server_get_running(self)) {
+    return;
+  }
+  clear_stop_request(self);
+  emit_server_notice(self, "WARN", "Server force-stopped by user; unsaved data may be lost.");
 #if defined(G_OS_WIN32)
   if (self->process_handle != NULL) {
     TerminateProcess(self->process_handle, 0);
   }
 #else
-  g_subprocess_send_signal(self->process, SIGTERM);
+  g_subprocess_force_exit(self->process);
 #endif
+}
+
+gboolean
+pumpkin_server_get_stopping(PumpkinServer *self)
+{
+  return self->stop_requested && pumpkin_server_get_running(self);
+}
+
+gboolean
+pumpkin_server_get_stop_timed_out(PumpkinServer *self)
+{
+  return pumpkin_server_get_stopping(self) && self->stop_timed_out;
+}
+
+gboolean
+pumpkin_server_begin_maintenance(PumpkinServer *self, GError **error)
+{
+  if (self->restart_source_id != 0) {
+    g_set_error_literal(error, G_IO_ERROR, G_IO_ERROR_BUSY, "An automatic restart is pending");
+    return FALSE;
+  }
+  if (self->maintenance_active) {
+    g_set_error_literal(error, G_IO_ERROR, G_IO_ERROR_BUSY, "Server maintenance is already in progress");
+    return FALSE;
+  }
+  self->maintenance_active = TRUE;
+  g_signal_emit(self, signals[STATE_CHANGED], 0);
+  return TRUE;
+}
+
+void
+pumpkin_server_end_maintenance(PumpkinServer *self)
+{
+  if (!self->maintenance_active) return;
+  self->maintenance_active = FALSE;
+  g_signal_emit(self, signals[STATE_CHANGED], 0);
+}
+
+gboolean
+pumpkin_server_get_maintenance(PumpkinServer *self)
+{
+  return self->maintenance_active;
 }
 
 gboolean
@@ -1760,9 +1998,13 @@ pumpkin_server_get_running(PumpkinServer *self)
 #endif
 }
 
-gboolean
-pumpkin_server_send_command(PumpkinServer *self, const char *command, GError **error)
+static gboolean
+send_console_command(PumpkinServer *self, const char *command, gboolean automatic, GError **error)
 {
+  if (pumpkin_server_get_stopping(self)) {
+    g_set_error_literal(error, G_IO_ERROR, G_IO_ERROR_CLOSED, "Server is stopping");
+    return FALSE;
+  }
   if (self->stdin_stream == NULL
 #if defined(G_OS_WIN32)
       || self->process_handle == NULL
@@ -1782,6 +2024,22 @@ pumpkin_server_send_command(PumpkinServer *self, const char *command, GError **e
   if (!g_output_stream_write_all(self->stdin_stream, line, strlen(line), &written, NULL, error)) {
     return FALSE;
   }
+  pumpkin_command_track(G_OBJECT(self), command, automatic, g_get_monotonic_time());
   g_output_stream_flush(self->stdin_stream, NULL, NULL);
   return TRUE;
+}
+
+gboolean
+pumpkin_server_send_command(PumpkinServer *self, const char *command, GError **error)
+{
+  return send_console_command(self, command, FALSE, error);
+}
+
+gboolean
+pumpkin_server_send_poll_command(PumpkinServer *self, const char *command)
+{
+  if (!pumpkin_command_poll_ready(G_OBJECT(self), command, g_get_monotonic_time())) {
+    return FALSE;
+  }
+  return send_console_command(self, command, TRUE, NULL);
 }

@@ -258,7 +258,7 @@ pumpkin_parse_player_list_snapshot_line(const char *line, int *out_count, char *
   }
 
   g_autoptr(GRegex) list_re =
-    g_regex_new("there\\s+are\\s+([0-9]+)\\s+of\\s+a\\s+max\\s+of\\s+[0-9]+\\s+players\\s+online\\s*:?\\s*(.*)$",
+    g_regex_new("^there\\s+are\\s+([0-9]+)\\s+of\\s+a\\s+max\\s+of\\s+[0-9]+\\s+players\\s+online\\s*:?\\s*(.*)$",
                 G_REGEX_CASELESS, 0, NULL);
   g_autoptr(GMatchInfo) match = NULL;
   if (!g_regex_match(list_re, line, 0, &match)) {
@@ -267,11 +267,10 @@ pumpkin_parse_player_list_snapshot_line(const char *line, int *out_count, char *
 
   g_autofree char *count_txt = g_match_info_fetch(match, 1);
   g_autofree char *names_txt = g_match_info_fetch(match, 2);
-  if (count_txt != NULL && out_count != NULL) {
-    *out_count = (int)strtol(count_txt, NULL, 10);
-    if (*out_count < 0) {
-      *out_count = 0;
-    }
+  if (count_txt != NULL) {
+    guint64 count = g_ascii_strtoull(count_txt, NULL, 10);
+    if (count > G_MAXINT) return FALSE;
+    if (out_count != NULL) *out_count = (int)count;
   }
   if (out_names_csv != NULL && names_txt != NULL) {
     g_strstrip(names_txt);

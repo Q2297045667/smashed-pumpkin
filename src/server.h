@@ -1,8 +1,10 @@
 #pragma once
 
-#include <adwaita.h>
+#include <gio/gio.h>
 
 G_BEGIN_DECLS
+
+#define PUMPKIN_AUTO_RESTART_DELAY_DEFAULT_MS 4000
 
 #define PUMPKIN_TYPE_SERVER (pumpkin_server_get_type())
 G_DECLARE_FINAL_TYPE(PumpkinServer, pumpkin_server, PUMPKIN, SERVER, GObject)
@@ -14,7 +16,14 @@ gboolean pumpkin_server_save(PumpkinServer *self, GError **error);
 
 gboolean pumpkin_server_start(PumpkinServer *self, GError **error);
 void pumpkin_server_stop(PumpkinServer *self);
+void pumpkin_server_force_stop(PumpkinServer *self);
+gboolean pumpkin_server_get_stopping(PumpkinServer *self);
+gboolean pumpkin_server_get_stop_timed_out(PumpkinServer *self);
+gboolean pumpkin_server_begin_maintenance(PumpkinServer *self, GError **error);
+void pumpkin_server_end_maintenance(PumpkinServer *self);
+gboolean pumpkin_server_get_maintenance(PumpkinServer *self);
 gboolean pumpkin_server_send_command(PumpkinServer *self, const char *command, GError **error);
+gboolean pumpkin_server_send_poll_command(PumpkinServer *self, const char *command);
 
 const char *pumpkin_server_get_id(PumpkinServer *self);
 const char *pumpkin_server_get_name(PumpkinServer *self);
@@ -58,7 +67,7 @@ void pumpkin_server_set_installed_url(PumpkinServer *self, const char *url);
 void pumpkin_server_set_installed_build_id(PumpkinServer *self, const char *build_id);
 void pumpkin_server_set_installed_build_label(PumpkinServer *self, const char *build_label);
 void pumpkin_server_set_auto_restart(PumpkinServer *self, gboolean enabled);
-void pumpkin_server_set_auto_restart_delay(PumpkinServer *self, int seconds);
+void pumpkin_server_set_auto_restart_delay(PumpkinServer *self, int milliseconds);
 void pumpkin_server_set_auto_update_enabled(PumpkinServer *self, gboolean enabled);
 void pumpkin_server_set_auto_update_use_schedule(PumpkinServer *self, gboolean enabled);
 void pumpkin_server_set_auto_update_hour(PumpkinServer *self, int hour);

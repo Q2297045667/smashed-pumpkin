@@ -4,6 +4,7 @@
     <file preprocess="xml-stripblanks">ui/window.ui</file>
     <file preprocess="xml-stripblanks">ui/window-windows.ui</file>
     <file>style.css</file>
+    <file>plugins/map-bridge.wasm</file>
     <file>store/org.gnome.Software.svg</file>
     <file>store/org.kde.discover.svg</file>
     <file>icons/hicolor/symbolic/apps/dev.rotstein.SmashedPumpkin-stats-symbolic.svg</file>

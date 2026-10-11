@@ -1,21 +1,60 @@
-adw_dep = dependency('libadwaita-1', version: '>= 1.5')
-Gtk_dep = dependency('gtk4', version: '>= 4.12')
-soup_dep = dependency('libsoup-3.0', version: '>= 3.4')
+android_host = host_machine.system() == 'android'
+
+if android_host and not meson.version().version_compare('>=1.9.0')
+  error('Android builds require Meson >= 1.9.0 for android_exe_type support')
+endif
+
+if android_host
+  adw_dep = dependency('libadwaita-1',
+    version: '>= 1.5',
+    fallback: ['libadwaita', 'libadwaita_dep'])
+  Gtk_dep = dependency('gtk4', version: '>= 4.12')
+  soup_dep = dependency('libsoup-3.0',
+    version: '>= 3.4',
+    fallback: ['libsoup', 'libsoup_dep'])
+else
+  adw_dep = dependency('libadwaita-1', version: '>= 1.5')
+  Gtk_dep = dependency('gtk4', version: '>= 4.12')
+  soup_dep = dependency('libsoup-3.0', version: '>= 3.4')
+endif
 psapi_dep = dependency('psapi', required: false)
 cc = meson.get_compiler('c')
 math_dep = cc.find_library('m', required: false)
 shell32_dep = cc.find_library('shell32', required: host_machine.system() == 'windows')
 user32_dep = cc.find_library('user32', required: host_machine.system() == 'windows')
 dwmapi_dep = cc.find_library('dwmapi', required: host_machine.system() == 'windows')
+crypt32_dep = cc.find_library('crypt32', required: host_machine.system() == 'windows')
+gmodule_dep = dependency('gmodule-2.0')
+platform_credential_deps = []
+if host_machine.system() == 'darwin'
+  platform_credential_deps += dependency('appleframeworks', modules: ['Security'])
+endif
 
 app_id = 'dev.rotstein.SmashedPumpkin'
 
 inc = include_directories('.')
 
+# cJSON uses strtod internally; without locale support JSON decimals fail in
+# locales such as de_DE. Keep the upstream default enabled for every consumer.
+cjson_library = static_library('smashed-pumpkin-json',
+  'vendor/cjson/cJSON.c',
+  c_args: ['-DENABLE_LOCALES'],
+  install: false)
+cjson_dep = declare_dependency(link_with: cjson_library, dependencies: math_dep)
+
 conf = configuration_data()
 conf.set_quoted('APP_ID', app_id)
 conf.set_quoted('APP_NAME', 'Smashed Pumpkin')
 conf.set_quoted('APP_VERSION', meson.project_version())
+
+startup_deps = []
+if host_machine.system() == 'linux'
+  startup_x11_dep = dependency('x11', required: false)
+  if startup_x11_dep.found() and cc.has_header('gdk/x11/gdkx.h', dependencies: Gtk_dep)
+    conf.set('HAVE_STARTUP_X11', 1)
+    startup_deps += startup_x11_dep
+  endif
+endif
 
 config_h = configure_file(
   output: 'config.h',
@@ -55,14 +94,46 @@ if host_machine.system() == 'windows'
 endif
 
 sources = [
+  'release-channel.c',
+  'release-channel.h',
+  'release-metadata.c',
+  'release-metadata.h',
+  'minimap-model.c',
+  'minimap-model.h',
+  'minimap-store.c',
+  'minimap-store.h',
+  'minimap-bridge-control.c',
+  'minimap-bridge-control.h',
+  'minimap-terrain.c',
+  'minimap-terrain.h',
+  'minimap-cache.c',
+  'minimap-cache.h',
+  'minimap-motion.c',
+  'minimap-motion.h',
+  'minimap-render.c',
+  'minimap-render.h',
+  'window-minimap.c',
+  'window-minimap.h',
+  'world-store.c',
+  'world-store.h',
+  'window-worlds.c',
+  'window-worlds.h',
+  'refresh-button.c',
+  'refresh-button.h',
   'app-config.c',
   'app-config.h',
+  'window-startup.c',
+  'window-startup.h',
+  'window-dialogs.c',
+  'window-dialogs.h',
   'main.c',
   'app.c',
   'app.h',
   'window-internal.h',
   'window-lifecycle.c',
   'window-lifecycle.h',
+  'window-server-actions.c',
+  'window-server-actions.h',
   'window-console.c',
   'window-console.h',
   'window-networks.c',
@@ -71,18 +142,36 @@ sources = [
   'window-player-data.h',
   'window-players.c',
   'window-players.h',
+  'window-player-events.c',
+  'player-protocol.c',
+  'player-protocol.h',
+  'player-heads.c',
+  'player-heads.h',
   'window-parse.c',
   'window-parse.h',
   'window-protocol.c',
   'window-protocol.h',
   'window.c',
+  'marketplace-request.c',
+  'marketplace-request.h',
   'window.h',
   'server.c',
   'server.h',
+  'server-maintenance.c',
+  'server-maintenance.h',
+  'server-command-tracker.c',
+  'server-command-tracker.h',
   'server-store.c',
   'server-store.h',
   'download.c',
   'download.h',
+  'marketplace-credentials.c',
+  'marketplace-credentials.h',
+  'plugin-store.c',
+  'plugin-store.h',
+  'marketplace-auth.c',
+  'marketplace-auth.h',
+  'vendor/tomlc17/tomlc17.c',
   config_h,
   resources,
   windows_resources,
@@ -98,16 +187,105 @@ install_data(join_paths('..', 'resources', 'icons', 'hicolor', '512x512', 'apps'
                         'dev.rotstein.SmashedPumpkin.png'),
              install_dir: join_paths(get_option('datadir'), 'icons', 'hicolor', '512x512', 'apps'))
 
-executable(
-  'smashed-pumpkin',
-  sources,
-  include_directories: inc,
-  dependencies: [adw_dep, Gtk_dep, soup_dep, psapi_dep, math_dep, shell32_dep, dwmapi_dep],
-  win_subsystem: host_machine.system() == 'windows' ? 'windows' : 'console',
-  install: true
-)
+if android_host
+  executable(
+    'smashed-pumpkin',
+    sources,
+    include_directories: inc,
+    dependencies: [adw_dep, Gtk_dep, soup_dep, psapi_dep, math_dep, shell32_dep, user32_dep, dwmapi_dep, crypt32_dep, gmodule_dep, cjson_dep] + platform_credential_deps + startup_deps,
+    android_exe_type: 'application',
+    install: true
+  )
+else
+  executable(
+    'smashed-pumpkin',
+    sources,
+    include_directories: inc,
+    dependencies: [adw_dep, Gtk_dep, soup_dep, psapi_dep, math_dep, shell32_dep, user32_dep, dwmapi_dep, crypt32_dep, gmodule_dep, cjson_dep] + platform_credential_deps + startup_deps,
+    win_subsystem: host_machine.system() == 'windows' ? 'windows' : 'console',
+    install: true
+  )
+endif
 
 gtk3_dep = dependency('gtk+-3.0', required: false)
+if not meson.is_cross_build()
+  release_download_tests = executable('test-release-download',
+    ['../tests/test-release-download.c', 'release-channel.c', 'release-metadata.c', 'download.c'],
+    include_directories: inc,
+    dependencies: [dependency('gio-2.0'), soup_dep, math_dep, cjson_dep], install: false)
+  test('release-download', release_download_tests)
+  minimap_tests = executable('test-minimap',
+    ['../tests/test-minimap.c', 'minimap-model.c', 'minimap-store.c', 'minimap-terrain.c', 'minimap-cache.c', 'minimap-motion.c', 'minimap-render.c', 'vendor/tomlc17/tomlc17.c'],
+    include_directories: inc,
+    dependencies: [dependency('gio-2.0'), dependency('cairo'), math_dep, cjson_dep], install: false)
+  test('minimap', minimap_tests,
+    env: {'SMASHED_BUNDLED_BRIDGE_SAMPLE': meson.project_source_root() / 'resources/plugins/map-bridge.wasm'})
+  terrain_tests = executable('test-minimap-terrain',
+    ['../tests/test-minimap-terrain.c', 'minimap-terrain.c'],
+    include_directories: inc,
+    dependencies: [dependency('gio-2.0'), dependency('cairo'), math_dep], install: false)
+  test('minimap-terrain', terrain_tests)
+  world_store_tests = executable('test-world-store',
+    ['../tests/test-world-store.c', 'world-store.c', 'vendor/tomlc17/tomlc17.c'],
+    include_directories: inc,
+    dependencies: [dependency('gio-2.0'), math_dep], install: false)
+  test('world-store', world_store_tests)
+  player_protocol_tests = executable('test-player-protocol',
+    ['../tests/test-player-protocol.c', 'player-protocol.c', 'window-protocol.c'],
+    include_directories: inc,
+    dependencies: [dependency('gio-2.0'), cjson_dep],
+    install: false)
+  test('player-protocol', player_protocol_tests)
+  startup_config_tests = executable('test-startup-config',
+    ['../tests/test-startup-config.c', 'app-config.c', 'release-channel.c'],
+    include_directories: inc,
+    dependencies: [dependency('gio-2.0')],
+    install: false)
+  test('startup-config', startup_config_tests)
+  plugin_store_tests = executable('test-plugin-store',
+    ['../tests/test-plugin-store.c', 'plugin-store.c', 'marketplace-auth.c',
+     'vendor/tomlc17/tomlc17.c'],
+    include_directories: inc,
+    dependencies: [dependency('gio-2.0'), math_dep, cjson_dep],
+    install: false)
+  test('plugin-store', plugin_store_tests)
+  marketplace_request_tests = executable('test-marketplace-request',
+    ['../tests/test-marketplace-request.c', 'marketplace-request.c'],
+    include_directories: inc,
+    dependencies: [soup_dep, dependency('gio-2.0')],
+    install: false)
+  test('marketplace-request', marketplace_request_tests)
+  marketplace_json_tests = executable('test-marketplace-json',
+    '../tests/test-marketplace-json.c',
+    include_directories: inc,
+    dependencies: [dependency('glib-2.0'), cjson_dep],
+    install: false)
+  test('marketplace-json', marketplace_json_tests)
+  command_tracker_tests = executable('test-server-command-tracker',
+    ['../tests/test-server-command-tracker.c', 'server-command-tracker.c'],
+    include_directories: inc,
+    dependencies: [dependency('gobject-2.0')], install: false)
+  test('server-command-tracker', command_tracker_tests)
+  if host_machine.system() == 'linux'
+    managed_server_fixture = executable('fake-managed-server',
+      '../tests/fake-managed-server.c',
+      dependencies: [dependency('glib-2.0')], install: false)
+    maintenance_tests = executable('test-server-maintenance',
+      ['../tests/test-server-maintenance.c', 'server-maintenance.c', 'server.c', 'server-command-tracker.c', 'release-channel.c'],
+      include_directories: inc,
+      c_args: ['-DPUMPKIN_STOP_TIMEOUT_SECONDS=1'],
+      dependencies: [dependency('gio-2.0')], install: false)
+    test('server-maintenance', maintenance_tests, args: [managed_server_fixture])
+    bridge_control_tests = executable('test-minimap-bridge-control',
+      ['../tests/test-minimap-bridge-control.c', 'minimap-bridge-control.c', 'minimap-store.c',
+       'minimap-model.c', 'server.c', 'server-command-tracker.c', 'release-channel.c', 'vendor/tomlc17/tomlc17.c'],
+      include_directories: inc,
+      dependencies: [dependency('gio-2.0'), dependency('cairo'), math_dep, cjson_dep], install: false)
+    test('minimap-bridge-control', bridge_control_tests, args: [managed_server_fixture],
+      env: {'SMASHED_BUNDLED_BRIDGE_SAMPLE': meson.project_source_root() / 'resources/plugins/map-bridge.wasm'})
+  endif
+endif
+
 appindicator_dep = dependency('ayatana-appindicator3-0.1', required: false)
 if not appindicator_dep.found()
   appindicator_dep = dependency('appindicator3-0.1', required: false)
@@ -116,7 +294,7 @@ endif
 if host_machine.system() == 'linux' and gtk3_dep.found() and appindicator_dep.found()
   executable(
     'smashed-pumpkin-tray',
-    ['tray.c', 'app-config.c', 'app-config.h', config_h, resources],
+    ['tray.c', 'app-config.c', 'app-config.h', 'release-channel.c', config_h, resources],
     include_directories: inc,
     dependencies: [gtk3_dep, appindicator_dep],
     install: true

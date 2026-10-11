@@ -1,8 +1,10 @@
 #include "window-console.h"
 
 #include "window-protocol.h"
+#include "player-protocol.h"
 
 static char *sanitize_console_text(const char *line);
+static ConsoleLevel console_level_from_text(const char *level_text);
 
 static const char *
 console_level_token_tag_name(ConsoleLevel level)
@@ -39,46 +41,27 @@ apply_console_tag_offsets(GtkTextBuffer *buffer, int line_start_offset, int star
   gtk_text_buffer_apply_tag_by_name(buffer, tag_name, &iter_start, &iter_end);
 }
 
-static void
+void
 apply_console_inline_tags(GtkTextBuffer *buffer, int line_start_offset, const char *display, ConsoleLevel level)
 {
   if (buffer == NULL || display == NULL || *display == '\0') {
     return;
   }
 
-  const char *level_word = NULL;
-  switch (level) {
-    case CONSOLE_LEVEL_TRACE:
-      level_word = "TRACE";
-      break;
-    case CONSOLE_LEVEL_DEBUG:
-      level_word = "DEBUG";
-      break;
-    case CONSOLE_LEVEL_INFO:
-      level_word = "INFO";
-      break;
-    case CONSOLE_LEVEL_WARN:
-      level_word = "WARN";
-      break;
-    case CONSOLE_LEVEL_ERROR:
-      level_word = "ERROR";
-      break;
-    case CONSOLE_LEVEL_SMPK:
-      level_word = "SMPK";
-      break;
-    case CONSOLE_LEVEL_OTHER:
-    default:
-      break;
+  static GRegex *level_re = NULL;
+  if (level_re == NULL) {
+    level_re = g_regex_new("\\[(TRACE|DEBUG|INFO|WARN(?:ING)?|ERROR|FATAL|CRITICAL|SMPK)\\]",
+                          G_REGEX_OPTIMIZE | G_REGEX_CASELESS, 0, NULL);
   }
-
+  g_autoptr(GMatchInfo) level_match = NULL;
   const char *level_tag_name = console_level_token_tag_name(level);
-  if (level_word != NULL && level_tag_name != NULL) {
-    g_autofree char *level_token = g_strdup_printf("[%s]", level_word);
-    const char *token_pos = level_token != NULL ? strstr(display, level_token) : NULL;
-    if (token_pos != NULL) {
-      int token_start = (int)(token_pos - display) + 1;
-      int token_end = token_start + (int)strlen(level_word);
-      apply_console_tag_offsets(buffer, line_start_offset, token_start, token_end, level_tag_name);
+  if (level_tag_name != NULL && g_regex_match(level_re, display, 0, &level_match)) {
+    g_autofree char *word = g_match_info_fetch(level_match, 1);
+    int start, end;
+    if (console_level_from_text(word) == level && g_match_info_fetch_pos(level_match, 1, &start, &end)) {
+      apply_console_tag_offsets(buffer, line_start_offset,
+        (int)g_utf8_pointer_to_offset(display, display + start),
+        (int)g_utf8_pointer_to_offset(display, display + end), level_tag_name);
     }
   }
 
@@ -96,10 +79,20 @@ apply_console_inline_tags(GtkTextBuffer *buffer, int line_start_offset, const ch
     int start = -1;
     int end = -1;
     if (g_match_info_fetch_pos(match, 0, &start, &end) && start >= 0 && end > start) {
-      apply_console_tag_offsets(buffer, line_start_offset, start, end, "console-token-startup-ms");
+      apply_console_tag_offsets(buffer, line_start_offset,
+        (int)g_utf8_pointer_to_offset(display, display + start),
+        (int)g_utf8_pointer_to_offset(display, display + end), "console-token-startup-ms");
     }
     if (!g_match_info_next(match, NULL)) {
       break;
+    }
+  }
+
+  if (display[0] == '[' && g_ascii_isdigit(display[1])) {
+    const char *close = strchr(display, ']');
+    if (close != NULL) {
+      apply_console_tag_offsets(buffer, line_start_offset, 0,
+        (int)g_utf8_pointer_to_offset(display, close + 1), "console-token-timestamp");
     }
   }
 }
@@ -135,22 +128,23 @@ console_level_from_text(const char *level_text)
     return CONSOLE_LEVEL_OTHER;
   }
   g_autofree char *lower = g_ascii_strdown(level_text, -1);
-  if (g_str_has_prefix(lower, "trace")) {
+  if (g_strcmp0(lower, "trace") == 0) {
     return CONSOLE_LEVEL_TRACE;
   }
-  if (g_str_has_prefix(lower, "debug")) {
+  if (g_strcmp0(lower, "debug") == 0) {
     return CONSOLE_LEVEL_DEBUG;
   }
-  if (g_str_has_prefix(lower, "info")) {
+  if (g_strcmp0(lower, "info") == 0) {
     return CONSOLE_LEVEL_INFO;
   }
-  if (g_str_has_prefix(lower, "warn")) {
+  if (g_strcmp0(lower, "warn") == 0 || g_strcmp0(lower, "warning") == 0) {
     return CONSOLE_LEVEL_WARN;
   }
-  if (g_str_has_prefix(lower, "error")) {
+  if (g_strcmp0(lower, "error") == 0 || g_strcmp0(lower, "fatal") == 0 ||
+      g_strcmp0(lower, "critical") == 0) {
     return CONSOLE_LEVEL_ERROR;
   }
-  if (g_str_has_prefix(lower, "smpk")) {
+  if (g_strcmp0(lower, "smpk") == 0) {
     return CONSOLE_LEVEL_SMPK;
   }
   return CONSOLE_LEVEL_OTHER;
@@ -270,18 +264,30 @@ ensure_console_buffer_tags(PumpkinWindow *self, GtkTextBuffer *buffer)
     g_object_set(tag, "foreground-set", FALSE, "weight-set", FALSE, NULL);
   }
 
-  struct {
+  ensure_log_buffer_tags(buffer);
+  apply_console_filters_to_buffer(self, buffer);
+}
+
+static void
+update_log_colors(AdwStyleManager *manager, GParamSpec *pspec, GtkTextBuffer *buffer)
+{
+  (void)pspec;
+  gboolean dark = adw_style_manager_get_dark(manager);
+  GtkTextTagTable *table = gtk_text_buffer_get_tag_table(buffer);
+  const struct {
     const char *name;
-    const char *color;
+    const char *light_color;
+    const char *dark_color;
     int weight;
   } token_tags[] = {
-    {"console-token-trace", "#7a828a", PANGO_WEIGHT_BOLD},
-    {"console-token-debug", "#6f767e", PANGO_WEIGHT_BOLD},
-    {"console-token-info", "#2f8f46", PANGO_WEIGHT_BOLD},
-    {"console-token-warn", "#b7791f", PANGO_WEIGHT_BOLD},
-    {"console-token-error", "#c93434", PANGO_WEIGHT_BOLD},
-    {"console-token-smpk", "#4b6cb7", PANGO_WEIGHT_BOLD},
-    {"console-token-startup-ms", NULL, PANGO_WEIGHT_BOLD}
+    {"console-token-trace", "#62676d", "#a0a6ad", PANGO_WEIGHT_BOLD},
+    {"console-token-debug", "#613583", "#c0a7e0", PANGO_WEIGHT_BOLD},
+    {"console-token-info", "#217238", "#8bd5a0", PANGO_WEIGHT_BOLD},
+    {"console-token-warn", "#956000", "#f6c667", PANGO_WEIGHT_BOLD},
+    {"console-token-error", "#b32632", "#ff9097", PANGO_WEIGHT_BOLD},
+    {"console-token-smpk", "#245f9d", "#91bff0", PANGO_WEIGHT_BOLD},
+    {"console-token-timestamp", "#62676d", "#a0a6ad", PANGO_WEIGHT_NORMAL},
+    {"console-token-startup-ms", NULL, NULL, PANGO_WEIGHT_BOLD}
   };
   for (guint i = 0; i < G_N_ELEMENTS(token_tags); i++) {
     GtkTextTag *tag = gtk_text_tag_table_lookup(table, token_tags[i].name);
@@ -291,13 +297,25 @@ ensure_console_buffer_tags(PumpkinWindow *self, GtkTextBuffer *buffer)
     if (tag == NULL) {
       continue;
     }
-    if (token_tags[i].color != NULL) {
-      g_object_set(tag, "foreground", token_tags[i].color, "weight", token_tags[i].weight, NULL);
+    const char *color = dark ? token_tags[i].dark_color : token_tags[i].light_color;
+    if (color != NULL) {
+      g_object_set(tag, "foreground", color, "weight", token_tags[i].weight, NULL);
     } else {
       g_object_set(tag, "weight", token_tags[i].weight, NULL);
     }
   }
-  apply_console_filters_to_buffer(self, buffer);
+}
+
+void
+ensure_log_buffer_tags(GtkTextBuffer *buffer)
+{
+  if (g_object_get_data(G_OBJECT(buffer), "log-colors-connected") != NULL) {
+    return;
+  }
+  AdwStyleManager *manager = adw_style_manager_get_default();
+  update_log_colors(manager, NULL, buffer);
+  g_signal_connect_object(manager, "notify::dark", G_CALLBACK(update_log_colors), buffer, 0);
+  g_object_set_data(G_OBJECT(buffer), "log-colors-connected", GINT_TO_POINTER(1));
 }
 
 void
@@ -317,8 +335,8 @@ apply_console_filters(PumpkinWindow *self)
   }
 }
 
-char *
-format_console_line(PumpkinWindow *self, const char *line, ConsoleLevel *out_level)
+static char *
+format_output_line(PumpkinWindow *self, const char *line, ConsoleLevel *out_level, gboolean live)
 {
   if (out_level != NULL) {
     *out_level = CONSOLE_LEVEL_OTHER;
@@ -328,10 +346,25 @@ format_console_line(PumpkinWindow *self, const char *line, ConsoleLevel *out_lev
     return NULL;
   }
 
+  static GRegex *bracket_re = NULL;
+  if (bracket_re == NULL) {
+    bracket_re = g_regex_new("^\\[[0-9][^\\]]*\\]\\s+\\[(TRACE|DEBUG|INFO|WARN(?:ING)?|ERROR|FATAL|CRITICAL|SMPK)\\]",
+                            G_REGEX_OPTIMIZE | G_REGEX_CASELESS, 0, NULL);
+  }
+  g_autoptr(GMatchInfo) bracket_match = NULL;
+  if (g_regex_match(bracket_re, clean, 0, &bracket_match)) {
+    g_autofree char *word = g_match_info_fetch(bracket_match, 1);
+    if (out_level != NULL) {
+      *out_level = console_level_from_text(word);
+    }
+    /* Preserve timestamps in previously formatted and archived logs. */
+    return g_steal_pointer(&clean);
+  }
+
   static GRegex *prefix_re = NULL;
   if (prefix_re == NULL) {
     prefix_re = g_regex_new(
-      "^([0-9]{4})-([0-9]{2})-([0-9]{2})[ T]([0-9]{2}):([0-9]{2}):([0-9]{2})\\s+([A-Za-z]+)\\s+(.+)$",
+      "^([0-9]{4})-([0-9]{2})-([0-9]{2})[ T]([0-9]{2}):([0-9]{2}):([0-9]{2})(?:\\.[0-9]+)?(Z|[+-][0-9]{2}:?[0-9]{2})?\\s+([A-Za-z]+)\\s+(.+)$",
       G_REGEX_OPTIMIZE, 0, NULL);
   }
 
@@ -339,6 +372,23 @@ format_console_line(PumpkinWindow *self, const char *line, ConsoleLevel *out_lev
   g_autofree char *message = NULL;
   g_autofree char *level = NULL;
   g_autofree char *target = NULL;
+
+  static GRegex *clock_re = NULL;
+  if (clock_re == NULL) {
+    clock_re = g_regex_new(
+      "^(\\[?[0-9]{2}:[0-9]{2}:[0-9]{2}(?:\\.[0-9]+)?\\]?)\\s+"
+      "(TRACE|DEBUG|INFO|WARN(?:ING)?|ERROR|FATAL|CRITICAL)\\s+(.+)$",
+      G_REGEX_OPTIMIZE | G_REGEX_CASELESS, 0, NULL);
+  }
+  g_autoptr(GMatchInfo) clock_match = NULL;
+  if (g_regex_match(clock_re, clean, 0, &clock_match)) {
+    timestamp_text = g_match_info_fetch(clock_match, 1);
+    g_strdelimit(timestamp_text, "[]", ' ');
+    g_strstrip(timestamp_text);
+    level = g_match_info_fetch(clock_match, 2);
+    message = g_match_info_fetch(clock_match, 3);
+    if (out_level != NULL) *out_level = console_level_from_text(level);
+  }
 
   if (g_str_has_prefix(clean, "[SMPK]")) {
     const char *rest = clean + strlen("[SMPK]");
@@ -371,16 +421,13 @@ format_console_line(PumpkinWindow *self, const char *line, ConsoleLevel *out_lev
       g_autofree char *hour_txt = g_match_info_fetch(match, 4);
       g_autofree char *minute_txt = g_match_info_fetch(match, 5);
       g_autofree char *second_txt = g_match_info_fetch(match, 6);
-      level = g_match_info_fetch(match, 7);
-      g_autofree char *rest = g_match_info_fetch(match, 8);
-
-      int year = year_txt != NULL ? (int)strtol(year_txt, NULL, 10) : 0;
-      int month = month_txt != NULL ? (int)strtol(month_txt, NULL, 10) : 0;
-      int day = day_txt != NULL ? (int)strtol(day_txt, NULL, 10) : 0;
-      int hour = hour_txt != NULL ? (int)strtol(hour_txt, NULL, 10) : 0;
-      int minute = minute_txt != NULL ? (int)strtol(minute_txt, NULL, 10) : 0;
-      int second = second_txt != NULL ? (int)strtol(second_txt, NULL, 10) : 0;
-      g_autoptr(GDateTime) dt_utc = g_date_time_new_utc(year, month, day, hour, minute, (gdouble)second);
+      g_autofree char *zone = g_match_info_fetch(match, 7);
+      level = g_match_info_fetch(match, 8);
+      g_autofree char *rest = g_match_info_fetch(match, 9);
+      g_autofree char *iso = g_strdup_printf("%s-%s-%sT%s:%s:%s%s",
+        year_txt, month_txt, day_txt, hour_txt, minute_txt, second_txt,
+        zone != NULL && *zone != '\0' ? zone : "Z");
+      g_autoptr(GDateTime) dt_utc = g_date_time_new_from_iso8601(iso, NULL);
       if (dt_utc != NULL) {
         g_autoptr(GDateTime) dt_local = g_date_time_to_local(dt_utc);
         if (dt_local != NULL) {
@@ -410,6 +457,26 @@ format_console_line(PumpkinWindow *self, const char *line, ConsoleLevel *out_lev
     }
   }
 
+  if (level == NULL) {
+    const char *word = clean[0] == '[' ? clean + 1 : clean;
+    const char *end = word;
+    while (g_ascii_isalpha(*end)) {
+      end++;
+    }
+    g_autofree char *candidate = g_strndup(word, (gsize)(end - word));
+    ConsoleLevel parsed = console_level_from_text(candidate);
+    if (parsed != CONSOLE_LEVEL_OTHER && (*end == ' ' || (clean[0] == '[' && *end == ']'))) {
+      level = g_ascii_strup(candidate, -1);
+      message = g_strdup(end + 1);
+      if (out_level != NULL) {
+        *out_level = parsed;
+      }
+    }
+  }
+
+  if (timestamp_text == NULL && !live) {
+    return level != NULL ? g_strdup_printf("[%s] %s", level, message) : g_steal_pointer(&clean);
+  }
   if (timestamp_text == NULL) {
     g_autoptr(GDateTime) now = g_date_time_new_now_local();
     if (now != NULL) {
@@ -434,6 +501,18 @@ format_console_line(PumpkinWindow *self, const char *line, ConsoleLevel *out_lev
   }
 
   return g_strdup_printf("[%s] %s", timestamp_text, message);
+}
+
+char *
+format_console_line(PumpkinWindow *self, const char *line, ConsoleLevel *out_level)
+{
+  return format_output_line(self, line, out_level, TRUE);
+}
+
+char *
+format_log_line(PumpkinWindow *self, const char *line, ConsoleLevel *out_level)
+{
+  return format_output_line(self, line, out_level, FALSE);
 }
 
 void
@@ -499,16 +578,17 @@ scroll_console_to_end_idle(gpointer user_data)
 {
   PumpkinWindow *self = PUMPKIN_WINDOW(user_data);
   self->console_scroll_idle_id = 0;
-  if (self == NULL || self->log_view == NULL) {
+  if (self->disposing || self->log_view == NULL ||
+      !gtk_widget_get_mapped(GTK_WIDGET(self->log_view))) {
     return G_SOURCE_REMOVE;
   }
-  GtkTextBuffer *buffer = gtk_text_view_get_buffer(self->log_view);
-  if (buffer == NULL) {
-    return G_SOURCE_REMOVE;
-  }
-  GtkTextMark *mark = gtk_text_buffer_get_mark(buffer, "log-end");
-  if (mark != NULL) {
-    gtk_text_view_scroll_to_mark(self->log_view, mark, 0.0, TRUE, 0.0, 1.0);
+  GtkAdjustment *adjustment = gtk_scrollable_get_vadjustment(GTK_SCROLLABLE(self->log_view));
+  if (adjustment != NULL) {
+    /* Streaming output should follow immediately, not leave an animation
+     * running while the containing page is hidden or its buffer is cleared. */
+    gtk_adjustment_set_value(adjustment,
+      MAX(gtk_adjustment_get_lower(adjustment),
+          gtk_adjustment_get_upper(adjustment) - gtk_adjustment_get_page_size(adjustment)));
   }
   return G_SOURCE_REMOVE;
 }
@@ -521,6 +601,25 @@ queue_console_scroll_to_end(PumpkinWindow *self)
   }
   self->console_scroll_idle_id =
     g_idle_add_full(G_PRIORITY_DEFAULT_IDLE, scroll_console_to_end_idle, g_object_ref(self), g_object_unref);
+}
+
+static void
+on_console_scroll_layout_changed(GObject *source, PumpkinWindow *self)
+{
+  (void)source;
+  if (!self->disposing && self->log_view != NULL &&
+      gtk_widget_get_mapped(GTK_WIDGET(self->log_view))) {
+    /* Adjustment bounds can change during layout; scroll only from an idle. */
+    queue_console_scroll_to_end(self);
+  }
+}
+
+void
+setup_console_autoscroll(PumpkinWindow *self)
+{
+  GtkAdjustment *adjustment = gtk_scrollable_get_vadjustment(GTK_SCROLLABLE(self->log_view));
+  g_signal_connect_object(adjustment, "changed", G_CALLBACK(on_console_scroll_layout_changed), self, 0);
+  g_signal_connect_object(self->log_view, "map", G_CALLBACK(on_console_scroll_layout_changed), self, 0);
 }
 
 void
@@ -553,21 +652,17 @@ append_log_for_server(PumpkinWindow *self, PumpkinServer *server, const char *li
 void
 set_console_warning(PumpkinWindow *self, const char *message, gboolean visible)
 {
-  if (self == NULL || self->console_warning_revealer == NULL ||
-      self->console_warning_label == NULL) {
+  if (self == NULL || !visible) {
     return;
   }
-  gtk_label_set_text(self->console_warning_label, message != NULL ? message : "");
-  gtk_revealer_set_reveal_child(self->console_warning_revealer, visible);
-  if (visible) {
-    gint64 now = g_get_monotonic_time();
-    if (self->suppress_warning_beep_until > now) {
-      return;
-    }
-    GdkDisplay *display = gdk_display_get_default();
-    if (display != NULL) {
-      gdk_display_beep(display);
-    }
+  set_details_status(self, message, 8);
+  gint64 now = g_get_monotonic_time();
+  if (self->suppress_warning_beep_until > now) {
+    return;
+  }
+  GdkDisplay *display = gdk_display_get_default();
+  if (display != NULL) {
+    gdk_display_beep(display);
   }
 }
 
@@ -670,9 +765,9 @@ sanitize_console_text(const char *line)
     }
     g_string_append_c(out, (char)c);
   }
-  char *text = g_string_free(out, FALSE);
+  g_autofree char *text = g_string_free(out, FALSE);
   g_strstrip(text);
-  return text;
+  return g_utf8_make_valid(text, -1);
 }
 
 void
@@ -797,6 +892,12 @@ console_level_matches_log_filter(ConsoleLevel level, int level_index)
   if (level_index == 3) {
     return level == CONSOLE_LEVEL_ERROR;
   }
+  if (level_index == 4) {
+    return level == CONSOLE_LEVEL_DEBUG;
+  }
+  if (level_index == 5) {
+    return level == CONSOLE_LEVEL_TRACE;
+  }
   return TRUE;
 }
 
@@ -806,13 +907,13 @@ is_auto_poll_noise_line(const char *line)
   if (line == NULL) {
     return FALSE;
   }
-  g_autofree char *clean = pumpkin_strip_ansi(line);
-  const char *check = clean != NULL ? clean : line;
-  if (pumpkin_is_player_list_snapshot_line(check)) {
+  g_autofree char *message = pumpkin_player_log_message(line);
+  if (pumpkin_parse_player_list_snapshot_line(message, NULL, NULL)) {
     return TRUE;
   }
   double tps = 0.0;
-  if (pumpkin_parse_tps_from_line(check, &tps)) {
+  if (message != NULL && g_ascii_strncasecmp(message, "TPS", 3) == 0 &&
+      pumpkin_parse_tps_from_line(message, &tps)) {
     return TRUE;
   }
   return FALSE;

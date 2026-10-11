@@ -141,8 +141,15 @@ init_windows_runtime(void)
 #endif
 
 int
+#if defined(__ANDROID__)
+main(int argc, char *argv[], char *envp[])
+#else
 main(int argc, char *argv[])
+#endif
 {
+#if defined(__ANDROID__)
+  (void)envp;
+#endif
 #if defined(G_OS_WIN32)
   set_windows_app_id();
   init_windows_runtime();

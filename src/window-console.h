@@ -8,10 +8,14 @@ void append_console_line(PumpkinWindow *self, PumpkinServer *server, const char 
 void append_log(PumpkinWindow *self, const char *line);
 void append_log_for_server(PumpkinWindow *self, PumpkinServer *server, const char *line);
 void queue_console_scroll_to_end(PumpkinWindow *self);
+void setup_console_autoscroll(PumpkinWindow *self);
 void set_console_warning(PumpkinWindow *self, const char *message, gboolean visible);
 void ensure_console_buffer_tags(PumpkinWindow *self, GtkTextBuffer *buffer);
+void ensure_log_buffer_tags(GtkTextBuffer *buffer);
+void apply_console_inline_tags(GtkTextBuffer *buffer, int line_start_offset, const char *display, ConsoleLevel level);
 void apply_console_filters(PumpkinWindow *self);
 char *format_console_line(PumpkinWindow *self, const char *line, ConsoleLevel *out_level);
+char *format_log_line(PumpkinWindow *self, const char *line, ConsoleLevel *out_level);
 void on_console_copy(GtkButton *button, PumpkinWindow *self);
 void on_console_clear(GtkButton *button, PumpkinWindow *self);
 void on_console_filter_toggled(GtkCheckButton *button, PumpkinWindow *self);

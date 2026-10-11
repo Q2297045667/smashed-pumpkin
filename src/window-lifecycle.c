@@ -1,4 +1,5 @@
 #include "window-lifecycle.h"
+#include "platform.h"
 
 static gboolean
 server_running_hint(PumpkinWindow *self, PumpkinServer *server)
@@ -54,7 +55,7 @@ start_server_internal(PumpkinWindow *self,
 
   DownloadProgressState *state = get_download_progress_state(self, server, FALSE);
   if (state != NULL && state->active) {
-    state->active = FALSE;
+    return FALSE;
   }
 
   if (use_starting_ui_state && self->current == server) {
@@ -143,7 +144,7 @@ stop_server_internal(PumpkinWindow *self,
   if (pumpkin_server_get_running(server)) {
     pumpkin_server_stop(server);
   }
-  set_server_running_hint(self, server, FALSE);
+  /* Keep the process visible as running until the exit callback confirms it. */
   queue_overview_refresh(self, self->current == server);
   return TRUE;
 }
@@ -184,6 +185,9 @@ void
 on_details_start(GtkButton *button, PumpkinWindow *self)
 {
   (void)button;
+  if (!pumpkin_platform_supports_local_hosting()) {
+    return;
+  }
   if (self->current == NULL) {
     return;
   }
@@ -194,11 +198,37 @@ on_details_start(GtkButton *button, PumpkinWindow *self)
   start_server_internal(self, self->current, FALSE, TRUE);
 }
 
+static void
+on_force_stop_chosen(GObject *source, GAsyncResult *result, gpointer data)
+{
+  g_autoptr(PumpkinWindow) self = PUMPKIN_WINDOW(data);
+  const char *response = adw_alert_dialog_choose_finish(ADW_ALERT_DIALOG(source), result);
+  PumpkinServer *server = g_object_get_data(source, "server");
+  if (g_strcmp0(response, "force") == 0 && pumpkin_server_get_stopping(server)) {
+    pumpkin_server_force_stop(server);
+    queue_overview_refresh(self, self->current == server);
+  }
+}
+
 void
 on_details_stop(GtkButton *button, PumpkinWindow *self)
 {
   (void)button;
+  if (!pumpkin_platform_supports_local_hosting()) {
+    return;
+  }
   if (self->current == NULL) {
+    return;
+  }
+  if (pumpkin_server_get_stop_timed_out(self->current)) {
+    AdwAlertDialog *dialog = ADW_ALERT_DIALOG(adw_alert_dialog_new("Force stop server?",
+      "The server has not finished shutting down. Force stopping may lose unsaved world or plugin data."));
+    adw_alert_dialog_add_responses(dialog, "cancel", "Keep Waiting", "force", "Force Stop", NULL);
+    adw_alert_dialog_set_response_appearance(dialog, "force", ADW_RESPONSE_DESTRUCTIVE);
+    adw_alert_dialog_set_default_response(dialog, "cancel");
+    adw_alert_dialog_set_close_response(dialog, "cancel");
+    g_object_set_data_full(G_OBJECT(dialog), "server", g_object_ref(self->current), g_object_unref);
+    adw_alert_dialog_choose(dialog, GTK_WIDGET(self), NULL, on_force_stop_chosen, g_object_ref(self));
     return;
   }
   if (self->ui_state == UI_STATE_STOPPING || self->ui_state == UI_STATE_RESTARTING ||
@@ -212,6 +242,9 @@ void
 on_details_restart(GtkButton *button, PumpkinWindow *self)
 {
   (void)button;
+  if (!pumpkin_platform_supports_local_hosting()) {
+    return;
+  }
   if (self->current == NULL) {
     return;
   }

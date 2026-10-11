@@ -1,0 +1,3 @@
+# The application is C, and its toolchains are not required to support C23.
+# Replacing NULL with nullptr would break builds using C17 compilers.
+Checks: 'clang-analyzer-core.*,-modernize-use-nullptr'

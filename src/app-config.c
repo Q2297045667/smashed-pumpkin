@@ -11,11 +11,18 @@ struct _PumpkinConfig {
   char *path;
   char *base_dir;
   char *default_download_url;
+  PumpkinReleaseChannel release_channel;
   gboolean use_cache;
   gboolean run_in_background;
   gboolean detailed_overview_cards;
+  gboolean minimap_enabled;
+  gboolean minimap_consent;
+  guint minimap_refresh_hz;
   gboolean autostart_on_boot;
   gboolean start_minimized;
+  gboolean start_expanded;
+  PumpkinStartMode start_mode;
+  char *start_monitor;
   gboolean auto_start_servers_enabled;
   gboolean review_prompt_shown;
   PumpkinDateFormat date_format;
@@ -80,12 +87,14 @@ pumpkin_config_load(GError **error)
   PumpkinConfig *config = g_new0(PumpkinConfig, 1);
   config->path = config_path();
   config->base_dir = default_base_dir();
-  config->default_download_url = g_strdup("");
+  config->default_download_url = pumpkin_release_default_url(PUMPKIN_RELEASE_NIGHTLY);
   config->use_cache = TRUE;
   config->run_in_background = TRUE;
   config->detailed_overview_cards = FALSE;
   config->autostart_on_boot = FALSE;
   config->start_minimized = FALSE;
+  config->start_mode = PUMPKIN_START_MAXIMIZED;
+  config->start_monitor = g_strdup("");
   config->auto_start_servers_enabled = FALSE;
   config->review_prompt_shown = FALSE;
   config->date_format = PUMPKIN_DATE_FORMAT_DMY;
@@ -99,8 +108,10 @@ pumpkin_config_load(GError **error)
       config->base_dir = g_strdup(base);
     }
 
+    g_autofree char *channel = g_key_file_get_string(key, "updates", "release_channel", NULL);
+    pumpkin_config_set_release_channel(config, g_strcmp0(channel, "stable") == 0 ? PUMPKIN_RELEASE_STABLE : PUMPKIN_RELEASE_NIGHTLY);
     g_autofree char *url = g_key_file_get_string(key, "updates", "default_download_url", NULL);
-    if (url != NULL && *url != '\0') {
+    if (url != NULL && *url != '\0' && !pumpkin_release_is_managed_url(url)) {
       g_clear_pointer(&config->default_download_url, g_free);
       config->default_download_url = g_strdup(url);
     }
@@ -124,6 +135,19 @@ pumpkin_config_load(GError **error)
     if (g_key_file_has_key(key, "behavior", "start_minimized", NULL)) {
       config->start_minimized = g_key_file_get_boolean(key, "behavior", "start_minimized", NULL);
     }
+
+    config->start_expanded = g_key_file_get_boolean(key, "behavior", "start_expanded", NULL);
+    config->minimap_enabled = g_key_file_get_boolean(key, "behavior", "minimap_enabled", NULL);
+    config->minimap_consent = g_key_file_get_boolean(key, "behavior", "minimap_consent", NULL);
+    gint refresh = g_key_file_get_integer(key, "behavior", "minimap_refresh_hz", NULL);
+    config->minimap_refresh_hz = refresh >= 2 && refresh <= 20 ? (guint)refresh : 2;
+    g_autoptr(GError) mode_error = NULL;
+    int mode = g_key_file_get_integer(key, "behavior", "start_mode", &mode_error);
+    if (mode_error == NULL) {
+      pumpkin_config_set_start_mode(config, (PumpkinStartMode)mode);
+    }
+    g_autofree char *monitor = g_key_file_get_string(key, "behavior", "start_monitor", NULL);
+    pumpkin_config_set_start_monitor(config, monitor);
 
     if (g_key_file_has_key(key, "behavior", "auto_start_servers_enabled", NULL)) {
       config->auto_start_servers_enabled = g_key_file_get_boolean(key, "behavior", "auto_start_servers_enabled", NULL);
@@ -189,10 +213,17 @@ pumpkin_config_save(PumpkinConfig *config, GError **error)
   g_key_file_set_string(key, "storage", "base_dir", config->base_dir);
   g_key_file_set_boolean(key, "storage", "use_cache", config->use_cache);
   g_key_file_set_string(key, "updates", "default_download_url", config->default_download_url);
+  g_key_file_set_string(key, "updates", "release_channel", pumpkin_release_channel_id(config->release_channel));
   g_key_file_set_boolean(key, "behavior", "run_in_background", config->run_in_background);
   g_key_file_set_boolean(key, "behavior", "detailed_overview_cards", config->detailed_overview_cards);
+  g_key_file_set_boolean(key, "behavior", "minimap_enabled", config->minimap_enabled);
+  g_key_file_set_boolean(key, "behavior", "minimap_consent", config->minimap_consent);
+  g_key_file_set_integer(key, "behavior", "minimap_refresh_hz", (int)pumpkin_config_get_minimap_refresh_hz(config));
   g_key_file_set_boolean(key, "behavior", "autostart_on_boot", config->autostart_on_boot);
   g_key_file_set_boolean(key, "behavior", "start_minimized", config->start_minimized);
+  g_key_file_set_boolean(key, "behavior", "start_expanded", config->start_expanded);
+  g_key_file_set_integer(key, "behavior", "start_mode", config->start_mode);
+  g_key_file_set_string(key, "behavior", "start_monitor", config->start_monitor);
   g_key_file_set_boolean(key, "behavior", "auto_start_servers_enabled", config->auto_start_servers_enabled);
   g_key_file_set_boolean(key, "behavior", "review_prompt_shown", config->review_prompt_shown);
   g_key_file_set_integer(key, "behavior", "date_format", config->date_format);
@@ -214,6 +245,7 @@ pumpkin_config_free(PumpkinConfig *config)
   g_clear_pointer(&config->path, g_free);
   g_clear_pointer(&config->base_dir, g_free);
   g_clear_pointer(&config->default_download_url, g_free);
+  g_clear_pointer(&config->start_monitor, g_free);
   g_free(config);
 }
 
@@ -227,6 +259,22 @@ const char *
 pumpkin_config_get_default_download_url(PumpkinConfig *config)
 {
   return config->default_download_url;
+}
+
+PumpkinReleaseChannel
+pumpkin_config_get_release_channel(PumpkinConfig *config)
+{
+  return config->release_channel;
+}
+
+void
+pumpkin_config_set_release_channel(PumpkinConfig *config, PumpkinReleaseChannel channel)
+{
+  config->release_channel = channel == PUMPKIN_RELEASE_STABLE ? channel : PUMPKIN_RELEASE_NIGHTLY;
+  if (pumpkin_release_is_managed_url(config->default_download_url)) {
+    g_free(config->default_download_url);
+    config->default_download_url = pumpkin_release_default_url(config->release_channel);
+  }
 }
 
 gboolean
@@ -247,6 +295,24 @@ pumpkin_config_get_detailed_overview_cards(PumpkinConfig *config)
   return config->detailed_overview_cards;
 }
 
+gboolean pumpkin_config_get_minimap_enabled(PumpkinConfig *config)
+{
+  return config->minimap_enabled;
+}
+
+void pumpkin_config_set_minimap_enabled(PumpkinConfig *config, gboolean enabled)
+{
+  config->minimap_enabled = enabled;
+}
+gboolean pumpkin_config_get_minimap_consent(PumpkinConfig *config)
+{ return config->minimap_consent; }
+void pumpkin_config_set_minimap_consent(PumpkinConfig *config, gboolean consent)
+{ config->minimap_consent = consent; }
+guint pumpkin_config_get_minimap_refresh_hz(PumpkinConfig *config)
+{ return config->minimap_refresh_hz >= 2 && config->minimap_refresh_hz <= 20 ? config->minimap_refresh_hz : 2; }
+void pumpkin_config_set_minimap_refresh_hz(PumpkinConfig *config, guint hz)
+{ config->minimap_refresh_hz = CLAMP(hz, 2, 20); }
+
 void
 pumpkin_config_set_base_dir(PumpkinConfig *config, const char *path)
 {
@@ -258,7 +324,7 @@ void
 pumpkin_config_set_default_download_url(PumpkinConfig *config, const char *url)
 {
   g_free(config->default_download_url);
-  config->default_download_url = g_strdup(url);
+  config->default_download_url = url != NULL && *url != '\0' ? g_strdup(url) : pumpkin_release_default_url(config->release_channel);
 }
 
 void
@@ -325,6 +391,50 @@ void
 pumpkin_config_set_start_minimized(PumpkinConfig *config, gboolean enabled)
 {
   config->start_minimized = enabled;
+}
+
+gboolean
+pumpkin_config_get_start_expanded(PumpkinConfig *config)
+{
+  return config->start_expanded;
+}
+
+gboolean
+pumpkin_config_should_expand_on_startup(PumpkinConfig *config)
+{
+  return config->start_expanded && config->autostart_on_boot && !config->start_minimized;
+}
+
+PumpkinStartMode
+pumpkin_config_get_start_mode(PumpkinConfig *config)
+{
+  return config->start_mode;
+}
+
+const char *
+pumpkin_config_get_start_monitor(PumpkinConfig *config)
+{
+  return config->start_monitor;
+}
+
+void
+pumpkin_config_set_start_expanded(PumpkinConfig *config, gboolean enabled)
+{
+  config->start_expanded = enabled;
+}
+
+void
+pumpkin_config_set_start_mode(PumpkinConfig *config, PumpkinStartMode mode)
+{
+  config->start_mode = mode == PUMPKIN_START_FULLSCREEN ? mode : PUMPKIN_START_MAXIMIZED;
+}
+
+void
+pumpkin_config_set_start_monitor(PumpkinConfig *config, const char *monitor)
+{
+  char *copy = g_strdup(monitor != NULL ? monitor : "");
+  g_free(config->start_monitor);
+  config->start_monitor = copy;
 }
 
 void

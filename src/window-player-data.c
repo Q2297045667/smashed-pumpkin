@@ -1,4 +1,7 @@
 #include "window-player-data.h"
+#include "vendor/cjson/cJSON.h"
+
+G_DEFINE_AUTOPTR_CLEANUP_FUNC(cJSON, cJSON_Delete)
 
 #include <stdlib.h>
 
@@ -127,59 +130,43 @@ resolve_data_file(PumpkinServer *server, const char *filename)
   return g_strdup(path);
 }
 
+static char *
+player_json_string(const cJSON *object, const char *field)
+{
+  const cJSON *value = cJSON_GetObjectItemCaseSensitive(object, field);
+  return cJSON_IsString(value) && *value->valuestring != '\0' ? g_strdup(value->valuestring) : NULL;
+}
+
 GPtrArray *
 load_player_entries_from_file(const char *path)
 {
-  if (path == NULL) {
-    return NULL;
-  }
-
   g_autofree char *contents = NULL;
-  if (!g_file_get_contents(path, &contents, NULL, NULL)) {
-    return NULL;
-  }
-
-  g_autoptr(GPtrArray) entries = g_ptr_array_new_with_free_func((GDestroyNotify)player_entry_free);
-  g_autoptr(GRegex) regex = g_regex_new("\\{[^\\{\\}]*\\}", G_REGEX_CASELESS | G_REGEX_DOTALL, 0, NULL);
-  g_autoptr(GMatchInfo) match = NULL;
-
-  if (!g_regex_match(regex, contents, 0, &match)) {
-    return g_steal_pointer(&entries);
-  }
-
-  while (g_match_info_matches(match)) {
-    g_autofree char *object_text = g_match_info_fetch(match, 0);
-    g_autofree char *name = extract_json_string_field(object_text, "name");
-    g_autofree char *uuid = extract_json_string_field(object_text, "uuid");
-    g_autofree char *ip = extract_json_string_field(object_text, "ip");
-    g_autofree char *reason = extract_json_string_field(object_text, "reason");
-    g_autofree char *created = extract_json_string_field(object_text, "created");
-    g_autofree char *source = extract_json_string_field(object_text, "source");
-    g_autofree char *expires = extract_json_string_field(object_text, "expires");
-    int op_level = extract_json_int_field(object_text, "level", -1);
-    gboolean bypasses_limit = extract_json_bool_field(object_text, "bypasses_player_limit", FALSE);
-    if (!bypasses_limit) {
-      bypasses_limit = extract_json_bool_field(object_text, "bypassesPlayerLimit", FALSE);
-    }
-
-    if ((name != NULL && *name != '\0') || (ip != NULL && *ip != '\0')) {
-      PlayerEntry *entry = g_new0(PlayerEntry, 1);
-      entry->name = (name != NULL && *name != '\0') ? g_strdup(name) : NULL;
-      entry->uuid = (uuid != NULL && *uuid != '\0') ? g_strdup(uuid) : NULL;
-      entry->ip = (ip != NULL && *ip != '\0') ? g_strdup(ip) : NULL;
-      entry->reason = (reason != NULL && *reason != '\0') ? g_strdup(reason) : NULL;
-      entry->created = (created != NULL && *created != '\0') ? g_strdup(created) : NULL;
-      entry->source = (source != NULL && *source != '\0') ? g_strdup(source) : NULL;
-      entry->expires = (expires != NULL && *expires != '\0') ? g_strdup(expires) : NULL;
-      entry->op_level = op_level;
-      entry->bypasses_player_limit = bypasses_limit;
+  if (path == NULL || !g_file_get_contents(path, &contents, NULL, NULL)) return NULL;
+  g_autoptr(cJSON) root = cJSON_ParseWithOpts(contents, NULL, TRUE);
+  if (!cJSON_IsArray(root)) return NULL;
+  GPtrArray *entries = g_ptr_array_new_with_free_func((GDestroyNotify)player_entry_free);
+  const cJSON *item;
+  cJSON_ArrayForEach(item, root) {
+    if (!cJSON_IsObject(item)) continue;
+    PlayerEntry *entry = g_new0(PlayerEntry, 1);
+    entry->name = player_json_string(item, "name");
+    entry->uuid = player_json_string(item, "uuid");
+    entry->ip = player_json_string(item, "ip");
+    entry->reason = player_json_string(item, "reason");
+    entry->created = player_json_string(item, "created");
+    entry->source = player_json_string(item, "source");
+    entry->expires = player_json_string(item, "expires");
+    const cJSON *level = cJSON_GetObjectItemCaseSensitive(item, "level");
+    entry->op_level = cJSON_IsNumber(level) && level->valuedouble >= 0 &&
+      level->valuedouble <= G_MAXINT && level->valuedouble == level->valueint ? level->valueint : -1;
+    entry->bypasses_player_limit =
+      cJSON_IsTrue(cJSON_GetObjectItemCaseSensitive(item, "bypasses_player_limit")) ||
+      cJSON_IsTrue(cJSON_GetObjectItemCaseSensitive(item, "bypassesPlayerLimit"));
+    if (entry->name != NULL || entry->ip != NULL || (entry->uuid != NULL && g_uuid_string_is_valid(entry->uuid)))
       g_ptr_array_add(entries, entry);
-    }
-
-    g_match_info_next(match, NULL);
+    else player_entry_free(entry);
   }
-
-  return g_steal_pointer(&entries);
+  return entries;
 }
 
 char *

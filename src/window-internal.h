@@ -105,13 +105,6 @@ typedef struct {
 } PlayerSortSettings;
 
 typedef struct {
-  PumpkinWindow *self;
-  PumpkinServer *server;
-  char *uuid_key;
-  char *cache_path;
-} PlayerHeadDownloadContext;
-
-typedef struct {
   char *id;
   char *name;
   char *icon_name;
@@ -168,17 +161,25 @@ void invalidate_player_list_signature(PumpkinWindow *self);
 
 struct _PumpkinWindow {
   AdwApplicationWindow parent_instance;
+  gboolean disposing;
 
   AdwViewStack *view_stack;
   AdwViewStack *details_stack;
-  AdwViewSwitcher *details_switcher;
+  AdwViewStack *plugins_stack;
+  AdwOverlaySplitView *details_split_view;
+  GtkListBox *details_sidebar;
+  GtkButton *btn_details_sidebar_toggle;
+  AdwViewSwitcher *plugins_switcher;
   AdwViewSwitcher *players_switcher;
   AdwViewStack *players_stack;
   GtkBox *overview_page_box;
   GtkBox *overview_header_row;
   GtkBox *details_page_box;
+  AdwPreferencesGroup *minimap_settings_group;
   GtkBox *details_header_row;
   GtkBox *details_identity_row;
+  GtkBox *server_header_controls;
+  GtkLabel *app_header_title;
   GtkBox *network_details_page_box;
   GtkBox *network_details_header_row;
   GtkBox *network_details_identity_row;
@@ -195,6 +196,9 @@ struct _PumpkinWindow {
   char *latest_url;
   char *latest_build_id;
   char *latest_build_label;
+  char *latest_error;
+  GCancellable *latest_resolve_cancellable;
+  guint latest_resolve_generation;
   guint latest_poll_id;
   gboolean latest_resolve_in_flight;
 
@@ -208,23 +212,45 @@ struct _PumpkinWindow {
   GtkButton *btn_sponsor_pumpkin;
   GtkLabel *label_sponsor_heart;
   GtkButton *btn_open_plugins;
+  GtkButton *btn_marketplace_account;
+  GtkButton *btn_import_plugin;
   GtkButton *btn_plugins_marketplace;
+  GtkButton *btn_marketplace_refresh;
+  GtkButton *btn_marketplace_retry;
+  GtkButton *btn_marketplace_prev;
+  GtkButton *btn_marketplace_next;
   GtkButton *btn_open_players;
   GtkButton *btn_open_worlds;
   GtkButton *btn_save_settings;
 
+  GtkSearchEntry *marketplace_search_entry;
+  GtkEntry *marketplace_category_entry;
+  GtkDropDown *marketplace_type_dropdown;
+  GtkDropDown *marketplace_sort_dropdown;
+  GtkToggleButton *btn_marketplace_sort_order;
+  GtkLabel *marketplace_status_label;
+  GtkSpinner *marketplace_spinner;
+  GtkListBox *marketplace_list;
   GtkListBox *plugin_list;
   GtkListBox *world_list;
+  GtkBox *world_page;
   GtkListBox *player_list;
   GtkSearchEntry *player_search;
+  GtkLabel *player_summary;
+  GtkDropDown *player_presence_filter;
   GtkDropDown *player_sort_dropdown;
   GtkToggleButton *btn_player_sort_order;
   GtkBox *plugin_drop_hint;
-  GtkBox *world_drop_hint;
   GtkListBox *whitelist_list;
+  GtkListBox *ip_bans_list;
+  GtkLabel *player_heading;
+  GtkButton *btn_player_reset_filters;
   GtkListBox *banned_list;
   GtkListBox *log_files_list;
   GtkTextView *log_file_view;
+  GtkLabel *log_file_title;
+  GtkLabel *log_file_summary;
+  GtkButton *btn_refresh_logs;
   GtkDropDown *log_filter;
   GtkDropDown *log_level_filter;
   GtkEntry *log_search;
@@ -236,14 +262,16 @@ struct _PumpkinWindow {
   GtkLabel *label_srv_ram;
   GtkBox *stats_row;
   GtkDrawingArea *stats_graph_usage;
-  GtkDrawingArea *stats_graph_players;
+  GtkDrawingArea *stats_graph_ram;
   GtkDrawingArea *stats_graph_disk;
+  GtkLabel *stats_hover_label;
+  GtkFixed *stats_hover_layer;
+  int stats_hover_metric;
+  int stats_hover_index[3];
   GtkLabel *label_stats_cpu;
   GtkLabel *label_stats_ram;
   GtkLabel *label_stats_disk;
   GtkLabel *label_stats_players;
-  GtkRevealer *console_warning_revealer;
-  GtkLabel *console_warning_label;
   GtkLabel *label_resource_limits;
 
   GtkLabel *details_title;
@@ -283,11 +311,9 @@ struct _PumpkinWindow {
   GtkCheckButton *check_console_smpk;
   GtkCheckButton *check_console_other;
   GtkButton *btn_open_server_root;
-  GtkLabel *details_error;
-  GtkRevealer *details_error_revealer;
-  GtkLabel *details_status;
-  GtkRevealer *details_status_revealer;
-  guint status_timeout_id;
+  AdwToastOverlay *notifications_overlay;
+  AdwToast *details_error_toast;
+  AdwToast *details_status_toast;
   GtkProgressBar *download_progress;
   GtkRevealer *download_progress_revealer;
   guint restart_delay_id;
@@ -313,13 +339,14 @@ struct _PumpkinWindow {
   unsigned long long last_total_jiffies;
   unsigned long long last_idle_jiffies;
   unsigned long long last_proc_jiffies;
-  double last_proc_cpu_smoothed;
   int last_proc_pid;
   long clk_tck;
   double stats_cpu[STATS_SAMPLES];
   double stats_ram_mb[STATS_SAMPLES];
+  double stats_ram_limit_mb;
   double stats_disk_mb[STATS_SAMPLES];
   double stats_players[STATS_SAMPLES];
+  gint64 stats_time_usec[STATS_SAMPLES];
   int stats_index;
   int stats_count;
   double last_tps;
@@ -337,10 +364,6 @@ struct _PumpkinWindow {
   gint64 last_player_list_request_at;
   gint64 last_player_state_flush_at;
   gboolean player_state_dirty;
-  guint pending_auto_tps_lines;
-  guint pending_auto_list_lines;
-  guint pending_java_platform_hints;
-  guint pending_bedrock_platform_hints;
 
   int ui_state;
 
@@ -385,6 +408,11 @@ struct _PumpkinWindow {
   GtkSwitch *switch_detailed_overview_cards;
   GtkSwitch *switch_autostart_on_boot;
   GtkSwitch *switch_start_minimized;
+  AdwSwitchRow *row_start_expanded;
+  AdwComboRow *row_start_mode;
+  AdwComboRow *row_release_channel;
+  AdwComboRow *row_start_monitor;
+  GPtrArray *startup_monitor_ids;
   GtkSwitch *switch_auto_start_servers;
   GtkDropDown *drop_date_format;
   GtkDropDown *drop_time_format;
@@ -407,6 +435,21 @@ struct _PumpkinWindow {
   char *pending_view_page;
   PumpkinServer *pending_server;
   char *current_log_path;
+  GPtrArray *market_plugin_cache;
+  gboolean market_cache_fetch_in_flight;
+  gint64 market_cache_fetched_at;
+  char *market_cache_error;
+  guint market_page;
+  guint market_limit;
+  gboolean marketplace_loading;
+  gboolean marketplace_load_failed;
+  guint marketplace_request_generation;
+  GCancellable *marketplace_request_cancellable;
+  GCancellable *market_cache_request_cancellable;
+  char *marketplace_access_token;
+  gboolean marketplace_install_in_flight;
+  gboolean marketplace_key_validation_in_flight;
+  guint marketplace_credential_generation;
 
   PumpkinServerStore *store;
   PumpkinServer *current;
@@ -425,7 +468,7 @@ struct _PumpkinWindow {
   GHashTable *player_states_by_uuid;
   GHashTable *player_states_by_name;
   GHashTable *deleted_player_keys;
-  GHashTable *player_head_downloads;
+  GHashTable *market_preview_downloads;
   GHashTable *console_buffers;
   GHashTable *server_running_hints;
   GPtrArray *command_history;
@@ -452,6 +495,7 @@ void ensure_server_log_handler(PumpkinWindow *self, PumpkinServer *server);
 void append_log(PumpkinWindow *self, const char *line);
 void append_log_for_server(PumpkinWindow *self, PumpkinServer *server, const char *line);
 void set_details_error(PumpkinWindow *self, const char *message);
+void set_details_status(PumpkinWindow *self, const char *message, guint timeout_seconds);
 void clear_auto_update_countdown(PumpkinWindow *self);
 void queue_overview_refresh(PumpkinWindow *self, gboolean include_details);
 gboolean start_after_delay(gpointer data);

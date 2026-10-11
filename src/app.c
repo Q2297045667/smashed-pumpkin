@@ -451,11 +451,14 @@ pumpkin_app_about_action(GSimpleAction *action,
       is_de = TRUE;
       break;
     }
+    if (g_str_has_prefix(*lang, "en") || g_str_equal(*lang, "C")) {
+      break;
+    }
   }
   adw_about_dialog_set_application_name(about, APP_NAME);
   adw_about_dialog_set_application_icon(about, APP_ID);
   adw_about_dialog_set_version(about, APP_VERSION);
-  adw_about_dialog_set_release_notes_version(about, "0.5.2");
+  adw_about_dialog_set_release_notes_version(about, "0.6.0");
   if (is_de) {
     adw_about_dialog_set_release_notes(
       about,

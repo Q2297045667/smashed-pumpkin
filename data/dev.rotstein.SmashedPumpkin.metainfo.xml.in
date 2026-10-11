@@ -57,7 +57,7 @@
     <control>touch</control>
   </supports>
   <releases>
-    <release version="0.5.2" date="2026-04-06">
+    <release version="0.6.0" date="2026-10-11">
       <description>
         <ul>
           <li>Interactive minimap with player markers, viewing direction, player tracking and world switching.</li>
@@ -65,6 +65,16 @@
           <li>Pumpkin Marketplace: browse, install and update plugins.</li>
           <li xml:lang="de">Pumpkin Marketplace: Plugins durchsuchen, installieren und aktualisieren.</li>
         </ul>
+      </description>
+    </release>
+    <release version="0.5.2" date="2026-04-06">
+      <description>
+        <ul>
+          <li>Windows port.</li>
+          <li xml:lang="de">Windows-Portierung.</li>
+        </ul>
+        <p>Thank you for your feedback. It directly helps development.</p>
+        <p xml:lang="de">Vielen Dank für euer Feedback. Es hilft der Entwicklung direkt weiter.</p>
       </description>
     </release>
     <release version="0.5.1" date="2026-04-04">

@@ -1,31 +1,29 @@
-# Platform Support Notes (Pumpkin + Smashed Pumpkin CI)
+# Platform Support
 
-Pumpkin nightly release assets currently provide these binaries:
+Smashed Pumpkin currently supports Linux, with Flatpak packages for x86_64 and
+aarch64. Native Linux builds are available from source.
 
-- `pumpkin-X64-Linux`
-- `pumpkin-ARM64-Linux`
-- `pumpkin-X64-macOS`
-- `pumpkin-ARM64-macOS`
-- `pumpkin-X64-Windows.exe`
-- `pumpkin-ARM64-Windows.exe`
+## Build Requirements
 
-Source used:
+The native app requires GTK 4.12 or newer, libadwaita 1.5 or newer and libsoup
+3.4 or newer. The Flatpak manifest supplies the GNOME runtime and dependencies.
+GTK 3 and Ayatana AppIndicator are optional for the native tray helper.
 
-- GitHub API: `https://api.github.com/repos/Pumpkin-MC/Pumpkin/releases/tags/nightly`
+The `Linux Builds` workflow builds and tests natively on both architectures and
+builds a Flatpak bundle for each. See [the release pipeline](release-pipeline.md).
 
-CI mapping in this repository:
+## Pumpkin Downloads
 
-- Linux desktop build job (`ubuntu-latest`, x64)
-- macOS desktop build jobs (`macos-13` Intel + `macos-14` Apple Silicon)
-- Windows desktop build job (`windows-latest`, x64 via MSYS2, bundle + Winget metadata)
+Application settings offer Nightly and Stable channels. Nightly is the default.
+Release metadata is resolved from the official Pumpkin repository:
 
-Windows packaging details:
+* Nightly: `https://api.github.com/repos/Pumpkin-MC/Pumpkin/releases/tags/nightly`
+* Stable: `https://api.github.com/repos/Pumpkin-MC/Pumpkin/releases/latest`
 
-- Installs the app as a real prefix-style bundle (`bin`, `lib`, `share`) inside the MSI
-- Includes `smashed-pumpkin-tray.exe` and required GLib helper executables
-- Bundles required GTK/libadwaita runtime DLLs, schemas, icon themes, and runtime modules
-- Publishes WinGet metadata and a ready-to-submit manifest artifact for tagged releases
+Linux uses `pumpkin-X64-Linux` or `pumpkin-ARM64-Linux`, depending on the host
+architecture. The app reports missing downloads rather than switching channels.
 
-Note:
+## Repositories
 
-- Windows ARM64 hosted runners are not generally available in GitHub-hosted CI yet, so the pipeline currently publishes x64 Windows artifacts.
+The app, website and Flathub manifest have separate Git histories. The local
+`smashed-website` and `.flathub` checkouts are not part of app commits.

@@ -23,94 +23,29 @@
   <content_rating type="oars-1.1"/>
   <screenshots>
     <screenshot type="default">
-      <image type="source">https://raw.githubusercontent.com/Rotstein007/smashed-pumpkin/master/data/screenshots/start-screen.png</image>
-      <caption xml:lang="en">Start screen</caption>
-      <caption xml:lang="de">Startansicht</caption>
+      <image type="source" width="1230" height="770">https://raw.githubusercontent.com/Rotstein007/smashed-pumpkin/master/data/screenshots/minimap.png</image>
+      <caption xml:lang="en">Interactive minimap</caption>
+      <caption xml:lang="de">Interaktive Minimap</caption>
     </screenshot>
     <screenshot>
-      <image type="source">https://raw.githubusercontent.com/Rotstein007/smashed-pumpkin/master/data/screenshots/start-screen-wm.png</image>
-      <caption xml:lang="en">Start screen in light mode</caption>
-      <caption xml:lang="de">Startansicht im hellen Modus</caption>
+      <image type="source" width="1230" height="770">https://raw.githubusercontent.com/Rotstein007/smashed-pumpkin/master/data/screenshots/plugins.png</image>
+      <caption xml:lang="en">Pumpkin Marketplace</caption>
+      <caption xml:lang="de">Pumpkin Marketplace</caption>
     </screenshot>
     <screenshot>
-      <image type="source">https://raw.githubusercontent.com/Rotstein007/smashed-pumpkin/master/data/screenshots/start-screen-rating.png</image>
-      <caption xml:lang="en">Feedback prompt</caption>
-      <caption xml:lang="de">Feedback-Hinweis</caption>
-    </screenshot>
-    <screenshot>
-      <image type="source">https://raw.githubusercontent.com/Rotstein007/smashed-pumpkin/master/data/screenshots/start-screen-rating-wm.png</image>
-      <caption xml:lang="en">Feedback prompt in light mode</caption>
-      <caption xml:lang="de">Feedback-Hinweis im hellen Modus</caption>
-    </screenshot>
-    <screenshot>
-      <image type="source">https://raw.githubusercontent.com/Rotstein007/smashed-pumpkin/master/data/screenshots/console.png</image>
+      <image type="source" width="1230" height="770">https://raw.githubusercontent.com/Rotstein007/smashed-pumpkin/master/data/screenshots/console.png</image>
       <caption xml:lang="en">Server console</caption>
       <caption xml:lang="de">Serverkonsole</caption>
     </screenshot>
     <screenshot>
-      <image type="source">https://raw.githubusercontent.com/Rotstein007/smashed-pumpkin/master/data/screenshots/console-wm.png</image>
-      <caption xml:lang="en">Server console in light mode</caption>
-      <caption xml:lang="de">Serverkonsole im hellen Modus</caption>
-    </screenshot>
-    <screenshot>
-      <image type="source">https://raw.githubusercontent.com/Rotstein007/smashed-pumpkin/master/data/screenshots/stats.png</image>
-      <caption xml:lang="en">Resource stats</caption>
-      <caption xml:lang="de">Ressourcenstatistiken</caption>
-    </screenshot>
-    <screenshot>
-      <image type="source">https://raw.githubusercontent.com/Rotstein007/smashed-pumpkin/master/data/screenshots/stats-wm.png</image>
-      <caption xml:lang="en">Resource stats in light mode</caption>
-      <caption xml:lang="de">Ressourcenstatistiken im hellen Modus</caption>
-    </screenshot>
-    <screenshot>
-      <image type="source">https://raw.githubusercontent.com/Rotstein007/smashed-pumpkin/master/data/screenshots/player.png</image>
+      <image type="source" width="1230" height="770">https://raw.githubusercontent.com/Rotstein007/smashed-pumpkin/master/data/screenshots/player.png</image>
       <caption xml:lang="en">Players</caption>
       <caption xml:lang="de">Spieler</caption>
     </screenshot>
     <screenshot>
-      <image type="source">https://raw.githubusercontent.com/Rotstein007/smashed-pumpkin/master/data/screenshots/player-wm.png</image>
-      <caption xml:lang="en">Players in light mode</caption>
-      <caption xml:lang="de">Spieler im hellen Modus</caption>
-    </screenshot>
-    <screenshot>
-      <image type="source">https://raw.githubusercontent.com/Rotstein007/smashed-pumpkin/master/data/screenshots/plugins.png</image>
-      <caption xml:lang="en">Plugin manager</caption>
-      <caption xml:lang="de">Plugin-Verwaltung</caption>
-    </screenshot>
-    <screenshot>
-      <image type="source">https://raw.githubusercontent.com/Rotstein007/smashed-pumpkin/master/data/screenshots/plugins-wm.png</image>
-      <caption xml:lang="en">Plugin manager in light mode</caption>
-      <caption xml:lang="de">Plugin-Verwaltung im hellen Modus</caption>
-    </screenshot>
-    <screenshot>
-      <image type="source">https://raw.githubusercontent.com/Rotstein007/smashed-pumpkin/master/data/screenshots/world.png</image>
-      <caption xml:lang="en">World manager</caption>
-      <caption xml:lang="de">Welten-Verwaltung</caption>
-    </screenshot>
-    <screenshot>
-      <image type="source">https://raw.githubusercontent.com/Rotstein007/smashed-pumpkin/master/data/screenshots/world-wm.png</image>
-      <caption xml:lang="en">World manager in light mode</caption>
-      <caption xml:lang="de">Welten-Verwaltung im hellen Modus</caption>
-    </screenshot>
-    <screenshot>
-      <image type="source">https://raw.githubusercontent.com/Rotstein007/smashed-pumpkin/master/data/screenshots/logs.png</image>
-      <caption xml:lang="en">Log files</caption>
-      <caption xml:lang="de">Logdateien</caption>
-    </screenshot>
-    <screenshot>
-      <image type="source">https://raw.githubusercontent.com/Rotstein007/smashed-pumpkin/master/data/screenshots/logs-wm.png</image>
-      <caption xml:lang="en">Log files in light mode</caption>
-      <caption xml:lang="de">Logdateien im hellen Modus</caption>
-    </screenshot>
-    <screenshot>
-      <image type="source">https://raw.githubusercontent.com/Rotstein007/smashed-pumpkin/master/data/screenshots/settings.png</image>
-      <caption xml:lang="en">Server settings</caption>
-      <caption xml:lang="de">Servereinstellungen</caption>
-    </screenshot>
-    <screenshot>
-      <image type="source">https://raw.githubusercontent.com/Rotstein007/smashed-pumpkin/master/data/screenshots/settings-wm.png</image>
-      <caption xml:lang="en">Server settings in light mode</caption>
-      <caption xml:lang="de">Servereinstellungen im hellen Modus</caption>
+      <image type="source" width="1230" height="770">https://raw.githubusercontent.com/Rotstein007/smashed-pumpkin/master/data/screenshots/stats.png</image>
+      <caption xml:lang="en">Resource stats</caption>
+      <caption xml:lang="de">Ressourcenstatistiken</caption>
     </screenshot>
   </screenshots>
   <requires>
@@ -125,11 +60,11 @@
     <release version="0.5.2" date="2026-04-06">
       <description>
         <ul>
-          <li>Windows port.</li>
-          <li xml:lang="de">Windows-Portierung.</li>
+          <li>Interactive minimap with player markers, viewing direction, player tracking and world switching.</li>
+          <li xml:lang="de">Interaktive Minimap mit Spieleranzeige, Blickrichtung, Spieler-Tracking und Weltenwechsel.</li>
+          <li>Pumpkin Marketplace: browse, install and update plugins.</li>
+          <li xml:lang="de">Pumpkin Marketplace: Plugins durchsuchen, installieren und aktualisieren.</li>
         </ul>
-        <p>Thank you for your feedback. It directly helps development.</p>
-        <p xml:lang="de">Vielen Dank für euer Feedback. Es hilft der Entwicklung direkt weiter.</p>
       </description>
     </release>
     <release version="0.5.1" date="2026-04-04">

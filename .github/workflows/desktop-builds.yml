@@ -1,4 +1,4 @@
-name: Desktop Builds
+name: Linux Builds
 
 env:
   FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: "true"
@@ -12,11 +12,11 @@ on:
   workflow_dispatch:
 
 concurrency:
-  group: desktop-builds-${{ github.ref }}
+  group: linux-builds-${{ github.ref }}
   cancel-in-progress: true
 
 permissions:
-  contents: write
+  contents: read
 
 jobs:
   release-meta:
@@ -42,6 +42,8 @@ jobs:
             exit 1
           fi
 
+          python3 build-aux/release-notes.py "${VERSION}" >/dev/null
+
           TAG="v${VERSION}"
           if [[ "${GITHUB_REF}" == refs/tags/v* && "${GITHUB_REF_NAME}" != "${TAG}" ]]; then
             echo "Tag version (${GITHUB_REF_NAME}) does not match meson.build version (${VERSION})."
@@ -51,98 +53,45 @@ jobs:
           echo "version=${VERSION}" >> "$GITHUB_OUTPUT"
           echo "tag=${TAG}" >> "$GITHUB_OUTPUT"
 
-  macos:
-    name: macOS ${{ matrix.arch }}
-    runs-on: ${{ matrix.os }}
+  linux:
+    name: Linux ${{ matrix.arch }} build and tests
+    runs-on: ${{ matrix.runner }}
     strategy:
       fail-fast: false
       matrix:
         include:
-          - os: macos-15-intel
-            arch: x64
-          - os: macos-15
-            arch: arm64
+          - arch: x86_64
+            runner: ubuntu-latest
+          - arch: aarch64
+            runner: ubuntu-24.04-arm
     steps:
       - name: Checkout
         uses: actions/checkout@v6
 
-      - name: Install dependencies
+      - name: Install build dependencies
         run: |
-          missing=()
-          for formula in meson ninja pkg-config gtk4 libadwaita libsoup; do
-            if ! brew list --versions "$formula" >/dev/null 2>&1; then
-              missing+=("$formula")
-            fi
-          done
-          if [ "${#missing[@]}" -gt 0 ]; then
-            brew install "${missing[@]}"
-          fi
+          sudo apt-get update
+          sudo apt-get install -y \
+            build-essential meson ninja-build pkg-config \
+            libadwaita-1-dev libsoup-3.0-dev libgtk-3-dev \
+            libayatana-appindicator3-dev libx11-dev
 
       - name: Configure
-        run: meson setup build --buildtype=release
+        run: meson setup buildDir --buildtype=release
 
       - name: Build
-        run: meson compile -C build
+        run: meson compile -C buildDir
 
-      - name: Build macOS app bundle
-        shell: bash
-        run: |
-          VERSION="$(sed -n "s/.*version: '\\([^']*\\)'.*/\\1/p" meson.build | head -n1)"
-          if [[ -z "${VERSION}" ]]; then
-            echo "Could not resolve app version from meson.build"
-            exit 1
-          fi
-          if [[ "${GITHUB_REF}" == refs/tags/v* ]]; then
-            TAG_VERSION="${GITHUB_REF_NAME#v}"
-            if [[ "${TAG_VERSION}" != "${VERSION}" ]]; then
-              echo "Tag version (${TAG_VERSION}) does not match meson.build version (${VERSION})."
-              exit 1
-            fi
-          fi
+      - name: Test
+        run: meson test -C buildDir --print-errorlogs
 
-          APP_NAME="Smashed Pumpkin.app"
-          APP_ROOT="dist/${APP_NAME}"
-          CONTENTS="${APP_ROOT}/Contents"
-          MACOS_DIR="${CONTENTS}/MacOS"
-          RES_DIR="${CONTENTS}/Resources"
-
-          rm -rf dist
-          mkdir -p "${MACOS_DIR}" "${RES_DIR}"
-          cp build/src/smashed-pumpkin "${MACOS_DIR}/smashed-pumpkin"
-          chmod +x "${MACOS_DIR}/smashed-pumpkin"
-
-          cat > "${CONTENTS}/Info.plist" <<EOF
-          <?xml version="1.0" encoding="UTF-8"?>
-          <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
-          <plist version="1.0">
-          <dict>
-            <key>CFBundleName</key>
-            <string>Smashed Pumpkin</string>
-            <key>CFBundleDisplayName</key>
-            <string>Smashed Pumpkin</string>
-            <key>CFBundleIdentifier</key>
-            <string>dev.rotstein.SmashedPumpkin</string>
-            <key>CFBundleVersion</key>
-            <string>${VERSION}</string>
-            <key>CFBundleShortVersionString</key>
-            <string>${VERSION}</string>
-            <key>CFBundleExecutable</key>
-            <string>smashed-pumpkin</string>
-            <key>CFBundlePackageType</key>
-            <string>APPL</string>
-            <key>LSMinimumSystemVersion</key>
-            <string>13.0</string>
-          </dict>
-          </plist>
-          EOF
-
-          ditto -c -k --sequesterRsrc --keepParent "${APP_ROOT}" "smashed-pumpkin-macos-${{ matrix.arch }}.app.zip"
-
-      - name: Upload artifact
+      - name: Upload test logs
+        if: failure()
         uses: actions/upload-artifact@v6
         with:
-          name: smashed-pumpkin-macos-${{ matrix.arch }}
-          path: smashed-pumpkin-macos-${{ matrix.arch }}.app.zip
+          name: linux-test-logs-${{ matrix.arch }}
+          path: buildDir/meson-logs/
+          if-no-files-found: ignore
           retention-days: 14
 
   flatpak:
@@ -199,477 +148,57 @@ jobs:
         with:
           name: SmashedPumpkin-${{ matrix.flatpak_arch }}.flatpak
           path: SmashedPumpkin-${{ matrix.flatpak_arch }}.flatpak
-          retention-days: 14
-
-  windows:
-    name: Windows ${{ matrix.arch }} (MSI)
-    runs-on: windows-latest
-    env:
-      WINDOWS_SIGNING_CERT_BASE64: ${{ secrets.WINDOWS_SIGNING_CERT_BASE64 }}
-      WINDOWS_SIGNING_CERT_PASSWORD: ${{ secrets.WINDOWS_SIGNING_CERT_PASSWORD }}
-      WINDOWS_SIGNING_TIMESTAMP_URL: ${{ secrets.WINDOWS_SIGNING_TIMESTAMP_URL }}
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-          - arch: x64
-            msystem: MINGW64
-            wix_arch: x64
-            winget_arch: x64
-            install: >-
-              mingw-w64-x86_64-toolchain
-              mingw-w64-x86_64-meson
-              mingw-w64-x86_64-ninja
-              mingw-w64-x86_64-pkgconf
-              mingw-w64-x86_64-gtk4
-              mingw-w64-x86_64-libadwaita
-              mingw-w64-x86_64-libsoup3
-    steps:
-      - name: Checkout
-        uses: actions/checkout@v6
-
-      - name: Setup MSYS2
-        uses: msys2/setup-msys2@v2
-        with:
-          update: true
-          msystem: ${{ matrix.msystem }}
-          install: ${{ matrix.install }}
-
-      - name: Resolve app version
-        id: version
-        shell: powershell
-        run: |
-          $line = Select-String -Path meson.build -Pattern "version:\s*'([^']+)'" | Select-Object -First 1
-          if (-not $line) { throw "Could not resolve version from meson.build" }
-          $version = $line.Matches[0].Groups[1].Value
-          if (-not $version) { throw "Could not resolve version from meson.build" }
-          if ("${{ github.ref }}".StartsWith("refs/tags/v")) {
-            $tagVersion = "${{ github.ref_name }}".Substring(1)
-            if ($tagVersion -ne $version) {
-              throw "Tag version ($tagVersion) does not match meson.build version ($version)"
-            }
-          }
-          "value=$version" >> $env:GITHUB_OUTPUT
-
-      - name: Configure
-        shell: msys2 {0}
-        run: meson setup build --buildtype=release --prefix=/
-
-      - name: Build
-        shell: msys2 {0}
-        run: meson compile -C build
-
-      - name: Stage Windows bundle
-        shell: msys2 {0}
-        run: build-aux/windows/stage-bundle.sh package-root
-
-      - name: Validate staged Windows bundle layout
-        shell: msys2 {0}
-        run: |
-          set -euo pipefail
-
-          test -f package-root/bin/smashed-pumpkin.exe
-          test -f package-root/bin/smashed-pumpkin-tray.exe
-
-          mapfile -t app_paths < <(find package-root -path '*/bin/smashed-pumpkin.exe' -print)
-          if [[ "${#app_paths[@]}" -ne 1 || "${app_paths[0]}" != "package-root/bin/smashed-pumpkin.exe" ]]; then
-            printf 'Unexpected staged app paths:\n' >&2
-            printf '%s\n' "${app_paths[@]}" >&2
-            exit 1
-          fi
-
-      - name: Install WiX Toolset
-        shell: powershell
-        run: choco install wixtoolset --yes --no-progress
-
-      - name: Prepare Windows signing certificate
-        if: ${{ env.WINDOWS_SIGNING_CERT_BASE64 != '' && env.WINDOWS_SIGNING_CERT_PASSWORD != '' }}
-        id: signing
-        shell: powershell
-        run: |
-          $certPath = Join-Path $env:RUNNER_TEMP 'windows-signing-cert.pfx'
-          [System.IO.File]::WriteAllBytes(
-            $certPath,
-            [System.Convert]::FromBase64String($env:WINDOWS_SIGNING_CERT_BASE64)
-          )
-          "cert_path=$certPath" >> $env:GITHUB_OUTPUT
-
-      - name: Sign Windows executables
-        if: ${{ steps.signing.outputs.cert_path != '' }}
-        shell: powershell
-        run: |
-          $signtool = (Get-Command signtool.exe -ErrorAction Stop).Source
-          $certPath = "${{ steps.signing.outputs.cert_path }}"
-          $password = $env:WINDOWS_SIGNING_CERT_PASSWORD
-          $timestampUrl = if ($env:WINDOWS_SIGNING_TIMESTAMP_URL -ne '') {
-            $env:WINDOWS_SIGNING_TIMESTAMP_URL
-          } else {
-            'http://timestamp.digicert.com'
-          }
-
-          $files = @(
-            'package-root\bin\smashed-pumpkin.exe',
-            'package-root\bin\smashed-pumpkin-tray.exe'
-          )
-
-          foreach ($file in $files) {
-            & $signtool sign `
-              /fd SHA256 `
-              /td SHA256 `
-              /tr $timestampUrl `
-              /f $certPath `
-              /p $password `
-              $file
-
-            if ($LASTEXITCODE -ne 0) {
-              throw "Failed to sign $file"
-            }
-          }
-
-      - name: Build MSI
-        shell: powershell
-        run: |
-          $wixRoot = Get-ChildItem 'C:\Program Files (x86)' -Directory | Where-Object { $_.Name -like 'WiX Toolset*' } | Sort-Object Name -Descending | Select-Object -First 1
-          if (-not $wixRoot) { throw 'WiX Toolset installation not found.' }
-          $wixBin = Join-Path $wixRoot.FullName 'bin'
-          $env:PATH = "$wixBin;$env:PATH"
-
-          $arch = "${{ matrix.wix_arch }}"
-          $platform = if ($arch -eq 'x86') { 'x86' } elseif ($arch -eq 'arm64') { 'arm64' } else { 'x64' }
-          $version = "${{ steps.version.outputs.value }}"
-          $upgradeCode = '8E643E21-5F9C-4D1C-89F1-A6B72E01F620'
-          $programFilesDir = if ($platform -eq 'x86') { 'ProgramFilesFolder' } else { 'ProgramFiles64Folder' }
-          $appUserModelId = 'Rotstein.SmashedPumpkin'
-
-          @"
-          <?xml version="1.0" encoding="UTF-8"?>
-          <Wix xmlns="http://schemas.microsoft.com/wix/2006/wi">
-            <Product Id="*" Name="Smashed Pumpkin" Language="1033" Version="$version" Manufacturer="Rotstein" UpgradeCode="$upgradeCode">
-              <Package InstallerVersion="500" Compressed="yes" InstallScope="perMachine" Platform="$platform" />
-              <MajorUpgrade DowngradeErrorMessage="A newer version of [ProductName] is already installed." />
-              <MediaTemplate EmbedCab="yes" />
-              <Icon Id="ProductIcon" SourceFile="resources\windows\smashed-pumpkin.ico" />
-              <Property Id="ARPURLINFOABOUT" Value="https://github.com/${{ github.repository }}" />
-              <Property Id="ARPHELPLINK" Value="https://github.com/${{ github.repository }}/issues" />
-              <Property Id="ARPCONTACT" Value="Rotstein" />
-              <Property Id="ARPPRODUCTICON" Value="ProductIcon" />
-
-              <Directory Id="TARGETDIR" Name="SourceDir">
-                <Directory Id="$programFilesDir">
-                  <Directory Id="INSTALLROOT" Name="Smashed Pumpkin">
-                    <Directory Id="INSTALLDIR" Name="app" />
-                  </Directory>
-                </Directory>
-                <Directory Id="CommonProgramsFolder">
-                  <Directory Id="ProgramMenuDir" Name="Smashed Pumpkin" />
-                </Directory>
-              </Directory>
-
-              <DirectoryRef Id="ProgramMenuDir">
-                <Component Id="StartMenuShortcutComponent" Guid="A02EBB2D-B6B4-4FD9-9E88-96DBE60E1226">
-                  <Shortcut Id="ApplicationStartMenuShortcut"
-                            Name="Smashed Pumpkin"
-                            Description="Desktop management app for Pumpkin servers"
-                            Target="[INSTALLDIR]bin\smashed-pumpkin.exe"
-                            WorkingDirectory="INSTALLDIR"
-                            Icon="ProductIcon"
-                            IconIndex="0">
-                    <ShortcutProperty Key="System.AppUserModel.ID" Value="$appUserModelId" />
-                  </Shortcut>
-                  <RemoveFolder Id="RemoveProgramMenuDir" On="uninstall" />
-                  <RegistryValue Root="HKLM"
-                                 Key="Software\Rotstein\Smashed Pumpkin"
-                                 Name="Installed"
-                                 Type="integer"
-                                 Value="1"
-                                 KeyPath="yes" />
-                </Component>
-              </DirectoryRef>
-
-              <Feature Id="MainFeature" Title="Smashed Pumpkin" Level="1">
-                <ComponentGroupRef Id="AppFiles" />
-                <ComponentRef Id="StartMenuShortcutComponent" />
-              </Feature>
-            </Product>
-          </Wix>
-          "@ | Set-Content Product.wxs
-
-          heat dir package-root -nologo -gg -srd -sreg -scom -cg AppFiles -dr INSTALLDIR -var var.SourceDir -out Files.wxs
-          candle -nologo -arch $arch -dSourceDir="package-root" Product.wxs Files.wxs
-          light -nologo Product.wixobj Files.wixobj -out "smashed-pumpkin-windows-${{ matrix.arch }}.msi"
-
-      - name: Sign MSI
-        if: ${{ steps.signing.outputs.cert_path != '' }}
-        shell: powershell
-        run: |
-          $signtool = (Get-Command signtool.exe -ErrorAction Stop).Source
-          $certPath = "${{ steps.signing.outputs.cert_path }}"
-          $password = $env:WINDOWS_SIGNING_CERT_PASSWORD
-          $timestampUrl = if ($env:WINDOWS_SIGNING_TIMESTAMP_URL -ne '') {
-            $env:WINDOWS_SIGNING_TIMESTAMP_URL
-          } else {
-            'http://timestamp.digicert.com'
-          }
-          $msi = "smashed-pumpkin-windows-${{ matrix.arch }}.msi"
-
-          & $signtool sign `
-            /fd SHA256 `
-            /td SHA256 `
-            /tr $timestampUrl `
-            /f $certPath `
-            /p $password `
-            $msi
-
-          if ($LASTEXITCODE -ne 0) {
-            throw "Failed to sign $msi"
-          }
-
-      - name: Generate winget metadata
-        shell: powershell
-        run: |
-          $msi = "smashed-pumpkin-windows-${{ matrix.arch }}.msi"
-          $sha = (Get-FileHash $msi -Algorithm SHA256).Hash.ToUpperInvariant()
-
-          $installer = New-Object -ComObject WindowsInstaller.Installer
-          $database = $installer.GetType().InvokeMember('OpenDatabase', 'InvokeMethod', $null, $installer, @($msi, 0))
-          $view = $database.OpenView("SELECT `Value` FROM `Property` WHERE `Property`='ProductCode'")
-          $view.Execute()
-          $record = $view.Fetch()
-          $productCode = $record.StringData(1)
-
-          New-Item -ItemType Directory -Path winget -Force | Out-Null
-          @{
-            architecture   = "${{ matrix.winget_arch }}"
-            installer_file = $msi
-            sha256         = $sha
-            product_code   = $productCode
-          } | ConvertTo-Json | Set-Content "winget/${{ matrix.arch }}.json"
-
-      - name: Upload artifact
-        uses: actions/upload-artifact@v6
-        with:
-          name: smashed-pumpkin-windows-${{ matrix.arch }}
-          path: |
-            smashed-pumpkin-windows-${{ matrix.arch }}.msi
-            winget/${{ matrix.arch }}.json
-          retention-days: 14
-
-  winget-manifests:
-    name: Build winget manifests
-    if: github.event_name != 'pull_request'
-    runs-on: ubuntu-latest
-    needs: [release-meta, windows]
-    steps:
-      - name: Checkout
-        uses: actions/checkout@v6
-
-      - name: Install jq
-        run: sudo apt-get update && sudo apt-get install -y jq
-
-      - name: Download Windows artifacts
-        uses: actions/download-artifact@v7
-        with:
-          pattern: smashed-pumpkin-windows-*
-          path: windows-artifacts
-
-      - name: Generate winget YAML files
-        shell: bash
-        run: |
-          set -euo pipefail
-          shopt -s globstar nullglob
-
-          VERSION="$(sed -n "s/.*version: '\\([^']*\\)'.*/\\1/p" meson.build | head -n1)"
-          if [[ -z "${VERSION}" ]]; then
-            echo "Could not resolve app version from meson.build"
-            exit 1
-          fi
-          RELEASE_TAG="${{ needs.release-meta.outputs.tag }}"
-          if [[ "${RELEASE_TAG}" != "v${VERSION}" ]]; then
-            echo "Release tag (${RELEASE_TAG}) does not match meson.build version (${VERSION})."
-            exit 1
-          fi
-          OUT_DIR="winget"
-          mkdir -p "$OUT_DIR"
-
-          PKG_ID="Rotstein.SmashedPumpkin"
-          INSTALLER_FILE="$OUT_DIR/${PKG_ID}.installer.yaml"
-          LOCALE_FILE="$OUT_DIR/${PKG_ID}.locale.en-US.yaml"
-          VERSION_FILE="$OUT_DIR/${PKG_ID}.yaml"
-
-          {
-            echo "PackageIdentifier: ${PKG_ID}"
-            echo "PackageVersion: ${VERSION}"
-            echo "InstallerType: msi"
-            echo "Scope: machine"
-            echo "Installers:"
-          } > "$INSTALLER_FILE"
-
-          found=0
-          for meta in windows-artifacts/**/winget/*.json; do
-            found=1
-            arch=$(jq -r '.architecture' "$meta")
-            file=$(jq -r '.installer_file' "$meta")
-            sha=$(jq -r '.sha256' "$meta")
-            product_code=$(jq -r '.product_code' "$meta")
-            url="https://github.com/${GITHUB_REPOSITORY}/releases/download/${RELEASE_TAG}/${file}"
-
-            {
-              echo "- Architecture: ${arch}"
-              echo "  InstallerUrl: ${url}"
-              echo "  InstallerSha256: ${sha}"
-              echo "  ProductCode: '${product_code}'"
-            } >> "$INSTALLER_FILE"
-          done
-
-          if [[ "$found" -eq 0 ]]; then
-            echo "No winget metadata found from Windows jobs."
-            exit 1
-          fi
-
-          {
-            echo "ManifestType: installer"
-            echo "ManifestVersion: 1.6.0"
-          } >> "$INSTALLER_FILE"
-
-          {
-            echo "PackageIdentifier: ${PKG_ID}"
-            echo "PackageVersion: ${VERSION}"
-            echo "PackageLocale: en-US"
-            echo "Publisher: Rotstein"
-            echo "PublisherUrl: https://github.com/${GITHUB_REPOSITORY}"
-            echo "PublisherSupportUrl: https://github.com/${GITHUB_REPOSITORY}/issues"
-            echo "PackageName: Smashed Pumpkin"
-            echo "PackageUrl: https://github.com/${GITHUB_REPOSITORY}"
-            echo "License: GPL-3.0-or-later"
-            echo "LicenseUrl: https://github.com/${GITHUB_REPOSITORY}/blob/${GITHUB_SHA}/LICENSE"
-            echo "ShortDescription: Desktop management app for Pumpkin servers."
-            echo "Description: Manage Pumpkin Minecraft servers and server networks from a native GTK desktop app."
-            echo "Moniker: smashed-pumpkin"
-            echo "ReleaseNotesUrl: https://github.com/${GITHUB_REPOSITORY}/releases/tag/${RELEASE_TAG}"
-            echo "Tags:"
-            echo "- minecraft"
-            echo "- pumpkin"
-            echo "- server"
-            echo "- gtk"
-            echo "ManifestType: defaultLocale"
-            echo "ManifestVersion: 1.6.0"
-          } > "$LOCALE_FILE"
-
-          {
-            echo "PackageIdentifier: ${PKG_ID}"
-            echo "PackageVersion: ${VERSION}"
-            echo "DefaultLocale: en-US"
-            echo "ManifestType: version"
-            echo "ManifestVersion: 1.6.0"
-          } > "$VERSION_FILE"
-
-      - name: Upload winget manifests
-        uses: actions/upload-artifact@v6
-        with:
-          name: winget-manifests
-          path: winget/
-          retention-days: 14
-
-  homebrew-cask:
-    name: Build Homebrew cask
-    if: github.event_name != 'pull_request'
-    runs-on: ubuntu-latest
-    needs: [release-meta, macos]
-    steps:
-      - name: Checkout
-        uses: actions/checkout@v6
-
-      - name: Download macOS artifacts
-        uses: actions/download-artifact@v7
-        with:
-          pattern: smashed-pumpkin-macos-*
-          path: macos-artifacts
-
-      - name: Generate Homebrew cask
-        shell: bash
-        run: |
-          set -euo pipefail
-
-          VERSION="$(sed -n "s/.*version: '\\([^']*\\)'.*/\\1/p" meson.build | head -n1)"
-          if [[ -z "${VERSION}" ]]; then
-            echo "Could not resolve app version from meson.build"
-            exit 1
-          fi
-
-          INTEL_ZIP="$(find macos-artifacts -type f -name 'smashed-pumpkin-macos-x64.app.zip' | head -n1)"
-          ARM_ZIP="$(find macos-artifacts -type f -name 'smashed-pumpkin-macos-arm64.app.zip' | head -n1)"
-          if [[ -z "${INTEL_ZIP}" || -z "${ARM_ZIP}" ]]; then
-            echo "Expected both macOS app zip artifacts."
-            exit 1
-          fi
-
-          build-aux/homebrew/generate-cask.sh \
-            "${VERSION}" \
-            "${GITHUB_REPOSITORY}" \
-            homebrew \
-            "${INTEL_ZIP}" \
-            "${ARM_ZIP}"
-
-      - name: Upload Homebrew cask
-        uses: actions/upload-artifact@v6
-        with:
-          name: homebrew-cask
-          path: homebrew/
+          if-no-files-found: error
           retention-days: 14
 
   release:
-    name: Publish GitHub Release
-    if: github.event_name != 'pull_request'
+    name: Publish Flatpak release
+    if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')
     runs-on: ubuntu-latest
-    needs: [release-meta, macos, windows, flatpak, winget-manifests, homebrew-cask]
+    needs: [release-meta, linux, flatpak]
+    permissions:
+      contents: write
     steps:
       - name: Checkout
         uses: actions/checkout@v6
 
-      - name: Download all release artifacts
+      - name: Prepare localized release notes
+        env:
+          RELEASE_VERSION: ${{ needs.release-meta.outputs.version }}
+        run: python3 build-aux/release-notes.py "${RELEASE_VERSION}" > "${RUNNER_TEMP}/release-notes.md"
+
+      - name: Download Flatpak bundles
         uses: actions/download-artifact@v7
         with:
-          path: release-assets
+          pattern: SmashedPumpkin-*.flatpak
+          path: publish-assets
           merge-multiple: true
 
-      - name: Collect installable files only
+      - name: Verify both release bundles
         shell: bash
         run: |
           set -euo pipefail
-
-          mkdir -p publish-assets
-
-          find release-assets -maxdepth 1 -type f \
-            \( -name 'smashed-pumpkin-macos-*.app.zip' \
-            -o -name 'smashed-pumpkin-windows-*.msi' \
-            -o -name 'SmashedPumpkin-*.flatpak' \) \
-            -exec cp -t publish-assets {} +
-
-          count="$(find publish-assets -maxdepth 1 -type f | wc -l | tr -d ' ')"
-          if [[ "$count" -eq 0 ]]; then
-            echo "No installable release files found."
-            exit 1
-          fi
-
-          echo "Publishing these files:"
-          ls -1 publish-assets
+          for arch in x86_64 aarch64; do
+            test -s "publish-assets/SmashedPumpkin-${arch}.flatpak"
+          done
 
       - name: Publish release assets
         shell: bash
         env:
           GH_TOKEN: ${{ github.token }}
+          RELEASE_TAG: ${{ needs.release-meta.outputs.tag }}
+          GH_REPO: ${{ github.repository }}
         run: |
           set -euo pipefail
-
-          TAG="${{ needs.release-meta.outputs.tag }}"
-          TITLE="${TAG}"
-
-          if gh release view "${TAG}" >/dev/null 2>&1; then
-            gh release upload "${TAG}" publish-assets/* --clobber
+          if gh release view "${RELEASE_TAG}" >/dev/null 2>&1; then
+            gh release upload "${RELEASE_TAG}" publish-assets/*.flatpak --clobber
+            gh release edit "${RELEASE_TAG}" \
+              --notes-file "${RUNNER_TEMP}/release-notes.md" \
+              --draft=false
           else
-            gh release create "${TAG}" publish-assets/* \
-              --title "${TITLE}" \
-              --target "${GITHUB_SHA}" \
-              --generate-notes
+            gh release create "${RELEASE_TAG}" publish-assets/*.flatpak \
+              --title "${RELEASE_TAG}" \
+              --verify-tag \
+              --notes-file "${RUNNER_TEMP}/release-notes.md"
           fi
 

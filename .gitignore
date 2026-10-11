@@ -20,6 +20,8 @@ buildDir/flatpak/
 *.so
 *.dll
 *.dylib
+__pycache__/
+*.pyc
 
 # Meson/Ninja
 meson-logs/
@@ -41,3 +43,18 @@ AGENTS.md
 buildDir/
 tmp/
 *.flatpak
+
+# Local build environments and upstream checkouts
+/.buildconfig
+/.patchbukkit/
+/.pixiewood/
+/.pumpkin-upstream/
+/pumpkin-source/
+/smashed-website/
+/*-screenshots/
+/screenshots aktuell/
+/subprojects/*/
+/subprojects/packagecache/
+!/subprojects/packagefiles/
+!/subprojects/packagefiles/**
+/subprojects/.wraplock

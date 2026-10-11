@@ -1,23 +1,49 @@
-# Release Pipeline Targets
+# Release Pipeline
 
-## Trigger
-- Tag push: `vX.Y.Z`
+The `Linux Builds` workflow is defined in
+`.github/workflows/desktop-builds.yml`. It supports Linux and Flatpak only.
 
-## Desktop Builds workflow
-- macOS: `x64` (Intel), `arm64` (Apple Silicon) as native `.app.zip`
-- Windows: `x64` as `.msi`
-- Winget: generates ready-to-submit manifest files as artifact (`winget-manifests`) and triggers the WinGet submission workflow from published releases
-- Homebrew: generates a ready-to-publish cask artifact (`homebrew-cask`) for a separate tap repository
-- GitHub Release: uploads all generated artifacts for tagged builds
+## Checks And Packages
 
-## Flatpak builds
-Flatpak bundles for `x86_64` and `aarch64` are built inside the `Desktop Builds` workflow so release publishing and platform artifacts stay in one pipeline.
+Native Linux builds and automated tests run on x86_64 and aarch64. Flatpak builds
+run on the same architectures and produce:
 
-## Winget publication
-Successful tagged `Desktop Builds` runs now trigger the `Submit WinGet Update` workflow automatically.
-The workflow resolves the permanent GitHub Release MSI URL, handles initial onboarding if the package is not yet present in `microsoft/winget-pkgs`, and otherwise submits a regular update.
+* `SmashedPumpkin-x86_64.flatpak`
+* `SmashedPumpkin-aarch64.flatpak`
 
-## Homebrew publication
-Homebrew support is prepared as a cask, not a formula, because the project ships signed macOS app bundles rather than CLI binaries.
-The tagged build generates a `homebrew-cask` artifact that can be copied into a separate `homebrew-*` tap repository.
-If `HOMEBREW_TAP_REPOSITORY` and `HOMEBREW_TAP_TOKEN` are configured, the cask can also be pushed there automatically after a successful tagged `Desktop Builds` run.
+Pull requests, `master` pushes and manual runs build and test without publishing
+a GitHub Release. Only a pushed version tag triggers publication, after both
+native builds and both Flatpak builds succeed.
+
+## Prepare A Version
+
+1. Finish and commit the feature and fix changes.
+2. Set the version in `meson.build`.
+3. Update the release notes in `data/dev.rotstein.SmashedPumpkin.metainfo.xml.in`
+   and the About dialog in `src/app.c`, including its release notes version.
+4. Commit the version and notes together.
+5. After publication is explicitly approved, push `master` and an annotated
+   `vX.Y.Z` tag whose version exactly matches `meson.build`.
+6. Verify the workflow and both Flatpak bundles in the GitHub Release.
+
+The workflow rejects a tag that does not match the app version. The release job
+has write permission; build jobs only have read permission.
+
+GitHub release notes come from the matching AppStream release, with English and
+German entries presented separately. The workflow rejects missing translations
+and does not append an automatically generated changelog.
+
+## Flathub
+
+The Flathub manifest is maintained in the separate checkout at
+`.flathub/dev.rotstein.SmashedPumpkin`. Point the app source at the exact commit
+containing the version and release notes. Commit that manifest change separately
+and update the Flathub pull request after approval.
+
+The minimap bridge also needs an offline source build using the locked Cargo
+dependencies. A precompiled bridge alone does not meet Flathub's source-build
+requirements. Check the current Flathub requirements before updating the manifest
+or submitting a pull request.
+
+Before announcing a release, verify that the app version, tag, About dialog and
+AppStream release notes match, and that Flathub references the intended commit.

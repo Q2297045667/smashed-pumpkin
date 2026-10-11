@@ -209,6 +209,9 @@ endif
 
 gtk3_dep = dependency('gtk+-3.0', required: false)
 if not meson.is_cross_build()
+  test('release-notes', find_program('python3'),
+    args: [meson.project_source_root() / 'tests/test-release-notes.py'],
+    env: {'PYTHONDONTWRITEBYTECODE': '1'})
   release_download_tests = executable('test-release-download',
     ['../tests/test-release-download.c', 'release-channel.c', 'release-metadata.c', 'download.c'],
     include_directories: inc,

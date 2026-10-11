@@ -1,5 +1,8 @@
 # Internationalization phase 1: text audit and logic separation
 
+This document records phase 1 findings and verification. For the gettext pipeline
+introduced in phase 2, see [internationalization infrastructure](<i18n.md>).
+
 ## Scope and findings
 
 This phase establishes boundaries for the future GNU gettext integration: business state, build identity, HTTP error classification, and process events must not depend on UI wording. It does not introduce gettext, change language preferences, or add a language selector. The existing English interface and partial English/German content are retained.

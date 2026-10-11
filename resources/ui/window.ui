@@ -1,5 +1,5 @@
 <?xml version="1.0" encoding="UTF-8"?>
-<interface>
+<interface domain="smashed-pumpkin">
   <requires lib="gtk" version="4.0"/>
   <requires lib="adwaita" version="1.0"/>
 
@@ -23,7 +23,7 @@
     <property name="default-height">720</property>
     <property name="width-request">800</property>
     <property name="height-request">580</property>
-    <property name="title" translatable="yes">Smashed Pumpkin</property>
+    <property name="title">Smashed Pumpkin</property>
     <child>
       <object class="AdwBreakpoint">
         <condition>max-width: 1000sp</condition>
@@ -40,7 +40,7 @@
             <property name="decoration-layout">:minimize,maximize,close</property>
             <property name="title-widget">
               <object class="GtkLabel" id="app_header_title">
-                <property name="label" translatable="yes">Smashed Pumpkin</property>
+                <property name="label">Smashed Pumpkin</property>
                 <property name="css-classes">heading</property>
               </object>
             </property>

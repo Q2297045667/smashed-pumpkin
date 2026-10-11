@@ -72,9 +72,10 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install -y \
-            build-essential meson ninja-build pkg-config \
+            build-essential meson ninja-build pkg-config gettext locales \
             libadwaita-1-dev libsoup-3.0-dev libgtk-3-dev \
             libayatana-appindicator3-dev libx11-dev
+          sudo locale-gen en_US.UTF-8
 
       - name: Configure
         run: meson setup buildDir --buildtype=release
@@ -113,9 +114,10 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install -y \
-            build-essential meson ninja-build pkg-config \
+            build-essential meson ninja-build pkg-config gettext locales \
             libadwaita-1-dev libsoup-3.0-dev libgtk-3-dev \
             libayatana-appindicator3-dev libx11-dev
+          sudo locale-gen en_US.UTF-8
 
       - name: Verify app integration with the source-built bridge
         env:

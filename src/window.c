@@ -3,6 +3,7 @@
 
 #include "download.h"
 #include "build-metadata.h"
+#include "i18n.h"
 #include "refresh-button.h"
 #include "server-maintenance.h"
 #include "window-worlds.h"
@@ -2911,9 +2912,9 @@ format_server_version(PumpkinWindow *self, PumpkinServer *server, gboolean insta
   if (!installed) {
     DownloadProgressState *state = get_download_progress_state(self, server, FALSE);
     if (state != NULL && state->active) {
-      return g_strdup("Installing...");
+      return g_strdup(_("Installing..."));
     }
-    return g_strdup("Not installed");
+    return g_strdup(_("Not installed"));
   }
   g_autofree char *bin = pumpkin_server_get_bin_path(server);
 
@@ -2929,10 +2930,11 @@ format_server_version(PumpkinWindow *self, PumpkinServer *server, gboolean insta
 
   const char *stored_id = pumpkin_server_get_installed_build_id(server);
   if (stored_id != NULL && *stored_id != '\0') {
-    return g_strdup_printf("Build %s", stored_id);
+    /* Translators: %s is an unmodified build identifier. */
+    return g_strdup_printf(_("Build %s"), stored_id);
   }
 
-  return g_strdup("Installed");
+  return g_strdup(_("Installed"));
 }
 
 static char *

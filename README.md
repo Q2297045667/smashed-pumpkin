@@ -75,8 +75,9 @@ More views are available on the [website](https://smashed-pumpkin.rotstein.dev/)
 
 ## Build On Linux
 
-Requires a C compiler, Meson 1.3.2 or newer, Ninja, pkg-config and development
-headers for GTK 4.12 or newer, libadwaita 1.5 or newer and libsoup 3.4 or newer.
+Requires a C compiler, Meson 1.3.2 or newer, Ninja, pkg-config, GNU gettext tools,
+and development headers for GTK 4.12 or newer, libadwaita 1.5 or newer and
+libsoup 3.4 or newer.
 GTK 3 and Ayatana AppIndicator are optional dependencies for the tray helper.
 
 ```bash
@@ -111,8 +112,10 @@ access or changing the bundled binary in the source tree.
 
 Report bugs or suggest improvements through
 [GitHub Issues](https://github.com/Rotstein007/smashed-pumpkin/issues).
-See [platform support](docs/platform-support.md) and
-[the release pipeline](docs/release-pipeline.md) for build and publishing details.
+See [platform support](docs/platform-support.md),
+[the release pipeline](docs/release-pipeline.md), and
+[internationalization infrastructure](docs/i18n.md) for build, publishing, and
+translation maintenance details.
 The [website](https://smashed-pumpkin.rotstein.dev/) is maintained in its own
 [repository](https://github.com/Rotstein007/smashed-website).
 

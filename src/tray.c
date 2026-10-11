@@ -1,4 +1,4 @@
-#include "config.h"
+#include "i18n.h"
 
 #include <gtk/gtk.h>
 #include <libayatana-appindicator/app-indicator.h>
@@ -97,8 +97,8 @@ populate_menu(GtkWidget *menu)
 {
   clear_menu(menu);
 
-  GtkWidget *open_item = gtk_menu_item_new_with_label("Open");
-  GtkWidget *quit_item = gtk_menu_item_new_with_label("Quit");
+  GtkWidget *open_item = gtk_menu_item_new_with_label(_("Open"));
+  GtkWidget *quit_item = gtk_menu_item_new_with_label(_("Quit"));
   g_signal_connect(open_item, "activate", G_CALLBACK(on_show_activate), NULL);
   g_signal_connect(quit_item, "activate", G_CALLBACK(on_quit_activate), NULL);
   gtk_menu_shell_append(GTK_MENU_SHELL(menu), open_item);
@@ -230,6 +230,8 @@ main(int argc, char *argv[])
 {
   g_log_set_handler("libayatana-appindicator", G_LOG_LEVEL_WARNING, on_appindicator_log, NULL);
   g_log_set_handler("libappindicator", G_LOG_LEVEL_WARNING, on_appindicator_log, NULL);
+  gtk_disable_setlocale();
+  pumpkin_i18n_init();
   gtk_init(&argc, &argv);
   smashed_pumpkin_register_resource();
 

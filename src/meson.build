@@ -46,6 +46,8 @@ conf = configuration_data()
 conf.set_quoted('APP_ID', app_id)
 conf.set_quoted('APP_NAME', 'Smashed Pumpkin')
 conf.set_quoted('APP_VERSION', meson.project_version())
+conf.set_quoted('GETTEXT_PACKAGE', gettext_package)
+conf.set_quoted('LOCALEDIR', gettext_locale_dir)
 
 startup_deps = []
 if host_machine.system() == 'linux'
@@ -116,6 +118,8 @@ if host_machine.system() == 'windows'
 endif
 
 sources = [
+  'i18n.c',
+  'i18n.h',
   'release-channel.c',
   'release-channel.h',
   'release-metadata.c',
@@ -216,7 +220,7 @@ if android_host
     'smashed-pumpkin',
     sources,
     include_directories: inc,
-    dependencies: [adw_dep, Gtk_dep, soup_dep, psapi_dep, math_dep, shell32_dep, user32_dep, dwmapi_dep, crypt32_dep, gmodule_dep, cjson_dep] + platform_credential_deps + startup_deps,
+    dependencies: [adw_dep, Gtk_dep, soup_dep, psapi_dep, math_dep, shell32_dep, user32_dep, dwmapi_dep, crypt32_dep, gmodule_dep, cjson_dep, intl_dep] + platform_credential_deps + startup_deps,
     android_exe_type: 'application',
     install: true
   )
@@ -225,7 +229,7 @@ else
     'smashed-pumpkin',
     sources,
     include_directories: inc,
-    dependencies: [adw_dep, Gtk_dep, soup_dep, psapi_dep, math_dep, shell32_dep, user32_dep, dwmapi_dep, crypt32_dep, gmodule_dep, cjson_dep] + platform_credential_deps + startup_deps,
+    dependencies: [adw_dep, Gtk_dep, soup_dep, psapi_dep, math_dep, shell32_dep, user32_dep, dwmapi_dep, crypt32_dep, gmodule_dep, cjson_dep, intl_dep] + platform_credential_deps + startup_deps,
     win_subsystem: host_machine.system() == 'windows' ? 'windows' : 'console',
     install: true
   )
@@ -243,8 +247,8 @@ if not meson.is_cross_build()
   test('release-download', release_download_tests)
   build_metadata_tests = executable('test-build-metadata',
     ['../tests/test-build-metadata.c', 'build-metadata.c'],
-    include_directories: inc, dependencies: dependency('glib-2.0'), install: false)
-  test('build-metadata', build_metadata_tests)
+    include_directories: inc, dependencies: [dependency('glib-2.0'), intl_dep], install: false)
+  test('build-metadata', build_metadata_tests, env: {'LC_ALL': 'C', 'LANGUAGE': 'en'})
   download_http_tests = executable('test-download-http',
     ['../tests/test-download-http.c', 'download.c', 'release-channel.c', 'release-metadata.c'],
     include_directories: inc,
@@ -330,9 +334,9 @@ endif
 if host_machine.system() == 'linux' and gtk3_dep.found() and appindicator_dep.found()
   executable(
     'smashed-pumpkin-tray',
-    ['tray.c', 'app-config.c', 'app-config.h', 'release-channel.c', config_h, resources],
+    ['tray.c', 'i18n.c', 'i18n.h', 'app-config.c', 'app-config.h', 'release-channel.c', config_h, resources],
     include_directories: inc,
-    dependencies: [gtk3_dep, appindicator_dep],
+    dependencies: [gtk3_dep, appindicator_dep, intl_dep],
     install: true
   )
 elif host_machine.system() == 'linux'

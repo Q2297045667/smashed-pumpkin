@@ -9,11 +9,14 @@ fi
 root=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
 build=${1:-"$root/buildDir"}
 scope=${2:-all}
-case "$scope" in all|minimap|worlds-map-access|releases|i18n-boundaries) ;; *) printf 'Unknown UI test scope: %s\n' "$scope" >&2; exit 2 ;; esac
+case "$scope" in all|minimap|worlds-map-access|releases|i18n-boundaries|i18n-loading) ;; *) printf 'Unknown UI test scope: %s\n' "$scope" >&2; exit 2 ;; esac
 if [[ "$build" != /* ]]; then
   build="$PWD/$build"
 fi
 meson compile -C "$build" smashed-pumpkin
+if [[ "$scope" == i18n-loading ]]; then
+  meson compile -C "$build" i18n-test-catalog
+fi
 
 profile=$(mktemp -d /tmp/smashed-pumpkin-ui-check-XXXXXX)
 cleanup_profile() {
@@ -24,11 +27,61 @@ cleanup_profile() {
     printf 'Refusing to clean unexpected test profile: %s\n' "$profile" >&2
     return 1
   fi
-  # Services on the private bus may finish writing their cache as it shuts down.
-  # Retry only this verified directory; do not stop the desktop's own services.
+  # D-Bus activation can leave private portal helpers alive after the bus exits.
+  # Stop only processes whose environment identifies this exact test profile.
+  # PID file descriptors prevent a recycled PID from targeting another process.
+  python3 - "$profile" <<'PY' || return 1
+import os
+from pathlib import Path
+import select
+import signal
+import sys
+import time
+
+profile = sys.argv[1]
+markers = {
+    f"HOME={profile}".encode(),
+    f"XDG_RUNTIME_DIR={profile}/runtime".encode(),
+}
+fds = []
+try:
+    for path in Path('/proc').iterdir():
+        if not path.name.isdigit() or int(path.name) == os.getpid():
+            continue
+        fd = None
+        try:
+            fd = os.pidfd_open(int(path.name))
+            environment = (path / 'environ').read_bytes().split(b'\0')
+            if not markers.intersection(environment):
+                continue
+            signal.pidfd_send_signal(fd, signal.SIGTERM)
+            fds.append(fd)
+            fd = None
+        except (FileNotFoundError, PermissionError, ProcessLookupError):
+            pass
+        finally:
+            if fd is not None:
+                os.close(fd)
+    # Let helpers finish their own cleanup before removing the private profile.
+    pending = set(fds)
+    deadline = time.monotonic() + 3
+    while pending and time.monotonic() < deadline:
+        ready, _, _ = select.select(list(pending), [], [], max(0, deadline - time.monotonic()))
+        pending.difference_update(ready)
+    for fd in pending:
+        try:
+            signal.pidfd_send_signal(fd, signal.SIGKILL)
+        except ProcessLookupError:
+            pass
+finally:
+    for fd in fds:
+        os.close(fd)
+PY
+  # Retry only this verified directory while terminated helpers finish exiting.
   local attempt
   for attempt in 1 2 3; do
-    if rm -rf -- "${profile:?}"; then
+    if rm -rf -- "${profile:?}" && [[ ! -e "$profile" ]]; then
+      printf '%s\n' 'PASS: isolated UI test profile and private helpers were cleaned up'
       return "$test_status"
     fi
   done
@@ -85,9 +138,21 @@ objects+=("$profile/server.o")
   -o "$profile/test-window-ui"
 
 # Never use the developer's servers, credentials, config or autostart entries.
-# Existing wording assertions are an English baseline; translated UI coverage
-# will use separate explicit locales once gettext is introduced.
-env LC_ALL=C LANGUAGE=en XDG_RUNTIME_DIR="$profile/runtime" WAYLAND_DISPLAY="$wayland_display" \
+# Existing wording assertions retain an explicit English baseline. The focused
+# translation test uses a non-C UTF-8 locale and a non-installed test catalog.
+test_locale=C
+test_language=en
+if [[ "$scope" == i18n-loading ]]; then
+  test_locale=en_US.UTF-8
+  test_language=de
+  if [[ "$(LC_ALL="$test_locale" locale charmap 2>/dev/null)" != UTF-8 ]]; then
+    printf '%s\n' 'The translated UI test requires en_US.UTF-8 (not a German locale).' >&2
+    exit 77
+  fi
+fi
+env LC_ALL="$test_locale" LANGUAGE="$test_language" TZ=UTC \
+  SMASHED_PUMPKIN_LOCALEDIR="$build/tests/i18n" \
+  XDG_RUNTIME_DIR="$profile/runtime" WAYLAND_DISPLAY="$wayland_display" \
   HOME="$profile" XDG_DATA_HOME="$profile/data" \
   XDG_CONFIG_HOME="$profile/config" XDG_CACHE_HOME="$profile/cache" \
   dbus-run-session -- timeout 90s env \
@@ -103,6 +168,10 @@ if [[ -n "$desktop_doc_mount" ]]; then
     exit 1
   fi
   printf '%s\n' 'PASS: the desktop document portal mount is unchanged'
+fi
+if [[ "$scope" == i18n-loading ]]; then
+  printf '%s\n' 'Only translation loading was exercised, using an isolated test catalog; no server was started.'
+  exit 0
 fi
 if [[ "$scope" == i18n-boundaries ]]; then
   printf '%s\n' 'Only i18n logic boundaries and updates were exercised, using isolated fake servers and local HTTP fixtures.'

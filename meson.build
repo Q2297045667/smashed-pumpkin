@@ -8,6 +8,15 @@ project('smashed-pumpkin', 'c',
 )
 
 gnome = import('gnome')
+i18n = import('i18n')
+gettext_package = 'smashed-pumpkin'
+gettext_locale_dir = get_option('prefix') / get_option('localedir')
+intl_dep = dependency('intl')
+msgfmt = find_program('msgfmt', native: true)
 
+subdir('po')
 subdir('src')
 subdir('data')
+if not meson.is_cross_build() and host_machine.system() == 'linux'
+  subdir('tests/i18n')
+endif

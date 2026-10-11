@@ -1,0 +1,1035 @@
+# SOME DESCRIPTIVE TITLE.
+# Copyright (C) YEAR THE PACKAGE'S COPYRIGHT HOLDER
+# This file is distributed under the same license as the smashed-pumpkin package.
+# FIRST AUTHOR <EMAIL@ADDRESS>, YEAR.
+#
+#, fuzzy
+msgid ""
+msgstr ""
+"Project-Id-Version: smashed-pumpkin\n"
+"Report-Msgid-Bugs-To: \n"
+"POT-Creation-Date: 2026-10-12 06:41+0800\n"
+"PO-Revision-Date: YEAR-MO-DA HO:MI+ZONE\n"
+"Last-Translator: FULL NAME <EMAIL@ADDRESS>\n"
+"Language-Team: LANGUAGE <LL@li.org>\n"
+"Language: \n"
+"MIME-Version: 1.0\n"
+"Content-Type: text/plain; charset=UTF-8\n"
+"Content-Transfer-Encoding: 8bit\n"
+
+#: resources/ui/window.ui:9 resources/ui/window-windows.ui:9
+msgid "_Info"
+msgstr ""
+
+#: resources/ui/window.ui:15 resources/ui/window-windows.ui:15
+msgid "_Quit"
+msgstr ""
+
+#: resources/ui/window.ui:54 resources/ui/window.ui:2386
+#: resources/ui/window.ui:2542 resources/ui/window-windows.ui:47
+#: resources/ui/window-windows.ui:2383 resources/ui/window-windows.ui:2539
+msgid "Back to Overview"
+msgstr ""
+
+#: resources/ui/window.ui:71 resources/ui/window-windows.ui:64
+msgid "No server selected"
+msgstr ""
+
+#: resources/ui/window.ui:90 resources/ui/window-windows.ui:82
+msgid "Support Pumpkin development"
+msgstr ""
+
+#: resources/ui/window.ui:104 resources/ui/window-windows.ui:96
+msgid "Sponsor Pumpkin"
+msgstr ""
+
+#: resources/ui/window.ui:122 resources/ui/window-windows.ui:119
+msgid "Overview"
+msgstr ""
+
+#: resources/ui/window.ui:146 resources/ui/window-windows.ui:143
+msgid "Server Networks"
+msgstr ""
+
+#: resources/ui/window.ui:156 resources/ui/window-windows.ui:153
+msgid "Add Network"
+msgstr ""
+
+#: resources/ui/window.ui:175 resources/ui/window.ui:2526
+#: resources/ui/window-windows.ui:172 resources/ui/window-windows.ui:2523
+msgid "Servers"
+msgstr ""
+
+#: resources/ui/window.ui:190 resources/ui/window.ui:2553
+#: resources/ui/window-windows.ui:187 resources/ui/window-windows.ui:2550
+msgid "Add Server"
+msgstr ""
+
+#: resources/ui/window.ui:195 resources/ui/window.ui:2559
+#: resources/ui/window-windows.ui:192 resources/ui/window-windows.ui:2556
+msgid "Import Server"
+msgstr ""
+
+#: resources/ui/window.ui:219 resources/ui/window-windows.ui:216
+msgid "Details"
+msgstr ""
+
+#: resources/ui/window.ui:239 resources/ui/window-windows.ui:236
+msgid "Toggle navigation"
+msgstr ""
+
+#: resources/ui/window.ui:255 resources/ui/window-windows.ui:252
+msgid "Up to date"
+msgstr ""
+
+#: resources/ui/window.ui:264 resources/ui/window-windows.ui:261
+msgid "Install"
+msgstr ""
+
+#: resources/ui/window.ui:273 resources/ui/window-windows.ui:270
+msgid "Update"
+msgstr ""
+
+#: resources/ui/window.ui:282 resources/ui/window-windows.ui:279
+msgid "Start"
+msgstr ""
+
+#: resources/ui/window.ui:291 resources/ui/window-windows.ui:288
+#: src/window-server-actions.c:30
+msgid "Stop"
+msgstr ""
+
+#: resources/ui/window.ui:300 resources/ui/window-windows.ui:297
+msgid "Restart"
+msgstr ""
+
+#: resources/ui/window.ui:355 resources/ui/window-windows.ui:352
+msgid "Console"
+msgstr ""
+
+#: resources/ui/window.ui:367 resources/ui/window-windows.ui:364
+msgid "System CPU: --"
+msgstr ""
+
+#: resources/ui/window.ui:373 resources/ui/window-windows.ui:370
+msgid "System RAM: --"
+msgstr ""
+
+#: resources/ui/window.ui:379 resources/ui/window-windows.ui:376
+msgid "Pumpkin CPU: --"
+msgstr ""
+
+#: resources/ui/window.ui:385 resources/ui/window-windows.ui:382
+msgid "Pumpkin RAM: --"
+msgstr ""
+
+#: resources/ui/window.ui:416 resources/ui/window-windows.ui:413
+msgid "Enter command…"
+msgstr ""
+
+#: resources/ui/window.ui:422 resources/ui/window-windows.ui:419
+msgid "Send command"
+msgstr ""
+
+#: resources/ui/window.ui:434 resources/ui/window-windows.ui:431
+msgid "Copy"
+msgstr ""
+
+#: resources/ui/window.ui:439 resources/ui/window-windows.ui:436
+msgid "Clear"
+msgstr ""
+
+#: resources/ui/window.ui:446 resources/ui/window-windows.ui:443
+msgid "Filter"
+msgstr ""
+
+#: resources/ui/window.ui:447 resources/ui/window-windows.ui:444
+msgid "Filter log levels"
+msgstr ""
+
+#: resources/ui/window.ui:461 resources/ui/window-windows.ui:458
+msgid "Console Levels"
+msgstr ""
+
+#: resources/ui/window.ui:468 resources/ui/window.ui:2207
+#: resources/ui/window-windows.ui:465 resources/ui/window-windows.ui:2204
+msgid "All"
+msgstr ""
+
+#: resources/ui/window.ui:474 resources/ui/window.ui:2226
+#: resources/ui/window-windows.ui:471 resources/ui/window-windows.ui:2223
+msgid "Trace"
+msgstr ""
+
+#: resources/ui/window.ui:480 resources/ui/window.ui:2225
+#: resources/ui/window-windows.ui:477 resources/ui/window-windows.ui:2222
+msgid "Debug"
+msgstr ""
+
+#: resources/ui/window.ui:486 resources/ui/window.ui:2222
+#: resources/ui/window-windows.ui:483 resources/ui/window-windows.ui:2219
+msgid "Info"
+msgstr ""
+
+#: resources/ui/window.ui:492 resources/ui/window.ui:2223
+#: resources/ui/window-windows.ui:489 resources/ui/window-windows.ui:2220
+msgid "Warn"
+msgstr ""
+
+#: resources/ui/window.ui:498 resources/ui/window.ui:2224
+#: resources/ui/window-windows.ui:495 resources/ui/window-windows.ui:2221
+msgid "Error"
+msgstr ""
+
+#: resources/ui/window.ui:504 resources/ui/window-windows.ui:501
+msgid "SMPK"
+msgstr ""
+
+#: resources/ui/window.ui:510 resources/ui/window-windows.ui:507
+msgid "Other"
+msgstr ""
+
+#: resources/ui/window.ui:523 resources/ui/window-windows.ui:520
+msgid "Server Folder"
+msgstr ""
+
+#: resources/ui/window.ui:537 resources/ui/window-windows.ui:534
+msgid "Stats"
+msgstr ""
+
+#: resources/ui/window.ui:560 resources/ui/window-windows.ui:557
+msgid "CPU"
+msgstr ""
+
+#: resources/ui/window.ui:609 resources/ui/window-windows.ui:606
+msgid "Memory"
+msgstr ""
+
+#: resources/ui/window.ui:646 resources/ui/window-windows.ui:643
+msgid "TPS"
+msgstr ""
+
+#: resources/ui/window.ui:684 resources/ui/window-windows.ui:681
+msgid "Plugins"
+msgstr ""
+
+#: resources/ui/window.ui:707 resources/ui/window-windows.ui:704
+msgid "Connect Marketplace account"
+msgstr ""
+
+#: resources/ui/window.ui:714 resources/ui/window-windows.ui:711
+msgid "Plugin Folder"
+msgstr ""
+
+#: resources/ui/window.ui:725 resources/ui/window.ui:945
+#: resources/ui/window-windows.ui:722 resources/ui/window-windows.ui:942
+msgid "Marketplace"
+msgstr ""
+
+#: resources/ui/window.ui:737 resources/ui/window-windows.ui:734
+msgid "Search marketplace plugins"
+msgstr ""
+
+#: resources/ui/window.ui:743 resources/ui/window-windows.ui:740
+msgid "Category"
+msgstr ""
+
+#: resources/ui/window.ui:751 resources/ui/window-windows.ui:748
+msgid "All types"
+msgstr ""
+
+#: resources/ui/window.ui:752 resources/ui/window-windows.ui:749
+msgid "Free"
+msgstr ""
+
+#: resources/ui/window.ui:753 resources/ui/window-windows.ui:750
+msgid "Paid"
+msgstr ""
+
+#: resources/ui/window.ui:754 resources/ui/window-windows.ui:751
+msgid "Adwall"
+msgstr ""
+
+#: resources/ui/window.ui:770 resources/ui/window.ui:1065
+#: resources/ui/window-windows.ui:767 resources/ui/window-windows.ui:1062
+msgid "Name"
+msgstr ""
+
+#: resources/ui/window.ui:771 resources/ui/window-windows.ui:768
+msgid "Downloads"
+msgstr ""
+
+#: resources/ui/window.ui:772 resources/ui/window-windows.ui:769
+msgid "Created"
+msgstr ""
+
+#: resources/ui/window.ui:773 resources/ui/window-windows.ui:770
+msgid "Updated"
+msgstr ""
+
+#: resources/ui/window.ui:783 resources/ui/window.ui:1074
+#: resources/ui/window-windows.ui:780 resources/ui/window-windows.ui:1071
+msgid "Sort descending"
+msgstr ""
+
+#: resources/ui/window.ui:790 resources/ui/window-windows.ui:787
+msgid "Refresh marketplace list"
+msgstr ""
+
+#: resources/ui/window.ui:801 resources/ui/window-windows.ui:798
+msgid "Loading marketplace plugins..."
+msgstr ""
+
+#: resources/ui/window.ui:813 resources/ui/window-windows.ui:810
+msgid "Reload"
+msgstr ""
+
+#: resources/ui/window.ui:814 resources/ui/window-windows.ui:811
+msgid "Retry loading Marketplace plugins"
+msgstr ""
+
+#: resources/ui/window.ui:819 resources/ui/window-windows.ui:816
+msgid "Previous"
+msgstr ""
+
+#: resources/ui/window.ui:825 resources/ui/window-windows.ui:822
+msgid "Next"
+msgstr ""
+
+#: resources/ui/window.ui:849 resources/ui/window-windows.ui:846
+#: src/window.c:2937
+msgid "Installed"
+msgstr ""
+
+#: resources/ui/window.ui:895 resources/ui/window-windows.ui:892
+msgid "Drop .so or .wasm plugins here"
+msgstr ""
+
+#: resources/ui/window.ui:911 resources/ui/window-windows.ui:908
+msgid "Import local plugins"
+msgstr ""
+
+#: resources/ui/window.ui:923 resources/ui/window-windows.ui:920
+msgid "Import"
+msgstr ""
+
+#: resources/ui/window.ui:933 resources/ui/window-windows.ui:930
+msgid "Browse plugin marketplace"
+msgstr ""
+
+#: resources/ui/window.ui:973 resources/ui/window.ui:1086
+#: resources/ui/window-windows.ui:970 resources/ui/window-windows.ui:1083
+msgid "All players"
+msgstr ""
+
+#: resources/ui/window.ui:989 resources/ui/window-windows.ui:986
+msgid "Your players"
+msgstr ""
+
+#: resources/ui/window.ui:996 resources/ui/window-windows.ui:993
+msgid "Player history and live connections"
+msgstr ""
+
+#: resources/ui/window.ui:1006 resources/ui/window-windows.ui:1003
+msgid "Open player data folder"
+msgstr ""
+
+#: resources/ui/window.ui:1025 resources/ui/window-windows.ui:1022
+msgid "Search players"
+msgstr ""
+
+#: resources/ui/window.ui:1031 resources/ui/window-windows.ui:1028
+msgid "Filter by connection status"
+msgstr ""
+
+#: resources/ui/window.ui:1035 resources/ui/window-windows.ui:1032
+msgid "Any status"
+msgstr ""
+
+#: resources/ui/window.ui:1036 resources/ui/window-windows.ui:1033
+msgid "Online"
+msgstr ""
+
+#: resources/ui/window.ui:1037 resources/ui/window-windows.ui:1034
+msgid "Offline"
+msgstr ""
+
+#: resources/ui/window.ui:1046 resources/ui/window-windows.ui:1043
+msgid "Clear search and connection-status filter"
+msgstr ""
+
+#: resources/ui/window.ui:1058 resources/ui/window-windows.ui:1055
+msgid "Sort players"
+msgstr ""
+
+#: resources/ui/window.ui:1062 resources/ui/window-windows.ui:1059
+msgid "Last seen"
+msgstr ""
+
+#: resources/ui/window.ui:1063 resources/ui/window-windows.ui:1060
+msgid "Playtime"
+msgstr ""
+
+#: resources/ui/window.ui:1064 resources/ui/window-windows.ui:1061
+msgid "Recorded since"
+msgstr ""
+
+#: resources/ui/window.ui:1111 resources/ui/window-windows.ui:1108
+msgid "Whitelist"
+msgstr ""
+
+#: resources/ui/window.ui:1137 resources/ui/window-windows.ui:1134
+msgid "Bans"
+msgstr ""
+
+#: resources/ui/window.ui:1150 resources/ui/window-windows.ui:1147
+msgid "Account bans"
+msgstr ""
+
+#: resources/ui/window.ui:1170 resources/ui/window-windows.ui:1167
+msgid "IP bans"
+msgstr ""
+
+#: resources/ui/window.ui:1177 resources/ui/window-windows.ui:1174
+msgid "Address blocks are independent of player connection status."
+msgstr ""
+
+#: resources/ui/window.ui:1208 resources/ui/window-windows.ui:1205
+msgid "Worlds"
+msgstr ""
+
+#: resources/ui/window.ui:1223 resources/ui/window-windows.ui:1220
+msgid "Settings"
+msgstr ""
+
+#: resources/ui/window.ui:1240 resources/ui/window-windows.ui:1237
+msgid "Application"
+msgstr ""
+
+#: resources/ui/window.ui:1261 resources/ui/window-windows.ui:1258
+msgid "Application startup"
+msgstr ""
+
+#: resources/ui/window.ui:1264 resources/ui/window-windows.ui:1261
+msgid "Start with system"
+msgstr ""
+
+#: resources/ui/window.ui:1265 resources/ui/window-windows.ui:1262
+msgid "Launch the app automatically when you log in."
+msgstr ""
+
+#: resources/ui/window.ui:1276 resources/ui/window-windows.ui:1273
+msgid "Start minimized"
+msgstr ""
+
+#: resources/ui/window.ui:1277 resources/ui/window-windows.ui:1274
+msgid "Start hidden in the system tray."
+msgstr ""
+
+#: resources/ui/window.ui:1290 resources/ui/window-windows.ui:1287
+msgid "Window at startup"
+msgstr ""
+
+#: resources/ui/window.ui:1291 resources/ui/window-windows.ui:1288
+msgid "Applies on the next launch."
+msgstr ""
+
+#: resources/ui/window.ui:1294 resources/ui/window-windows.ui:1291
+msgid "Expand on startup"
+msgstr ""
+
+#: resources/ui/window.ui:1295 resources/ui/window-windows.ui:1292
+msgid "Start maximized or in borderless fullscreen."
+msgstr ""
+
+#: resources/ui/window.ui:1300 resources/ui/window-windows.ui:1297
+msgid "Window mode"
+msgstr ""
+
+#: resources/ui/window.ui:1301 resources/ui/window-windows.ui:1298
+msgid "In fullscreen, press F11 to return to a window."
+msgstr ""
+
+#: resources/ui/window.ui:1305 resources/ui/window-windows.ui:1302
+msgid "Maximized window"
+msgstr ""
+
+#: resources/ui/window.ui:1306 resources/ui/window-windows.ui:1303
+msgid "Borderless fullscreen"
+msgstr ""
+
+#: resources/ui/window.ui:1314 resources/ui/window-windows.ui:1311
+msgid "Monitor"
+msgstr ""
+
+#: resources/ui/window.ui:1321 resources/ui/window-windows.ui:1318
+msgid "Display and time"
+msgstr ""
+
+#: resources/ui/window.ui:1324 resources/ui/window-windows.ui:1321
+msgid "Date format"
+msgstr ""
+
+#: resources/ui/window.ui:1325 resources/ui/window-windows.ui:1322
+msgid "Used in logs, player information and build labels."
+msgstr ""
+
+#: resources/ui/window.ui:1333 resources/ui/window-windows.ui:1330
+msgid "YYYY-MM-DD"
+msgstr ""
+
+#: resources/ui/window.ui:1334 resources/ui/window-windows.ui:1331
+msgid "DD.MM.YYYY"
+msgstr ""
+
+#: resources/ui/window.ui:1335 resources/ui/window-windows.ui:1332
+msgid "MM/DD/YYYY"
+msgstr ""
+
+#: resources/ui/window.ui:1345 resources/ui/window-windows.ui:1342
+msgid "Time format"
+msgstr ""
+
+#: resources/ui/window.ui:1346 resources/ui/window-windows.ui:1343
+msgid "Uses your local system timezone."
+msgstr ""
+
+#: resources/ui/window.ui:1354 resources/ui/window-windows.ui:1351
+msgid "24-hour"
+msgstr ""
+
+#: resources/ui/window.ui:1355 resources/ui/window-windows.ui:1352
+msgid "12-hour"
+msgstr ""
+
+#: resources/ui/window.ui:1367 resources/ui/window-windows.ui:1364
+msgid "Server startup"
+msgstr ""
+
+#: resources/ui/window.ui:1370 resources/ui/window-windows.ui:1367
+msgid "Auto-start servers on launch"
+msgstr ""
+
+#: resources/ui/window.ui:1371 resources/ui/window-windows.ui:1368
+msgid "Start the selected servers after their configured delay."
+msgstr ""
+
+#: resources/ui/window.ui:1391 resources/ui/window-windows.ui:1388
+msgid "Add server to auto-start list"
+msgstr ""
+
+#: resources/ui/window.ui:1397 resources/ui/window.ui:2470
+#: resources/ui/window-windows.ui:1394 resources/ui/window-windows.ui:2467
+msgid "Add server"
+msgstr ""
+
+#: resources/ui/window.ui:1413 resources/ui/window-windows.ui:1410
+msgid "Background and overview"
+msgstr ""
+
+#: resources/ui/window.ui:1416 resources/ui/window-windows.ui:1413
+msgid "Keep running in background"
+msgstr ""
+
+#: resources/ui/window.ui:1417 resources/ui/window-windows.ui:1414
+msgid "Closing the window keeps the app and servers running."
+msgstr ""
+
+#: resources/ui/window.ui:1428 resources/ui/window-windows.ui:1425
+msgid "Show detailed server cards"
+msgstr ""
+
+#: resources/ui/window.ui:1429 resources/ui/window-windows.ui:1426
+msgid "Show build, players, size, ports and status in the overview."
+msgstr ""
+
+#: resources/ui/window.ui:1442 resources/ui/window-windows.ui:1439
+msgid "Minimap"
+msgstr ""
+
+#: resources/ui/window.ui:1443 resources/ui/window-windows.ui:1440
+msgid "Optional world map and local player telemetry. Applies immediately."
+msgstr ""
+
+#: resources/ui/window.ui:1448 resources/ui/window-windows.ui:1445
+msgid "Downloads and storage"
+msgstr ""
+
+#: resources/ui/window.ui:1451 resources/ui/window-windows.ui:1448
+msgid "Pumpkin release channel"
+msgstr ""
+
+#: resources/ui/window.ui:1452 resources/ui/window-windows.ui:1449
+msgid ""
+"Applies to future installs and updates. Back up worlds before changing "
+"channels; plugin compatibility may differ."
+msgstr ""
+
+#: resources/ui/window.ui:1456 resources/ui/window-windows.ui:1453
+msgid "Nightly"
+msgstr ""
+
+#: resources/ui/window.ui:1457 resources/ui/window-windows.ui:1454
+msgid "Stable"
+msgstr ""
+
+#: resources/ui/window.ui:1465 resources/ui/window-windows.ui:1462
+msgid "Use local download cache"
+msgstr ""
+
+#: resources/ui/window.ui:1466 resources/ui/window-windows.ui:1463
+msgid "Reuse downloaded Pumpkin binaries across servers."
+msgstr ""
+
+#: resources/ui/window.ui:1477 resources/ui/window-windows.ui:1474
+msgid "Cached downloads"
+msgstr ""
+
+#: resources/ui/window.ui:1478 resources/ui/window-windows.ui:1475
+msgid "Installed servers are not removed."
+msgstr ""
+
+#: resources/ui/window.ui:1481 resources/ui/window-windows.ui:1478
+msgid "Clear Cache"
+msgstr ""
+
+#: resources/ui/window.ui:1483 resources/ui/window-windows.ui:1480
+msgid "Delete all cached Pumpkin binaries"
+msgstr ""
+
+#: resources/ui/window.ui:1492 resources/ui/window-windows.ui:1489
+msgid "Advanced"
+msgstr ""
+
+#: resources/ui/window.ui:1495 resources/ui/window-windows.ui:1492
+msgid "Download URL"
+msgstr ""
+
+#: resources/ui/window.ui:1496 resources/ui/window-windows.ui:1493
+msgid ""
+"Leave empty to use the selected release channel. Custom URLs override the "
+"channel and are not checked for updates."
+msgstr ""
+
+#: resources/ui/window.ui:1501 resources/ui/window-windows.ui:1498
+msgid "Pumpkin download URL (binary)"
+msgstr ""
+
+#: resources/ui/window.ui:1515 resources/ui/window-windows.ui:1512
+msgid "Save Application Settings"
+msgstr ""
+
+#: resources/ui/window.ui:1521 resources/ui/window.ui:2168
+#: resources/ui/window-windows.ui:1518 resources/ui/window-windows.ui:2165
+msgid "Reset to Defaults"
+msgstr ""
+
+#: resources/ui/window.ui:1538 resources/ui/window-windows.ui:1535
+msgid "Server"
+msgstr ""
+
+#: resources/ui/window.ui:1560 resources/ui/window-windows.ui:1557
+msgid "Server Settings"
+msgstr ""
+
+#: resources/ui/window.ui:1568 resources/ui/window-windows.ui:1565
+msgid "Identity & Install"
+msgstr ""
+
+#: resources/ui/window.ui:1575 resources/ui/window-windows.ui:1572
+msgid "Server name (shown in the app)"
+msgstr ""
+
+#: resources/ui/window.ui:1583 resources/ui/window-windows.ui:1580
+msgid "Choose Server Icon"
+msgstr ""
+
+#: resources/ui/window.ui:1588 resources/ui/window-windows.ui:1585
+msgid "Reset Icon"
+msgstr ""
+
+#: resources/ui/window.ui:1595 resources/ui/window-windows.ui:1592
+msgid ""
+"Minecraft uses a 64×64 PNG named server-icon.png in the server root. The "
+"image will be resized and saved there."
+msgstr ""
+
+#: resources/ui/window.ui:1607 resources/ui/window-windows.ui:1604
+msgid "Networking"
+msgstr ""
+
+#: resources/ui/window.ui:1621 resources/ui/window-windows.ui:1618
+msgid "Java Port"
+msgstr ""
+
+#: resources/ui/window.ui:1628 resources/ui/window.ui:1648
+#: resources/ui/window-windows.ui:1625 resources/ui/window-windows.ui:1645
+msgid "Port"
+msgstr ""
+
+#: resources/ui/window.ui:1641 resources/ui/window-windows.ui:1638
+msgid "Bedrock Port"
+msgstr ""
+
+#: resources/ui/window.ui:1659 resources/ui/window.ui:1668
+#: resources/ui/window.ui:2140 resources/ui/window-windows.ui:1656
+#: resources/ui/window-windows.ui:1665 resources/ui/window-windows.ui:2137
+msgid "Port must be 1–65535."
+msgstr ""
+
+#: resources/ui/window.ui:1677 resources/ui/window-windows.ui:1674
+msgid "Maximum player count."
+msgstr ""
+
+#: resources/ui/window.ui:1685 resources/ui/window-windows.ui:1682
+msgid "Max players"
+msgstr ""
+
+#: resources/ui/window.ui:1693 resources/ui/window-windows.ui:1690
+msgid "Max players must be at least 1."
+msgstr ""
+
+#: resources/ui/window.ui:1702 resources/ui/window-windows.ui:1699
+msgid "Update rate for stats and player polling (milliseconds)."
+msgstr ""
+
+#: resources/ui/window.ui:1710 resources/ui/window-windows.ui:1707
+msgid "Update rate (ms)"
+msgstr ""
+
+#: resources/ui/window.ui:1718 resources/ui/window-windows.ui:1715
+msgid "Update rate must be between 2ms and 2000ms."
+msgstr ""
+
+#: resources/ui/window.ui:1735 resources/ui/window-windows.ui:1732
+msgid "Domains & DDNS"
+msgstr ""
+
+#: resources/ui/window.ui:1742 resources/ui/window-windows.ui:1739
+msgid ""
+"Set hostnames for this server and optionally keep a Cloudflare DNS record "
+"updated when your home IP changes."
+msgstr ""
+
+#: resources/ui/window.ui:1750 resources/ui/window-windows.ui:1747
+msgid "Domain or subdomain (e.g. pumpkin.rotstein.dev)"
+msgstr ""
+
+#: resources/ui/window.ui:1758 resources/ui/window-windows.ui:1755
+msgid "Dynamic DNS (Cloudflare)"
+msgstr ""
+
+#: resources/ui/window.ui:1768 resources/ui/window-windows.ui:1765
+msgid "Enable DDNS"
+msgstr ""
+
+#: resources/ui/window.ui:1782 resources/ui/window-windows.ui:1779
+msgid "Cloudflare Zone ID (required)"
+msgstr ""
+
+#: resources/ui/window.ui:1787 resources/ui/window-windows.ui:1784
+msgid "Cloudflare API Token (required)"
+msgstr ""
+
+#: resources/ui/window.ui:1792 resources/ui/window-windows.ui:1789
+msgid "Cloudflare Record ID (optional, auto-discovered when empty)"
+msgstr ""
+
+#: resources/ui/window.ui:1800 resources/ui/window-windows.ui:1797
+msgid "Proxied (orange cloud)"
+msgstr ""
+
+#: resources/ui/window.ui:1817 resources/ui/window-windows.ui:1814
+msgid "Interval (30-86400 seconds)"
+msgstr ""
+
+#: resources/ui/window.ui:1837 resources/ui/window-windows.ui:1834
+msgid "Sync now"
+msgstr ""
+
+#: resources/ui/window.ui:1844 resources/ui/window-windows.ui:1841
+msgid "DDNS disabled."
+msgstr ""
+
+#: resources/ui/window.ui:1856 resources/ui/window-windows.ui:1853
+msgid "DNS setup guide"
+msgstr ""
+
+#: resources/ui/window.ui:1863 resources/ui/window-windows.ui:1860
+msgid "Target: your-public-ip (Java:25565, Bedrock:19132)"
+msgstr ""
+
+#: resources/ui/window.ui:1869 resources/ui/window-windows.ui:1866
+msgid "1) Create one A/AAAA record for your domain to your public server IP."
+msgstr ""
+
+#: resources/ui/window.ui:1877 resources/ui/window-windows.ui:1874
+msgid ""
+"2) If Java does not use port 25565, add an SRV record: _minecraft._tcp."
+"<domain> with your Java port."
+msgstr ""
+
+#: resources/ui/window.ui:1885 resources/ui/window-windows.ui:1882
+msgid ""
+"3) For Bedrock on the same domain, add an SRV record: _minecraft._udp."
+"<domain> with your Bedrock port if needed."
+msgstr ""
+
+#: resources/ui/window.ui:1893 resources/ui/window-windows.ui:1890
+msgid "Save Domain & DDNS Settings"
+msgstr ""
+
+#: resources/ui/window.ui:1906 resources/ui/window-windows.ui:1903
+msgid "Performance Limits"
+msgstr ""
+
+#: resources/ui/window.ui:1916 resources/ui/window-windows.ui:1913
+msgid "Max CPU cores"
+msgstr ""
+
+#: resources/ui/window.ui:1921 resources/ui/window-windows.ui:1918
+msgid "Max RAM (MB)"
+msgstr ""
+
+#: resources/ui/window.ui:1928 resources/ui/window-windows.ui:1925
+msgid "Max CPU cores available: --."
+msgstr ""
+
+#: resources/ui/window.ui:1937 resources/ui/window-windows.ui:1934
+msgid "Max RAM available: -- MB."
+msgstr ""
+
+#: resources/ui/window.ui:1946 resources/ui/window-windows.ui:1943
+msgid "Max available: -- cores, -- MB RAM."
+msgstr ""
+
+#: resources/ui/window.ui:1954 resources/ui/window-windows.ui:1951
+msgid "Recommendation: set at least 5 GB RAM."
+msgstr ""
+
+#: resources/ui/window.ui:1966 resources/ui/window-windows.ui:1963
+msgid "Reliability"
+msgstr ""
+
+#: resources/ui/window.ui:1976 resources/ui/window-windows.ui:1973
+msgid "Auto restart"
+msgstr ""
+
+#: resources/ui/window.ui:1993 resources/ui/window-windows.ui:1990
+msgid "Delay (ms)"
+msgstr ""
+
+#: resources/ui/window.ui:2001 resources/ui/window-windows.ui:1998
+msgid "ms"
+msgstr ""
+
+#: resources/ui/window.ui:2009 resources/ui/window-windows.ui:2006
+msgid "The server will restart automatically after this delay if it crashes."
+msgstr ""
+
+#: resources/ui/window.ui:2020 resources/ui/window-windows.ui:2017
+msgid "Auto Update"
+msgstr ""
+
+#: resources/ui/window.ui:2030 resources/ui/window-windows.ui:2027
+msgid "Install updates automatically"
+msgstr ""
+
+#: resources/ui/window.ui:2047 resources/ui/window-windows.ui:2044
+msgid "Use scheduled time"
+msgstr ""
+
+#: resources/ui/window.ui:2064 resources/ui/window-windows.ui:2061
+msgid "HH:MM (24h)"
+msgstr ""
+
+#: resources/ui/window.ui:2072 resources/ui/window-windows.ui:2069
+msgid "Local time"
+msgstr ""
+
+#: resources/ui/window.ui:2080 resources/ui/window-windows.ui:2077
+msgid "Use HH:MM (24h), e.g. 01:00."
+msgstr ""
+
+#: resources/ui/window.ui:2089 resources/ui/window-windows.ui:2086
+msgid ""
+"When enabled, the server announces a 10s update restart and then counts down "
+"3..2..1.. before restarting."
+msgstr ""
+
+#: resources/ui/window.ui:2101 resources/ui/window-windows.ui:2098
+msgid "RCON"
+msgstr ""
+
+#: resources/ui/window.ui:2108 resources/ui/window-windows.ui:2105
+msgid ""
+"RCON (Remote Console) is optional. Use it if you want to control the server "
+"from admin tools or scripts."
+msgstr ""
+
+#: resources/ui/window.ui:2119 resources/ui/window-windows.ui:2116
+msgid "RCON host"
+msgstr ""
+
+#: resources/ui/window.ui:2124 resources/ui/window-windows.ui:2121
+msgid "RCON port"
+msgstr ""
+
+#: resources/ui/window.ui:2131 resources/ui/window-windows.ui:2128
+msgid "Enter a valid IP address."
+msgstr ""
+
+#: resources/ui/window.ui:2149 resources/ui/window-windows.ui:2146
+msgid "RCON password (keep secret)"
+msgstr ""
+
+#: resources/ui/window.ui:2162 resources/ui/window-windows.ui:2159
+msgid "Save Server Settings"
+msgstr ""
+
+#: resources/ui/window.ui:2192 resources/ui/window-windows.ui:2189
+msgid "Logs"
+msgstr ""
+
+#: resources/ui/window.ui:2208 resources/ui/window-windows.ui:2205
+msgid "Today"
+msgstr ""
+
+#: resources/ui/window.ui:2209 resources/ui/window-windows.ui:2206
+msgid "This week"
+msgstr ""
+
+#: resources/ui/window.ui:2221 resources/ui/window-windows.ui:2218
+msgid "All levels"
+msgstr ""
+
+#: resources/ui/window.ui:2234 resources/ui/window-windows.ui:2231
+msgid "Search sessions…"
+msgstr ""
+
+#: resources/ui/window.ui:2241 resources/ui/window-windows.ui:2238
+msgid "Refresh sessions"
+msgstr ""
+
+#: resources/ui/window.ui:2261 resources/ui/window-windows.ui:2258
+msgid "Sessions"
+msgstr ""
+
+#: resources/ui/window.ui:2298 resources/ui/window-windows.ui:2295
+msgid "Session archive"
+msgstr ""
+
+#: resources/ui/window.ui:2306 resources/ui/window-windows.ui:2303
+msgid "Select a server session to view its log"
+msgstr ""
+
+#: resources/ui/window.ui:2342 resources/ui/window-windows.ui:2339
+msgid "Open Logs Folder"
+msgstr ""
+
+#: resources/ui/window.ui:2348 resources/ui/window-windows.ui:2345
+msgid "Clear All Logs"
+msgstr ""
+
+#: resources/ui/window.ui:2370 resources/ui/window-windows.ui:2367
+msgid "Network Details"
+msgstr ""
+
+#: resources/ui/window.ui:2405 resources/ui/window-windows.ui:2402
+msgid "No network selected"
+msgstr ""
+
+#: resources/ui/window.ui:2442 resources/ui/window-windows.ui:2439
+msgid "Start all"
+msgstr ""
+
+#: resources/ui/window.ui:2449 resources/ui/window-windows.ui:2446
+msgid "Stop all"
+msgstr ""
+
+#: resources/ui/window.ui:2456 resources/ui/window-windows.ui:2453
+msgid "Update all"
+msgstr ""
+
+#: resources/ui/window.ui:2463 resources/ui/window-windows.ui:2460
+msgid "Install all"
+msgstr ""
+
+#: resources/ui/window.ui:2477 resources/ui/window-windows.ui:2474
+msgid "Set icon"
+msgstr ""
+
+#: resources/ui/window.ui:2484 resources/ui/window-windows.ui:2481
+msgid "Reset icon"
+msgstr ""
+
+#: resources/ui/window.ui:2491 resources/ui/window-windows.ui:2488
+msgid "Set proxy"
+msgstr ""
+
+#: resources/ui/window.ui:2498 resources/ui/window-windows.ui:2495
+msgid "Clear proxy"
+msgstr ""
+
+#: resources/ui/window.ui:2566 resources/ui/window-windows.ui:2563
+msgid "Delete"
+msgstr ""
+
+#. Translators: %s is a display date/time, not persisted build metadata.
+#. Translators: %s is an unmodified build identifier.
+#: src/build-metadata.c:88 src/window.c:2934
+#, c-format
+msgid "Build %s"
+msgstr ""
+
+#. Translators: %s is an unmodified version identifier.
+#: src/build-metadata.c:92
+#, c-format
+msgid "Stable %s"
+msgstr ""
+
+#. Translators: %s is an unmodified nightly build identifier.
+#: src/build-metadata.c:96
+#, c-format
+msgid "Nightly %s"
+msgstr ""
+
+#: src/tray.c:100
+msgid "Open"
+msgstr ""
+
+#: src/tray.c:101
+msgid "Quit"
+msgstr ""
+
+#: src/window.c:2915
+msgid "Installing..."
+msgstr ""
+
+#: src/window.c:2917
+msgid "Not installed"
+msgstr ""
+
+#: src/window-server-actions.c:30
+msgid "Force Stop..."
+msgstr ""
+
+#: src/window-server-actions.c:30
+msgid "Stopping..."
+msgstr ""
+
+#: src/window-server-actions.c:37
+msgid "Force termination can lose unsaved data"
+msgstr ""
+
+#: src/window-server-actions.c:37
+msgid "Save data and stop the server"
+msgstr ""
+
+#: src/window-server-actions.c:39
+msgid "Download first, then safely stop, install and restart"
+msgstr ""
+
+#: src/window-server-actions.c:39
+msgid "Update the installed server"
+msgstr ""

@@ -16,6 +16,8 @@
 #include "vendor/cjson/cJSON.h"
 #include "refresh-button.h"
 #include "build-metadata.h"
+#include "i18n.h"
+#include <locale.h>
 #include <glib/gstdio.h>
 #include <libsoup/soup.h>
 #include <math.h>
@@ -2010,13 +2012,98 @@ static void test_i18n_boundaries_only(PumpkinWindow *window)
   g_print("PASS: i18n boundary regressions use stable widget identities and retain raw persisted build metadata\n");
 }
 
+static GtkWidget *find_label_containing(GtkWidget *root, const char *text)
+{
+  if (GTK_IS_LABEL(root) && strstr(gtk_label_get_text(GTK_LABEL(root)), text) != NULL) return root;
+  for (GtkWidget *child = gtk_widget_get_first_child(root); child != NULL;
+       child = gtk_widget_get_next_sibling(child)) {
+    GtkWidget *found = find_label_containing(child, text);
+    if (found != NULL) return found;
+  }
+  return NULL;
+}
+
+static void test_i18n_loading_only(PumpkinWindow *window)
+{
+  /* Keep this test independent of remote release metadata and actual servers. */
+  ++window->latest_resolve_generation;
+  if (window->latest_resolve_cancellable != NULL) g_cancellable_cancel(window->latest_resolve_cancellable);
+  g_clear_object(&window->latest_resolve_cancellable);
+  window->latest_resolve_in_flight = FALSE;
+  if (window->latest_poll_id != 0) {
+    g_source_remove(window->latest_poll_id);
+    window->latest_poll_id = 0;
+  }
+  g_clear_pointer(&window->latest_error, g_free);
+  g_clear_pointer(&window->latest_url, g_free);
+  window->latest_url = g_strdup("https://example.org/test-managed-build");
+  g_clear_pointer(&window->latest_build_id, g_free);
+  g_clear_pointer(&window->latest_build_label, g_free);
+  window->latest_build_label = g_strdup("Build 2026-10-12 03:04 UTC");
+
+  /* Look up widgets and pages by stable identity, then assert their presentation. */
+  GtkWidget *overview = adw_view_stack_get_child_by_name(window->view_stack, "overview");
+  g_assert_nonnull(overview);
+  AdwViewStackPage *page = adw_view_stack_get_page(window->view_stack, overview);
+  g_assert_cmpstr(adw_view_stack_page_get_title(page), ==, "Übersicht");
+  g_assert_cmpstr(gtk_window_get_title(GTK_WINDOW(window)), ==, "Smashed Pumpkin");
+  g_assert_cmpstr(gtk_button_get_label(window->btn_details_install), ==, "Installieren");
+  g_assert_cmpstr(setlocale(LC_NUMERIC, NULL), ==, "C");
+  g_assert_cmpstr(localeconv()->decimal_point, ==, ".");
+
+  pumpkin_config_set_detailed_overview_cards(window->config, TRUE);
+  g_autoptr(PumpkinServer) server = pumpkin_server_store_add(window->store, "I18n loading", NULL);
+  pumpkin_window_select_server(window, pumpkin_server_get_id(server));
+  g_assert_nonnull(find_label_containing(overview_row_for(window, server), "Nicht installiert"));
+  pumpkin_window_update_server_actions(window, FALSE, FALSE, FALSE, FALSE);
+  g_assert_true(gtk_widget_get_visible(GTK_WIDGET(window->btn_details_install)));
+  g_assert_cmpstr(gtk_button_get_label(window->btn_details_stop), ==, "Anhalten");
+  g_assert_cmpstr(gtk_widget_get_tooltip_text(GTK_WIDGET(window->btn_details_stop)), ==,
+                 "Daten speichern und den Server anhalten");
+  g_assert_cmpstr(gtk_widget_get_tooltip_text(GTK_WIDGET(window->btn_details_update)), ==,
+                 "Den installierten Server aktualisieren");
+
+  /* A padded fake binary supplies installation state without running a process. */
+  g_autofree char *bin = pumpkin_server_get_bin_path(server);
+  g_autofree char *executable = NULL;
+  gsize executable_size = 0;
+  g_assert_true(g_file_get_contents(g_getenv("FAKE_MANAGED_PUMPKIN_BINARY"),
+                                   &executable, &executable_size, NULL));
+  gsize size = MAX(executable_size, (gsize)MIN_VALID_PUMPKIN_BINARY_BYTES);
+  g_autofree char *binary = g_malloc0(size);
+  memcpy(binary, executable, executable_size);
+  g_assert_true(g_file_set_contents(bin, binary, (gssize)size, NULL));
+  g_assert_cmpint(g_chmod(bin, 0755), ==, 0);
+  pumpkin_server_set_installed_build_label(server, "Build 2026-10-12 03:04 UTC");
+  pumpkin_config_set_date_format(window->config, PUMPKIN_DATE_FORMAT_YMD);
+  pumpkin_config_set_time_format(window->config, PUMPKIN_TIME_FORMAT_24H);
+  GtkWidget *row = overview_row_for(window, server);
+  g_assert_nonnull(find_label_containing(row, "Erstellt 2026-10-12 03:04"));
+  g_assert_null(find_css_class(row, "update-button"));
+  g_assert_cmpstr(pumpkin_server_get_installed_build_label(server), ==, "Build 2026-10-12 03:04 UTC");
+  g_assert_cmpstr(pumpkin_server_get_name(server), ==, "I18n loading");
+  pumpkin_server_set_installed_build_id(server, "old-build");
+  window->latest_build_id = g_strdup("new-build");
+  g_assert_nonnull(find_css_class(overview_row_for(window, server), "update-button"));
+  g_assert_false(pumpkin_server_get_running(server));
+
+  gtk_window_destroy(GTK_WINDOW(window));
+  spin(650);
+  g_print("PASS: GTK template and dynamic C translations load; raw build identities, branding and numeric wire formats stay stable\n");
+}
+
 int main(void)
 {
+  gtk_disable_setlocale();
+  pumpkin_i18n_init();
   adw_init();
   smashed_pumpkin_register_resource();
   g_autoptr(AdwApplication) app = adw_application_new("dev.rotstein.SmashedPumpkin.UIRegression", G_APPLICATION_NON_UNIQUE);
   g_assert_true(g_application_register(G_APPLICATION(app), NULL, NULL));
   PumpkinWindow *window = PUMPKIN_WINDOW(pumpkin_window_new(app));
+  if (g_strcmp0(g_getenv("SMASHED_UI_TEST_SCOPE"), "i18n-loading") == 0) {
+    test_i18n_loading_only(window); return 0;
+  }
   if (g_strcmp0(g_getenv("SMASHED_UI_TEST_SCOPE"), "i18n-boundaries") == 0) {
     test_i18n_boundaries_only(window); return 0;
   }

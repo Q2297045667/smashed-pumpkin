@@ -1,4 +1,5 @@
 #include "build-metadata.h"
+#include "i18n.h"
 
 #include <string.h>
 
@@ -83,14 +84,16 @@ pumpkin_build_metadata_format(const char *metadata, const char *date_time_format
     g_autoptr(GDateTime) display_date = is_utc ? g_date_time_to_local(date) : g_date_time_ref(date);
     g_autofree char *formatted = g_date_time_format(display_date,
       date_time_format != NULL ? date_time_format : "%Y-%m-%d %H:%M");
-    /* Only these presentation strings should become gettext entries later. */
-    return g_strdup_printf("Build %s", formatted);
+    /* Translators: %s is a display date/time, not persisted build metadata. */
+    return g_strdup_printf(_("Build %s"), formatted);
   }
   if (g_str_has_prefix(metadata, "Stable ")) {
-    return g_strdup_printf("Stable %s", metadata + 7);
+    /* Translators: %s is an unmodified version identifier. */
+    return g_strdup_printf(_("Stable %s"), metadata + 7);
   }
   if (g_str_has_prefix(metadata, "Nightly ")) {
-    return g_strdup_printf("Nightly %s", metadata + 8);
+    /* Translators: %s is an unmodified nightly build identifier. */
+    return g_strdup_printf(_("Nightly %s"), metadata + 8);
   }
   return g_strdup(metadata);
 }

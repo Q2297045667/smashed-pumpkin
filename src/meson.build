@@ -120,6 +120,8 @@ sources = [
   'release-channel.h',
   'release-metadata.c',
   'release-metadata.h',
+  'build-metadata.c',
+  'build-metadata.h',
   'minimap-model.c',
   'minimap-model.h',
   'minimap-store.c',
@@ -239,6 +241,15 @@ if not meson.is_cross_build()
     include_directories: inc,
     dependencies: [dependency('gio-2.0'), soup_dep, math_dep, cjson_dep], install: false)
   test('release-download', release_download_tests)
+  build_metadata_tests = executable('test-build-metadata',
+    ['../tests/test-build-metadata.c', 'build-metadata.c'],
+    include_directories: inc, dependencies: dependency('glib-2.0'), install: false)
+  test('build-metadata', build_metadata_tests)
+  download_http_tests = executable('test-download-http',
+    ['../tests/test-download-http.c', 'download.c', 'release-channel.c', 'release-metadata.c'],
+    include_directories: inc,
+    dependencies: [dependency('gio-2.0'), soup_dep, math_dep, cjson_dep], install: false)
+  test('download-http', download_http_tests)
   minimap_tests = executable('test-minimap',
     ['../tests/test-minimap.c', 'minimap-model.c', 'minimap-store.c', 'minimap-terrain.c', 'minimap-cache.c', 'minimap-motion.c', 'minimap-render.c', 'vendor/tomlc17/tomlc17.c', resources],
     include_directories: inc,

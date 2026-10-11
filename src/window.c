@@ -2,6 +2,7 @@
 #include "app.h"
 
 #include "download.h"
+#include "build-metadata.h"
 #include "refresh-button.h"
 #include "server-maintenance.h"
 #include "window-worlds.h"
@@ -131,7 +132,7 @@ typedef struct DownloadContext {
   PumpkinServer *server;
   char *used_url;
   char *used_build_id;
-  char *used_build_label;
+  char *used_build_label; /* Raw build metadata, persisted after installation. */
   char *dest_path;
   char *tmp_path;
   char *server_bin;
@@ -347,7 +348,7 @@ static void on_log_search_changed(GtkEditable *editable, PumpkinWindow *self);
 static void on_log_file_activated(GtkListBox *box, GtkListBoxRow *row, PumpkinWindow *self);
 static void on_open_logs(GtkButton *button, PumpkinWindow *self);
 static void on_clear_all_logs(GtkButton *button, PumpkinWindow *self);
-static char *build_label_from_binary_path(PumpkinWindow *self, const char *bin_path);
+static char *build_metadata_from_binary_path(const char *bin_path);
 gboolean start_after_delay(gpointer data);
 static gboolean on_plugins_drop(GtkDropTarget *target, const GValue *value, double x, double y, PumpkinWindow *self);
 static void cache_wait_context_free(CacheWaitContext *ctx);
@@ -379,7 +380,7 @@ static char *format_unix_time(PumpkinWindow *self, gint64 unix_ts);
 static char *format_duration(guint64 seconds);
 static char *relative_time_label(gint64 unix_ts);
 static const char *date_time_pattern_for_config(PumpkinWindow *self);
-static char *normalize_build_label(PumpkinWindow *self, const char *label);
+static char *format_build_label(PumpkinWindow *self, const char *label);
 static const char *platform_label(PlayerPlatform platform);
 static GPtrArray *build_ip_unban_candidates(const char *raw_ip);
 static gboolean refresh_player_list_deferred(gpointer data);
@@ -2285,34 +2286,14 @@ static void
 on_log_line(PumpkinServer *server, const char *line, PumpkinWindow *self)
 {
   gboolean is_current = (self->current == server);
-  gboolean internal_line =
-    line != NULL &&
-    (g_strcmp0(line, "Server process exited") == 0 ||
-     g_strcmp0(line, "Auto-restart scheduled") == 0);
   g_autofree char *clean = line != NULL ? pumpkin_strip_ansi(line) : NULL;
   const char *check = clean != NULL ? clean : line;
-  if (check != NULL &&
-      *check != '\0' &&
-      g_strcmp0(line, "Server process exited") != 0 &&
-      g_strcmp0(line, "Auto-restart scheduled") != 0) {
+  if (check != NULL && *check != '\0') {
     set_server_running_hint(self, server, TRUE);
-  }
-  if (check != NULL &&
-      (strstr(check, "Server is now running") != NULL ||
-       strstr(check, "Started server") != NULL ||
-       strstr(check, "Server query running on port") != NULL ||
-       strstr(check, "Server is running") != NULL ||
-       strstr(check, "Done") != NULL ||
-       strstr(check, "Listening") != NULL)) {
-    set_server_running_hint(self, server, TRUE);
-  }
-  if (line != NULL && g_strcmp0(line, "Server process exited") == 0) {
-    set_server_running_hint(self, server, FALSE);
   }
   gboolean tps_line = FALSE;
-  gboolean list_line = FALSE;
   g_autofree char *message = pumpkin_player_log_message(check);
-  list_line = pumpkin_parse_player_list_snapshot_line(message, NULL, NULL);
+  gboolean list_line = pumpkin_parse_player_list_snapshot_line(message, NULL, NULL);
   if (message != NULL && g_ascii_strncasecmp(message, "TPS", 3) == 0) {
     double tps = 0.0;
     if (pumpkin_parse_tps_from_line(message, &tps)) {
@@ -2331,23 +2312,13 @@ on_log_line(PumpkinServer *server, const char *line, PumpkinWindow *self)
   if (list_line) {
     suppress_auto_line |= pumpkin_command_consume_reply(G_OBJECT(server), "list");
   }
-  if (internal_line && g_strcmp0(line, "Server process exited") == 0) {
-    pumpkin_command_tracking_reset(G_OBJECT(server));
-  }
-  if (!internal_line && !suppress_auto_line) {
+  if (!suppress_auto_line) {
     append_console_line(self, server, line);
   }
-  if (!is_current) {
-    if (line != NULL && g_strcmp0(line, "Server process exited") == 0) {
-      if (self->auto_update_server == server) {
-        clear_auto_update_countdown(self);
-      }
-      queue_overview_refresh(self, FALSE);
-    }
-    return;
-  }
+  if (!is_current) return;
 
   update_live_player_names(self, line);
+  /* These are upstream server protocol tokens, not application UI messages. */
   if (check != NULL && self->ui_state == UI_STATE_STARTING) {
     if (strstr(check, "Server is now running") != NULL ||
         strstr(check, "Started server") != NULL ||
@@ -2359,38 +2330,49 @@ on_log_line(PumpkinServer *server, const char *line, PumpkinWindow *self)
       queue_overview_refresh(self, TRUE);
     }
   }
-  if (line != NULL && g_strcmp0(line, "Server process exited") == 0) {
-    if (self->auto_update_server == server) {
-      clear_auto_update_countdown(self);
-    }
-    player_states_mark_all_offline(self);
-    player_states_save(self, server);
-    self->tps_enabled = FALSE;
-    self->last_tps_valid = FALSE;
-    self->list_snapshot_players = 0;
-    self->list_snapshot_max_players = 0;
-    self->list_snapshot_updated_at = 0;
+}
 
-    if (!self->restart_requested) {
-      if (!self->user_stop_requested) {
-        set_console_warning(self, "Server stopped unexpectedly.", TRUE);
-      } else {
-        set_console_warning(self, NULL, FALSE);
-      }
-      self->user_stop_requested = FALSE;
-      self->ui_state = UI_STATE_IDLE;
-      queue_overview_refresh(self, TRUE);
+static void
+on_server_process_exited(PumpkinServer *server, PumpkinWindow *self)
+{
+  if (self->disposing) return;
+  set_server_running_hint(self, server, FALSE);
+  pumpkin_command_tracking_reset(G_OBJECT(server));
+  if (self->auto_update_server == server) {
+    clear_auto_update_countdown(self);
+  }
+  if (self->current != server) {
+    queue_overview_refresh(self, FALSE);
+    return;
+  }
+
+  player_states_mark_all_offline(self);
+  player_states_save(self, server);
+  self->tps_enabled = FALSE;
+  self->last_tps_valid = FALSE;
+  self->list_snapshot_players = 0;
+  self->list_snapshot_max_players = 0;
+  self->list_snapshot_updated_at = 0;
+
+  if (!self->restart_requested) {
+    if (!self->user_stop_requested) {
+      set_console_warning(self, "Server stopped unexpectedly.", TRUE);
+    } else {
+      set_console_warning(self, NULL, FALSE);
     }
-    if (self->restart_requested && self->restart_pending) {
-      self->restart_pending = FALSE;
-      RestartContext *ctx = g_new0(RestartContext, 1);
-      ctx->self = g_object_ref(self);
-      ctx->server = g_object_ref(server);
-      if (self->restart_delay_id != 0) {
-        g_source_remove(self->restart_delay_id);
-      }
-      self->restart_delay_id = g_timeout_add(0, restart_after_delay, ctx);
+    self->user_stop_requested = FALSE;
+    self->ui_state = UI_STATE_IDLE;
+    queue_overview_refresh(self, TRUE);
+  }
+  if (self->restart_requested && self->restart_pending) {
+    self->restart_pending = FALSE;
+    RestartContext *ctx = g_new0(RestartContext, 1);
+    ctx->self = g_object_ref(self);
+    ctx->server = g_object_ref(server);
+    if (self->restart_delay_id != 0) {
+      g_source_remove(self->restart_delay_id);
     }
+    self->restart_delay_id = g_timeout_add(0, restart_after_delay, ctx);
   }
 }
 
@@ -2441,6 +2423,8 @@ ensure_server_log_handler(PumpkinWindow *self, PumpkinServer *server)
   g_signal_connect_object(server, "log-line", G_CALLBACK(on_log_line), self, 0);
   g_signal_handlers_disconnect_by_func(server, G_CALLBACK(on_server_session_started), self);
   g_signal_connect_object(server, "session-started", G_CALLBACK(on_server_session_started), self, 0);
+  g_signal_handlers_disconnect_by_func(server, G_CALLBACK(on_server_process_exited), self);
+  g_signal_connect_object(server, "process-exited", G_CALLBACK(on_server_process_exited), self, 0);
   g_signal_handlers_disconnect_by_func(server, G_CALLBACK(on_server_state_changed), self);
   g_signal_connect_object(server, "state-changed", G_CALLBACK(on_server_state_changed), self, 0);
   g_signal_handlers_disconnect_by_func(server, G_CALLBACK(prepare_bridge_for_start), self);
@@ -2845,51 +2829,9 @@ date_time_pattern_for_config(PumpkinWindow *self)
 }
 
 static char *
-normalize_build_label(PumpkinWindow *self, const char *label)
+format_build_label(PumpkinWindow *self, const char *metadata)
 {
-  if (label == NULL || *label == '\0') {
-    return NULL;
-  }
-
-  const char *text = label;
-  if (g_str_has_prefix(text, "Build ")) {
-    text += 6;
-  }
-
-  int year = 0;
-  int month = 0;
-  int day = 0;
-  int hour = 0;
-  int minute = 0;
-
-  if (sscanf(text, "%d-%d-%d %d:%d UTC", &year, &month, &day, &hour, &minute) == 5) {
-    g_autoptr(GDateTime) utc_dt = g_date_time_new_utc(year, month, day, hour, minute, 0.0);
-    if (utc_dt != NULL) {
-      g_autoptr(GDateTime) local_dt = g_date_time_to_local(utc_dt);
-      if (local_dt != NULL) {
-        g_autofree char *formatted = g_date_time_format(local_dt, date_time_pattern_for_config(self));
-        return g_strdup_printf("Build %s", formatted);
-      }
-    }
-  }
-
-  if (sscanf(text, "%d-%d-%d %d:%d", &year, &month, &day, &hour, &minute) == 5) {
-    g_autoptr(GDateTime) local_dt = g_date_time_new_local(year, month, day, hour, minute, 0.0);
-    if (local_dt != NULL) {
-      g_autofree char *formatted = g_date_time_format(local_dt, date_time_pattern_for_config(self));
-      return g_strdup_printf("Build %s", formatted);
-    }
-  }
-
-  if (sscanf(text, "%d-%d-%d", &year, &month, &day) == 3) {
-    g_autoptr(GDateTime) local_dt = g_date_time_new_local(year, month, day, 0, 0, 0.0);
-    if (local_dt != NULL) {
-      g_autofree char *formatted = g_date_time_format(local_dt, date_time_pattern_for_config(self));
-      return g_strdup_printf("Build %s", formatted);
-    }
-  }
-
-  return g_strdup(label);
+  return pumpkin_build_metadata_format(metadata, date_time_pattern_for_config(self));
 }
 
 static char *
@@ -2954,9 +2896,9 @@ relative_time_label(gint64 unix_ts)
 }
 
 static char *
-get_server_version(PumpkinWindow *self, PumpkinServer *server)
+format_server_version(PumpkinWindow *self, PumpkinServer *server, gboolean installed)
 {
-  if (!server_has_installation(self, server)) {
+  if (!installed) {
     DownloadProgressState *state = get_download_progress_state(self, server, FALSE);
     if (state != NULL && state->active) {
       return g_strdup("Installing...");
@@ -2965,44 +2907,31 @@ get_server_version(PumpkinWindow *self, PumpkinServer *server)
   }
   g_autofree char *bin = pumpkin_server_get_bin_path(server);
 
-  const char *stored_label = pumpkin_server_get_installed_build_label(server);
-  if (stored_label != NULL && *stored_label != '\0') {
-    return normalize_build_label(self, stored_label);
+  const char *stored_metadata = pumpkin_server_get_installed_build_label(server);
+  if (stored_metadata != NULL && *stored_metadata != '\0') {
+    return format_build_label(self, stored_metadata);
   }
 
-  g_autofree char *mtime_label = build_label_from_binary_path(self, bin);
-  if (mtime_label != NULL) {
-    return g_strdup(mtime_label);
+  g_autofree char *mtime_metadata = build_metadata_from_binary_path(bin);
+  if (mtime_metadata != NULL) {
+    return format_build_label(self, mtime_metadata);
   }
 
   const char *stored_id = pumpkin_server_get_installed_build_id(server);
   if (stored_id != NULL && *stored_id != '\0') {
-    g_autofree char *raw = g_strdup_printf("Build %s", stored_id);
-    return normalize_build_label(self, raw);
+    return g_strdup_printf("Build %s", stored_id);
   }
 
   return g_strdup("Installed");
 }
 
 static char *
-build_label_from_binary_path(PumpkinWindow *self, const char *bin_path)
+build_metadata_from_binary_path(const char *bin_path)
 {
-  if (bin_path == NULL) {
-    return NULL;
-  }
-
+  if (bin_path == NULL) return NULL;
   GStatBuf st;
-  if (g_stat(bin_path, &st) != 0) {
-    return NULL;
-  }
-
-  g_autoptr(GDateTime) dt = g_date_time_new_from_unix_local(st.st_mtime);
-  if (dt == NULL) {
-    return NULL;
-  }
-
-  g_autofree char *formatted = g_date_time_format(dt, date_time_pattern_for_config(self));
-  return g_strdup_printf("Build %s", formatted != NULL ? formatted : "Unknown");
+  if (g_stat(bin_path, &st) != 0) return NULL;
+  return pumpkin_build_metadata_from_unix(st.st_mtime);
 }
 
 static gboolean
@@ -3020,11 +2949,7 @@ is_update_available_by_metadata(PumpkinWindow *self, PumpkinServer *server, gboo
 
   if (self->latest_build_label != NULL && *self->latest_build_label != '\0') {
     const char *installed_label = pumpkin_server_get_installed_build_label(server);
-    g_autofree char *latest_norm = normalize_build_label(self, self->latest_build_label);
-    g_autofree char *installed_norm = normalize_build_label(self, installed_label);
-    if (latest_norm != NULL && *latest_norm != '\0') {
-      return (installed_norm == NULL || g_strcmp0(latest_norm, installed_norm) != 0);
-    }
+    return !pumpkin_build_metadata_equal(self->latest_build_label, installed_label);
   }
 
   const char *installed_url = pumpkin_server_get_installed_url(server);
@@ -3270,8 +3195,8 @@ auto_update_countdown_tick(gpointer data)
         const char *from_id = pumpkin_server_get_installed_build_id(server);
         const char *to_label = self->latest_build_label;
         const char *to_id = self->latest_build_id;
-        g_autofree char *from_label_norm = normalize_build_label(self, from_label);
-        g_autofree char *to_label_norm = normalize_build_label(self, to_label);
+        g_autofree char *from_label_norm = format_build_label(self, from_label);
+        g_autofree char *to_label_norm = format_build_label(self, to_label);
         const char *from = (from_label_norm != NULL && *from_label_norm != '\0') ? from_label_norm :
                            ((from_id != NULL && *from_id != '\0') ? from_id : "installed");
         const char *to = (to_label_norm != NULL && *to_label_norm != '\0') ? to_label_norm :
@@ -3784,8 +3709,8 @@ on_overview_update_clicked(GtkButton *button, gpointer user_data)
   const char *from_id = pumpkin_server_get_installed_build_id(server);
   const char *to_label = self->latest_build_label;
   const char *to_id = self->latest_build_id;
-  g_autofree char *from_label_norm = normalize_build_label(self, from_label);
-  g_autofree char *to_label_norm = normalize_build_label(self, to_label);
+  g_autofree char *from_label_norm = format_build_label(self, from_label);
+  g_autofree char *to_label_norm = format_build_label(self, to_label);
   const char *from = (from_label_norm != NULL && *from_label_norm != '\0') ? from_label_norm :
                      ((from_id != NULL && *from_id != '\0') ? from_id : "installed");
   const char *to = (to_label_norm != NULL && *to_label_norm != '\0') ? to_label_norm :
@@ -5296,9 +5221,9 @@ on_market_install_download_done(GObject *source, GAsyncResult *res, gpointer use
       g_remove(ctx->tmp_path);
     }
     const char *message = error != NULL ? error->message : "Marketplace returned an invalid WASM plugin.";
-    if (strstr(message, "HTTP status 401") != NULL) {
+    if (g_error_matches(error, PUMPKIN_DOWNLOAD_HTTP_ERROR, SOUP_STATUS_UNAUTHORIZED)) {
       message = "The Marketplace rejected this anonymous free download. No API key was sent.";
-    } else if (strstr(message, "HTTP status 403") != NULL) {
+    } else if (g_error_matches(error, PUMPKIN_DOWNLOAD_HTTP_ERROR, SOUP_STATUS_FORBIDDEN)) {
       message = "The Marketplace does not currently allow downloading this plugin.";
     }
     append_log(self, message);
@@ -7485,7 +7410,8 @@ create_overview_server_card(PumpkinWindow *self,
     return NULL;
   }
 
-  g_autofree char *version = get_server_version(self, server);
+  gboolean has_installation = server_has_installation(self, server);
+  g_autofree char *version = format_server_version(self, server, has_installation);
   g_autofree char *size = get_server_size(server);
   int players = get_overview_player_count(self, server);
   int java_port = pumpkin_server_get_port(server);
@@ -7496,11 +7422,10 @@ create_overview_server_card(PumpkinWindow *self,
     state->overview_bar = NULL;
   }
   gboolean running = server_is_running_ui(self, server);
-  gboolean installed = download_active || g_strcmp0(version, "Not installed") != 0;
+  gboolean installed = download_active || has_installation;
   gboolean global_download_active = any_download_active(self);
   gboolean maintenance = pumpkin_server_get_maintenance(server);
-  const char *version_text =
-    (download_active && g_strcmp0(version, "Not installed") == 0) ? "Installing..." : version;
+  const char *version_text = version;
   gboolean update_available = is_update_available_for_server(self, server, installed);
   const char *status_text = "Stopped";
   const char *status_css = "server-state-stopped";
@@ -12909,7 +12834,7 @@ on_binary_install_done(GObject *source, GAsyncResult *result, gpointer data)
   if (ctx->used_build_label != NULL && *ctx->used_build_label != '\0') {
     pumpkin_server_set_installed_build_label(server, ctx->used_build_label);
   } else if (!ctx->self->disposing) {
-    g_autofree char *label = build_label_from_binary_path(ctx->self, ctx->server_bin);
+    g_autofree char *label = build_metadata_from_binary_path(ctx->server_bin);
     pumpkin_server_set_installed_build_label(server, label);
   }
   gboolean metadata_saved = pumpkin_server_save(server, &error);
@@ -13010,7 +12935,7 @@ apply_cached_binary(PumpkinWindow *self, PumpkinServer *server,
   ctx->server_bin = pumpkin_server_get_bin_path(server);
   ctx->used_url = g_strdup(url);
   ctx->used_build_id = g_strdup(build_id);
-  ctx->used_build_label = normalize_build_label(self, build_label);
+  ctx->used_build_label = g_strdup(build_label);
   ctx->use_cache = TRUE;
   ctx->restart_after_download = restart_after_download;
   apply_downloaded_binary(ctx);
@@ -13143,7 +13068,7 @@ start_download_for_server(PumpkinWindow *self,
       wait_ctx->server = g_object_ref(server);
       wait_ctx->url = g_strdup(url);
       wait_ctx->build_id = g_strdup(resolved_build_id);
-      wait_ctx->build_label = normalize_build_label(self, resolved_build_label);
+      wait_ctx->build_label = g_strdup(resolved_build_label);
       wait_ctx->cache_path = g_strdup(cache_path);
       wait_ctx->restart_after_download = restart_after_download;
       wait_ctx->attempts = 0;
@@ -13164,7 +13089,7 @@ start_download_for_server(PumpkinWindow *self,
   ctx->server = g_object_ref(server);
   ctx->used_url = g_strdup(url);
   ctx->used_build_id = g_strdup(resolved_build_id);
-  ctx->used_build_label = normalize_build_label(self, resolved_build_label);
+  ctx->used_build_label = g_strdup(resolved_build_label);
   ctx->dest_path = g_strdup(cache_path != NULL ? cache_path : bin);
   ctx->tmp_path = g_strdup(tmp);
   ctx->server_bin = g_strdup(bin);
@@ -13321,7 +13246,7 @@ on_latest_only_resolve_done(GObject *source, GAsyncResult *res, gpointer user_da
   g_clear_pointer(&self->latest_build_id, g_free);
   self->latest_build_id = g_strdup(resolved->build_id);
   g_clear_pointer(&self->latest_build_label, g_free);
-  self->latest_build_label = normalize_build_label(self, resolved->build_label);
+  self->latest_build_label = g_strdup(resolved->build_label);
   refresh_overview_list(self);
   update_check_updates_badge(self);
   update_details(self);
@@ -13530,8 +13455,8 @@ on_details_update(GtkButton *button, PumpkinWindow *self)
   const char *from_id = pumpkin_server_get_installed_build_id(self->current);
   const char *to_label = self->latest_build_label;
   const char *to_id = self->latest_build_id;
-  g_autofree char *from_label_norm = normalize_build_label(self, from_label);
-  g_autofree char *to_label_norm = normalize_build_label(self, to_label);
+  g_autofree char *from_label_norm = format_build_label(self, from_label);
+  g_autofree char *to_label_norm = format_build_label(self, to_label);
   const char *from = (from_label_norm != NULL && *from_label_norm != '\0') ? from_label_norm :
                      ((from_id != NULL && *from_id != '\0') ? from_id : "installed");
   const char *to = (to_label_norm != NULL && *to_label_norm != '\0') ? to_label_norm :

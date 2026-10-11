@@ -27,6 +27,8 @@ typedef struct {
   PumpkinReleaseChannel channel;
 } ResolveState;
 
+G_DEFINE_QUARK(pumpkin-download-http-error, pumpkin_download_http_error)
+
 static SoupSession *shared_session = NULL;
 
 static SoupSession *
@@ -158,7 +160,7 @@ on_download_ready(GObject *source, GAsyncResult *res, gpointer user_data)
   }
   guint status = soup_message_get_status(state->message);
   if (status < 200 || status >= 300) {
-    g_task_return_new_error(task, G_IO_ERROR, G_IO_ERROR_FAILED,
+    g_task_return_new_error(task, PUMPKIN_DOWNLOAD_HTTP_ERROR, (gint)status,
                             "Download failed with HTTP status %u", status);
     g_object_unref(task);
     return;

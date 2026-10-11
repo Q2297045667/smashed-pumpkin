@@ -9,14 +9,33 @@ fi
 root=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
 build=${1:-"$root/buildDir"}
 scope=${2:-all}
-case "$scope" in all|minimap|worlds-map-access|releases) ;; *) printf 'Unknown UI test scope: %s\n' "$scope" >&2; exit 2 ;; esac
+case "$scope" in all|minimap|worlds-map-access|releases|i18n-boundaries) ;; *) printf 'Unknown UI test scope: %s\n' "$scope" >&2; exit 2 ;; esac
 if [[ "$build" != /* ]]; then
   build="$PWD/$build"
 fi
 meson compile -C "$build" smashed-pumpkin
 
 profile=$(mktemp -d /tmp/smashed-pumpkin-ui-check-XXXXXX)
-trap 'rm -rf "$profile"' EXIT
+cleanup_profile() {
+  local test_status=$?
+  # Never delete anything except the exact temporary directory created above.
+  if [[ "$profile" != /tmp/smashed-pumpkin-ui-check-* ||
+        "$(realpath -- "$profile")" != "$profile" ]]; then
+    printf 'Refusing to clean unexpected test profile: %s\n' "$profile" >&2
+    return 1
+  fi
+  # Services on the private bus may finish writing their cache as it shuts down.
+  # Retry only this verified directory; do not stop the desktop's own services.
+  local attempt
+  for attempt in 1 2 3; do
+    if rm -rf -- "${profile:?}"; then
+      return "$test_status"
+    fi
+  done
+  printf 'Failed to clean isolated test profile: %s\n' "$profile" >&2
+  return 1
+}
+trap cleanup_profile EXIT
 mkdir -m 700 "$profile/runtime"
 # A private bus also needs a private runtime directory: a test document portal
 # must never mount over (and subsequently unmount) the desktop's doc filesystem.
@@ -66,7 +85,9 @@ objects+=("$profile/server.o")
   -o "$profile/test-window-ui"
 
 # Never use the developer's servers, credentials, config or autostart entries.
-env XDG_RUNTIME_DIR="$profile/runtime" WAYLAND_DISPLAY="$wayland_display" \
+# Existing wording assertions are an English baseline; translated UI coverage
+# will use separate explicit locales once gettext is introduced.
+env LC_ALL=C LANGUAGE=en XDG_RUNTIME_DIR="$profile/runtime" WAYLAND_DISPLAY="$wayland_display" \
   HOME="$profile" XDG_DATA_HOME="$profile/data" \
   XDG_CONFIG_HOME="$profile/config" XDG_CACHE_HOME="$profile/cache" \
   dbus-run-session -- timeout 90s env \
@@ -82,6 +103,10 @@ if [[ -n "$desktop_doc_mount" ]]; then
     exit 1
   fi
   printf '%s\n' 'PASS: the desktop document portal mount is unchanged'
+fi
+if [[ "$scope" == i18n-boundaries ]]; then
+  printf '%s\n' 'Only i18n logic boundaries and updates were exercised, using isolated fake servers and local HTTP fixtures.'
+  exit 0
 fi
 if [[ "$scope" == releases ]]; then
   printf '%s\n' 'Only release-channel settings were exercised; no server was started.'

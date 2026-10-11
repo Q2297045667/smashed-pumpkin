@@ -14,6 +14,7 @@
 #include "minimap-cache.h"
 #include "vendor/cjson/cJSON.h"
 #include "refresh-button.h"
+#include "build-metadata.h"
 #include <glib/gstdio.h>
 #include <libsoup/soup.h>
 #include <math.h>
@@ -177,8 +178,31 @@ static void test_console_polling(PumpkinWindow *window, PumpkinServer *server)
   g_assert_false(pumpkin_command_poll_ready(G_OBJECT(server), "tps", g_get_monotonic_time()));
   g_signal_emit_by_name(server, "log-line", "[INFO] TPS: 20.0 MSPT: 0.5ms");
   g_assert_true(pumpkin_command_poll_ready(G_OBJECT(server), "tps", g_get_monotonic_time()));
-  g_signal_emit_by_name(server, "log-line", "Server process exited");
-  g_print("PASS: late player replies remain hidden across server switches; manual replies and chat remain visible\n");
+  pumpkin_command_track(G_OBJECT(server), "tps", TRUE, g_get_monotonic_time());
+  window->ui_state = UI_STATE_RUNNING;
+  window->user_stop_requested = TRUE;
+  const char *ordinary_logs[] = {"Server process exited", "Auto-restart scheduled", "Serverprozess beendet"};
+  for (guint i = 0; i < G_N_ELEMENTS(ordinary_logs); ++i) {
+    g_signal_emit_by_name(server, "log-line", ordinary_logs[i]);
+    g_assert_false(pumpkin_command_poll_ready(G_OBJECT(server), "tps", g_get_monotonic_time()));
+    g_assert_cmpint(window->ui_state, ==, UI_STATE_RUNNING);
+    g_assert_true(window->user_stop_requested);
+  }
+  g_clear_pointer(&text, g_free);
+  text = buffer_text(buffer);
+  for (guint i = 0; i < G_N_ELEMENTS(ordinary_logs); ++i) g_assert_nonnull(strstr(text, ordinary_logs[i]));
+  g_signal_emit_by_name(server, "process-exited");
+  g_assert_true(pumpkin_command_poll_ready(G_OBJECT(server), "tps", g_get_monotonic_time()));
+  g_assert_cmpint(window->ui_state, ==, UI_STATE_IDLE);
+  g_assert_false(window->user_stop_requested);
+  /* An exit for a background server clears only that server's tracking. */
+  pumpkin_command_track(G_OBJECT(other), "list uuids", TRUE, g_get_monotonic_time());
+  pumpkin_command_track(G_OBJECT(server), "list uuids", TRUE, g_get_monotonic_time());
+  g_signal_emit_by_name(other, "process-exited");
+  g_assert_true(pumpkin_command_poll_ready(G_OBJECT(other), "list uuids", g_get_monotonic_time()));
+  g_assert_false(pumpkin_command_poll_ready(G_OBJECT(server), "list uuids", g_get_monotonic_time()));
+  pumpkin_command_tracking_reset(G_OBJECT(server));
+  g_print("PASS: late polling replies are isolated; lifecycle uses typed events, not raw English or translated logs\n");
 }
 
 static void test_console_layout(PumpkinWindow *window, PumpkinServer *server)
@@ -1115,6 +1139,7 @@ test_update_pipeline(PumpkinWindow *window)
     g_assert_true(g_file_set_contents(bin, old_binary, (gssize)size, NULL));
     g_assert_cmpint(g_chmod(bin, 0755), ==, 0);
     pumpkin_server_set_installed_build_id(server, "old");
+    pumpkin_server_set_installed_build_label(server, "Build 2020-01-02 03:04 UTC");
     g_autofree char *url = g_strdup_printf("%sdownload-%u", base_url, mode);
     g_autofree char *build = g_strdup_printf("new-%u", mode);
     pumpkin_window_select_server(window, pumpkin_server_get_id(server));
@@ -1123,7 +1148,10 @@ test_update_pipeline(PumpkinWindow *window)
     g_free(window->latest_build_id);
     window->latest_build_id = g_strdup(build);
     g_free(window->latest_build_label);
-    window->latest_build_label = g_strdup("Test update");
+    const char *raw_metadata = mode == 1 ? NULL : "Build 2026-10-12 03:04 UTC";
+    window->latest_build_label = g_strdup(raw_metadata);
+    pumpkin_config_set_date_format(window->config, (PumpkinDateFormat)(mode % 3));
+    pumpkin_config_set_time_format(window->config, (PumpkinTimeFormat)(mode % 2));
     pumpkin_config_set_use_cache(window->config, mode == 2 || mode == 3 || mode == 5);
     fixture.fail = mode == 0;
     fixture.invalid = mode == 6;
@@ -1186,8 +1214,22 @@ test_update_pipeline(PumpkinWindow *window)
     if (failed_download) {
       g_assert_true(pumpkin_server_get_running(server));
       g_assert_false(pumpkin_server_get_stopping(server));
+      g_assert_cmpstr(pumpkin_server_get_installed_build_id(server), ==, "old");
+      g_assert_cmpstr(pumpkin_server_get_installed_build_label(server), ==, "Build 2020-01-02 03:04 UTC");
     } else {
       g_assert_cmpstr(pumpkin_server_get_installed_build_id(server), ==, build);
+      g_autofree char *fallback_metadata = NULL;
+      if (raw_metadata == NULL) {
+        GStatBuf stat_buf;
+        g_assert_cmpint(g_stat(bin, &stat_buf), ==, 0);
+        fallback_metadata = pumpkin_build_metadata_from_unix(stat_buf.st_mtime);
+      }
+      const char *expected_metadata = raw_metadata != NULL ? raw_metadata : fallback_metadata;
+      g_assert_cmpstr(pumpkin_server_get_installed_build_label(server), ==, expected_metadata);
+      g_autoptr(PumpkinServer) reloaded = pumpkin_server_load(pumpkin_server_get_root_dir(server), &error);
+      g_assert_no_error(error);
+      g_assert_nonnull(reloaded);
+      g_assert_cmpstr(pumpkin_server_get_installed_build_label(reloaded), ==, expected_metadata);
       g_assert_true(mode == 4 ? !pumpkin_server_get_running(server) : pumpkin_server_get_running(server));
       g_autofree char *backup = g_strconcat(bin, ".previous", NULL);
       g_autofree char *previous = NULL;
@@ -1706,6 +1748,103 @@ static void test_release_channels_only(PumpkinWindow *window)
   g_print("PASS: Nightly default, persisted Stable selection, request cancellation, busy guard, custom URLs and animated badge labels\n");
 }
 
+static GtkWidget *find_css_class(GtkWidget *root, const char *css_class)
+{
+  if (gtk_widget_has_css_class(root, css_class)) return root;
+  for (GtkWidget *child = gtk_widget_get_first_child(root); child != NULL;
+       child = gtk_widget_get_next_sibling(child)) {
+    GtkWidget *found = find_css_class(child, css_class);
+    if (found != NULL) return found;
+  }
+  return NULL;
+}
+
+static GtkWidget *overview_row_for(PumpkinWindow *window, PumpkinServer *server)
+{
+  queue_overview_refresh(window, TRUE);
+  spin(30);
+  for (GtkWidget *row = gtk_widget_get_first_child(GTK_WIDGET(window->overview_list)); row != NULL;
+       row = gtk_widget_get_next_sibling(row)) {
+    if (g_object_get_data(G_OBJECT(row), "server") == server) return row;
+  }
+  g_error("Missing overview row for the test server");
+}
+
+static void test_i18n_boundaries_only(PumpkinWindow *window)
+{
+  /* The update regressions use a local HTTP fixture, not a live release response. */
+  ++window->latest_resolve_generation;
+  if (window->latest_resolve_cancellable != NULL) g_cancellable_cancel(window->latest_resolve_cancellable);
+  g_clear_object(&window->latest_resolve_cancellable);
+  window->latest_resolve_in_flight = FALSE;
+  if (window->latest_poll_id != 0) {
+    g_source_remove(window->latest_poll_id);
+    window->latest_poll_id = 0;
+  }
+  g_clear_pointer(&window->latest_error, g_free);
+  g_clear_pointer(&window->latest_url, g_free);
+  window->latest_url = g_strdup("https://example.org/test-managed-build");
+  g_clear_pointer(&window->latest_build_id, g_free);
+  g_clear_pointer(&window->latest_build_label, g_free);
+  window->latest_build_label = g_strdup("Build 2026-10-12 03:04 UTC");
+
+  g_autoptr(PumpkinServer) server = pumpkin_server_store_add(window->store, "I18n boundaries", NULL);
+  g_autofree char *bin = pumpkin_server_get_bin_path(server);
+  g_autofree char *executable = NULL;
+  gsize executable_size = 0;
+  g_assert_true(g_file_get_contents(g_getenv("FAKE_MANAGED_PUMPKIN_BINARY"),
+                                   &executable, &executable_size, NULL));
+  gsize size = MAX(executable_size, (gsize)MIN_VALID_PUMPKIN_BINARY_BYTES);
+  g_autofree char *binary = g_malloc0(size);
+  memcpy(binary, executable, executable_size);
+  g_assert_true(g_file_set_contents(bin, binary, (gssize)size, NULL));
+  g_assert_cmpint(g_chmod(bin, 0755), ==, 0);
+  pumpkin_window_select_server(window, pumpkin_server_get_id(server));
+  test_console_polling(window, server);
+
+  /* These opaque stored labels deliberately collide with UI status wording.
+   * Installation must depend on the binary, not English or translated text. */
+  const char *status_labels[] = {"Not installed", "Nicht installiert"};
+  for (guint i = 0; i < G_N_ELEMENTS(status_labels); ++i) {
+    pumpkin_server_set_installed_build_label(server, status_labels[i]);
+    GtkWidget *row = overview_row_for(window, server);
+    g_assert_nonnull(find_css_class(row, "update-button"));
+    g_assert_false(gtk_widget_get_visible(GTK_WIDGET(window->btn_details_install)));
+  }
+
+  /* Optional legacy Build prefix is metadata grammar, not translated output.
+   * The same build remains current for every date/time presentation setting. */
+  pumpkin_server_set_installed_build_label(server, "Build 2026-10-12 03:04 UTC");
+  g_free(window->latest_build_label);
+  window->latest_build_label = g_strdup("2026-10-12 03:04 UTC");
+  for (guint date = 0; date < 3; ++date) {
+    for (guint time = 0; time < 2; ++time) {
+      pumpkin_config_set_date_format(window->config, (PumpkinDateFormat)date);
+      pumpkin_config_set_time_format(window->config, (PumpkinTimeFormat)time);
+      g_assert_null(find_css_class(overview_row_for(window, server), "update-button"));
+      g_assert_cmpstr(pumpkin_server_get_installed_build_label(server), ==, "Build 2026-10-12 03:04 UTC");
+    }
+  }
+  pumpkin_server_set_installed_build_id(server, "old-build");
+  window->latest_build_id = g_strdup("new-build");
+  g_assert_nonnull(find_css_class(overview_row_for(window, server), "update-button"));
+  g_clear_pointer(&window->latest_build_id, g_free);
+  g_free(window->latest_build_label);
+  window->latest_build_label = g_strdup("Build 2026-10-12 03:05 UTC");
+  g_assert_nonnull(find_css_class(overview_row_for(window, server), "update-button"));
+
+  /* Metadata alone cannot make a missing binary installed. */
+  g_assert_cmpint(g_remove(bin), ==, 0);
+  g_assert_null(find_css_class(overview_row_for(window, server), "update-button"));
+  g_assert_true(gtk_widget_get_visible(GTK_WIDGET(window->btn_details_install)));
+  g_print("PASS: installation is independent of status wording; raw metadata and build IDs drive update decisions\n");
+
+  test_update_pipeline(window);
+  gtk_window_destroy(GTK_WINDOW(window));
+  spin(650);
+  g_print("PASS: i18n boundary regressions use stable widget identities and retain raw persisted build metadata\n");
+}
+
 int main(void)
 {
   adw_init();
@@ -1713,6 +1852,9 @@ int main(void)
   g_autoptr(AdwApplication) app = adw_application_new("dev.rotstein.SmashedPumpkin.UIRegression", G_APPLICATION_NON_UNIQUE);
   g_assert_true(g_application_register(G_APPLICATION(app), NULL, NULL));
   PumpkinWindow *window = PUMPKIN_WINDOW(pumpkin_window_new(app));
+  if (g_strcmp0(g_getenv("SMASHED_UI_TEST_SCOPE"), "i18n-boundaries") == 0) {
+    test_i18n_boundaries_only(window); return 0;
+  }
   if (g_strcmp0(g_getenv("SMASHED_UI_TEST_SCOPE"), "releases") == 0) {
     test_release_channels_only(window); return 0;
   }

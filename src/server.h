@@ -9,6 +9,13 @@ G_BEGIN_DECLS
 #define PUMPKIN_TYPE_SERVER (pumpkin_server_get_type())
 G_DECLARE_FINAL_TYPE(PumpkinServer, pumpkin_server, PUMPKIN, SERVER, GObject)
 
+/* Lifecycle notifications are independent of human-readable log-line payloads:
+ * process-exited() fires after process cleanup, even if waiting reported an
+ * error; restart-scheduled(guint delay_ms) fires after scheduling auto-restart.
+ * Raw server output may contain any text, including old internal messages.
+ * Buffered output after exit is drained into its original session log only,
+ * not emitted as log-line for a stopped or subsequently restarted process. */
+
 PumpkinServer *pumpkin_server_new(const char *id, const char *name);
 PumpkinServer *pumpkin_server_load(const char *dir, GError **error);
 
@@ -31,6 +38,7 @@ const char *pumpkin_server_get_root_dir(PumpkinServer *self);
 const char *pumpkin_server_get_download_url(PumpkinServer *self);
 const char *pumpkin_server_get_installed_url(PumpkinServer *self);
 const char *pumpkin_server_get_installed_build_id(PumpkinServer *self);
+/* Raw legacy build metadata, not a formatted/translated label. */
 const char *pumpkin_server_get_installed_build_label(PumpkinServer *self);
 gboolean pumpkin_server_get_auto_restart(PumpkinServer *self);
 int pumpkin_server_get_auto_restart_delay(PumpkinServer *self);

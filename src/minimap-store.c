@@ -1,4 +1,5 @@
 #include "minimap-store.h"
+#include "smashed-pumpkin-resources.h"
 #include "vendor/cjson/cJSON.h"
 #include "vendor/tomlc17/tomlc17.h"
 #include <glib/gstdio.h>
@@ -133,10 +134,16 @@ static char *verified_bridge(const char *data_dir, GBytes *bundled, GError **err
 static gboolean data_only_release(const char *hash)
 {
   /* Add a release here only after verifying its exact requested permissions. */
-  return g_strcmp0(hash, "538a4d9a01d74e20c35878184c8c6f9672bc9d2f383cb02b7c08adbdfaae7713") == 0 ||
+  if (g_strcmp0(hash, "538a4d9a01d74e20c35878184c8c6f9672bc9d2f383cb02b7c08adbdfaae7713") == 0 ||
     g_strcmp0(hash, "388d4c9a89cf9237d0dc47cedf854fdf7ae06b9861a64ebf1286ddcab1d909a1") == 0 ||
     g_strcmp0(hash, "85010387416105c03fe3bebf018f0b7455e0fb90ed7a2f63a663bc013aaaa26b") == 0 ||
-    g_strcmp0(hash, "99a788aa6a9ef7f41112ef5773c87e4f4fedd8836358801832ab8daaaca92194") == 0;
+    g_strcmp0(hash, "99a788aa6a9ef7f41112ef5773c87e4f4fedd8836358801832ab8daaaca92194") == 0) return TRUE;
+  /* Compiler versions can change the binary; trust only this build's own resource. */
+  g_autoptr(GBytes) bundled = g_resource_lookup_data(smashed_pumpkin_get_resource(),
+    "/dev/rotstein/SmashedPumpkin/plugins/map-bridge.wasm", G_RESOURCE_LOOKUP_FLAGS_NONE, NULL);
+  if (bundled == NULL) return FALSE;
+  g_autofree char *bundled_hash = g_compute_checksum_for_bytes(G_CHECKSUM_SHA256, bundled);
+  return g_strcmp0(hash, bundled_hash) == 0;
 }
 gboolean pumpkin_map_bridge_set_enabled(const char *data_dir, gboolean enabled,
                                          char **plugin_name, gboolean *changed, GError **error)

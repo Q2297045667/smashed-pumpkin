@@ -101,6 +101,12 @@ meson compile -C buildDir
 The bridge uses locked dependencies and a pinned Pumpkin SDK. A server with a
 different plugin API may require rebuilding against its matching SDK.
 
+For an offline source build, extract `SmashedPumpkin-X.Y.Z-map-bridge-sources.tar.xz`
+from the release into `plugins/map-bridge` with its top-level directory stripped. With
+Cargo and the `wasm32-wasip2` standard library installed, configure Meson with
+`-Dbuild_minimap_bridge=true`. This builds and embeds the bridge without network
+access or changing the bundled binary in the source tree.
+
 ## Contribute
 
 Report bugs or suggest improvements through

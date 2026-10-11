@@ -61,16 +61,38 @@ config_h = configure_file(
   configuration: conf
 )
 
+resources_conf = configuration_data()
+bridge_dependencies = []
+bridge_sample = meson.project_source_root() / 'resources/plugins/map-bridge.wasm'
+if get_option('build_minimap_bridge')
+  bridge_cargo = find_program('cargo', native: true)
+  bridge_target = custom_target('minimap-bridge',
+    input: ['../plugins/map-bridge/Cargo.toml', '../plugins/map-bridge/Cargo.lock',
+            '../plugins/map-bridge/src/lib.rs'],
+    output: 'map-bridge.wasm',
+    command: [find_program('env'), 'CARGO=' + bridge_cargo.full_path(),
+              'CARGO_TARGET_DIR=' + meson.current_build_dir() / 'bridge-target',
+              find_program('bash'), meson.project_source_root() / 'build-aux/build-map-bridge.sh',
+              '--output', '@OUTPUT@', '--frozen'],
+    depend_files: '../build-aux/build-map-bridge.sh')
+  bridge_dependencies += bridge_target
+  bridge_sample = meson.current_build_dir() / 'map-bridge.wasm'
+  resources_conf.set('MAP_BRIDGE_RESOURCE', 'map-bridge.wasm')
+else
+  resources_conf.set('MAP_BRIDGE_RESOURCE', 'plugins/map-bridge.wasm')
+endif
+
 resources_xml = configure_file(
   input: join_paths('..', 'resources', 'smashed-pumpkin.gresource.xml.in'),
   output: 'smashed-pumpkin.gresource.xml',
-  configuration: conf
+  configuration: resources_conf
 )
 
 resources = gnome.compile_resources(
   'smashed-pumpkin-resources',
   resources_xml,
-  source_dir: join_paths('..', 'resources'),
+  source_dir: [meson.current_build_dir(), join_paths('..', 'resources')],
+  dependencies: bridge_dependencies,
   c_name: 'smashed_pumpkin',
   extra_args: '--manual-register'
 )
@@ -218,11 +240,11 @@ if not meson.is_cross_build()
     dependencies: [dependency('gio-2.0'), soup_dep, math_dep, cjson_dep], install: false)
   test('release-download', release_download_tests)
   minimap_tests = executable('test-minimap',
-    ['../tests/test-minimap.c', 'minimap-model.c', 'minimap-store.c', 'minimap-terrain.c', 'minimap-cache.c', 'minimap-motion.c', 'minimap-render.c', 'vendor/tomlc17/tomlc17.c'],
+    ['../tests/test-minimap.c', 'minimap-model.c', 'minimap-store.c', 'minimap-terrain.c', 'minimap-cache.c', 'minimap-motion.c', 'minimap-render.c', 'vendor/tomlc17/tomlc17.c', resources],
     include_directories: inc,
     dependencies: [dependency('gio-2.0'), dependency('cairo'), math_dep, cjson_dep], install: false)
   test('minimap', minimap_tests,
-    env: {'SMASHED_BUNDLED_BRIDGE_SAMPLE': meson.project_source_root() / 'resources/plugins/map-bridge.wasm'})
+    env: {'SMASHED_BUNDLED_BRIDGE_SAMPLE': bridge_sample}, depends: bridge_dependencies)
   terrain_tests = executable('test-minimap-terrain',
     ['../tests/test-minimap-terrain.c', 'minimap-terrain.c'],
     include_directories: inc,
@@ -281,11 +303,11 @@ if not meson.is_cross_build()
     test('server-maintenance', maintenance_tests, args: [managed_server_fixture])
     bridge_control_tests = executable('test-minimap-bridge-control',
       ['../tests/test-minimap-bridge-control.c', 'minimap-bridge-control.c', 'minimap-store.c',
-       'minimap-model.c', 'server.c', 'server-command-tracker.c', 'release-channel.c', 'vendor/tomlc17/tomlc17.c'],
+       'minimap-model.c', 'server.c', 'server-command-tracker.c', 'release-channel.c', 'vendor/tomlc17/tomlc17.c', resources],
       include_directories: inc,
       dependencies: [dependency('gio-2.0'), dependency('cairo'), math_dep, cjson_dep], install: false)
     test('minimap-bridge-control', bridge_control_tests, args: [managed_server_fixture],
-      env: {'SMASHED_BUNDLED_BRIDGE_SAMPLE': meson.project_source_root() / 'resources/plugins/map-bridge.wasm'})
+      env: {'SMASHED_BUNDLED_BRIDGE_SAMPLE': bridge_sample}, depends: bridge_dependencies)
   endif
 endif
 

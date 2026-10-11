@@ -1,0 +1,2 @@
+option('build_minimap_bridge', type: 'boolean', value: false,
+  description: 'Build the minimap bridge offline from vendored Rust sources instead of using the bundled binary')

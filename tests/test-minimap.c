@@ -3,6 +3,7 @@
 #include "minimap-terrain.h"
 #include "minimap-motion.h"
 #include "minimap-render.h"
+#include "smashed-pumpkin-resources.h"
 #include "vendor/cjson/cJSON.h"
 #include <glib/gstdio.h>
 #include <math.h>
@@ -272,6 +273,12 @@ static void test_bridge_enable_disable(void)
   g_assert_error(error, G_IO_ERROR, G_IO_ERROR_PERMISSION_DENIED);
   g_assert_false(changed); g_assert_null(name); g_clear_error(&error);
   g_assert_cmpint(g_remove(disabled), ==, 0);
+  g_assert_cmpuint(size, >, 0);
+  contents[size - 1] ^= 1;
+  g_assert_true(g_file_set_contents(binary, contents, (gssize)size, NULL));
+  g_assert_false(pumpkin_map_bridge_set_enabled(root, FALSE, &name, &changed, &error));
+  g_assert_error(error, G_IO_ERROR, G_IO_ERROR_PERMISSION_DENIED);
+  g_assert_false(changed); g_assert_null(name); g_clear_error(&error);
   g_assert_true(g_file_set_contents(binary, "custom plugin", -1, NULL));
   g_assert_false(pumpkin_map_bridge_set_enabled(root, FALSE, &name, &changed, &error));
   g_assert_error(error, G_IO_ERROR, G_IO_ERROR_PERMISSION_DENIED);
@@ -635,6 +642,7 @@ int main(int argc, char **argv)
   g_autofree char *cache = g_dir_make_tmp("smashed-map-cache-XXXXXX", NULL);
   g_setenv("XDG_CACHE_HOME", cache, TRUE);
   g_test_init(&argc, &argv, NULL);
+  smashed_pumpkin_register_resource();
   g_test_add_func("/minimap/snapshot", test_snapshot);
   g_test_add_func("/minimap/locator-yaw", test_locator_and_yaw);
   g_test_add_func("/minimap/validation", test_validation);
@@ -659,5 +667,8 @@ int main(int argc, char **argv)
 #ifndef G_OS_WIN32
   g_test_add_func("/minimap/symlinks", test_symlinks);
 #endif
-  int result = g_test_run(); remove_tree(cache); return result;
+  int result = g_test_run();
+  smashed_pumpkin_unregister_resource();
+  remove_tree(cache);
+  return result;
 }

@@ -1,5 +1,6 @@
 #include "minimap-bridge-control.h"
 #include "minimap-store.h"
+#include "smashed-pumpkin-resources.h"
 #include <glib/gstdio.h>
 
 static const char *fake_binary;
@@ -78,6 +79,9 @@ int main(int argc, char **argv)
   g_assert_cmpint(argc, >=, 2);
   fake_binary = argv[1];
   g_test_init(&argc, &argv, NULL);
+  smashed_pumpkin_register_resource();
   g_test_add_func("/minimap/bridge-runtime-control", test_bridge_control);
-  return g_test_run();
+  int result = g_test_run();
+  smashed_pumpkin_unregister_resource();
+  return result;
 }

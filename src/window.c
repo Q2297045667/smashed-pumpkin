@@ -2283,6 +2283,14 @@ on_download_progress(goffset current, goffset total, gpointer user_data)
 }
 
 static void
+on_console_notice(PumpkinServer *server, const char *message, PumpkinWindow *self)
+{
+  if (!self->disposing) {
+    append_console_line(self, server, message);
+  }
+}
+
+static void
 on_log_line(PumpkinServer *server, const char *line, PumpkinWindow *self)
 {
   gboolean is_current = (self->current == server);
@@ -2421,6 +2429,8 @@ ensure_server_log_handler(PumpkinWindow *self, PumpkinServer *server)
   }
   g_signal_handlers_disconnect_by_func(server, G_CALLBACK(on_log_line), self);
   g_signal_connect_object(server, "log-line", G_CALLBACK(on_log_line), self, 0);
+  g_signal_handlers_disconnect_by_func(server, G_CALLBACK(on_console_notice), self);
+  g_signal_connect_object(server, "console-notice", G_CALLBACK(on_console_notice), self, 0);
   g_signal_handlers_disconnect_by_func(server, G_CALLBACK(on_server_session_started), self);
   g_signal_connect_object(server, "session-started", G_CALLBACK(on_server_session_started), self, 0);
   g_signal_handlers_disconnect_by_func(server, G_CALLBACK(on_server_process_exited), self);
@@ -3959,27 +3969,27 @@ recover_server_binary_from_cache(PumpkinWindow *self, PumpkinServer *server, con
   const char *url_candidates[] = {
     installed_url,
     download_url,
-    fallback_latest,
-    NULL
+    fallback_latest
   };
   const char *identity_candidates[] = {
     installed_build_id,
     installed_build_label,
     self->latest_build_id,
-    self->latest_build_label,
-    NULL
+    self->latest_build_label
   };
 
-  for (guint u = 0; url_candidates[u] != NULL; u++) {
+  /* Optional fields are holes, not array terminators. */
+  for (guint u = 0; u < G_N_ELEMENTS(url_candidates); u++) {
     const char *url = url_candidates[u];
     if (url == NULL || *url == '\0') {
       continue;
     }
 
-    /* Try identity-specific cache first, then URL-only fallback. */
+    /* For each URL, try all known raw identities before one URL-only fallback.
+     * A missing ID must not bypass a later label or become an early fallback. */
     for (guint i = 0; i <= G_N_ELEMENTS(identity_candidates); i++) {
       const char *identity = (i < G_N_ELEMENTS(identity_candidates)) ? identity_candidates[i] : NULL;
-      if (identity != NULL && *identity == '\0') {
+      if (i < G_N_ELEMENTS(identity_candidates) && (identity == NULL || *identity == '\0')) {
         continue;
       }
       g_autofree char *cache_path = cache_path_for_download(self, url, identity);

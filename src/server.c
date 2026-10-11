@@ -109,6 +109,7 @@ G_DEFINE_FINAL_TYPE(PumpkinServer, pumpkin_server, G_TYPE_OBJECT)
 
 enum {
   LOG_LINE,
+  CONSOLE_NOTICE,
   SESSION_STARTED,
   PROCESS_EXITED,
   RESTART_SCHEDULED,
@@ -199,6 +200,8 @@ pumpkin_server_class_init(PumpkinServerClass *class)
     1,
     G_TYPE_STRING
   );
+  signals[CONSOLE_NOTICE] = g_signal_new("console-notice", G_TYPE_FROM_CLASS(class),
+    G_SIGNAL_RUN_LAST, 0, NULL, NULL, g_cclosure_marshal_VOID__STRING, G_TYPE_NONE, 1, G_TYPE_STRING);
   signals[SESSION_STARTED] = g_signal_new("session-started", G_TYPE_FROM_CLASS(class),
     G_SIGNAL_RUN_LAST, 0, NULL, NULL, g_cclosure_marshal_VOID__VOID, G_TYPE_NONE, 0);
   signals[PROCESS_EXITED] = g_signal_new("process-exited", G_TYPE_FROM_CLASS(class),
@@ -1318,7 +1321,7 @@ auto_restart_cb(gpointer data)
   g_autoptr(GError) err = NULL;
   if (!pumpkin_server_start(srv, &err)) {
     if (err != NULL) {
-      g_signal_emit(srv, signals[LOG_LINE], 0, err->message);
+      g_signal_emit(srv, signals[CONSOLE_NOTICE], 0, err->message);
     }
   }
   return G_SOURCE_REMOVE;
@@ -1385,7 +1388,7 @@ emit_server_notice(PumpkinServer *self, const char *level, const char *message)
   g_autofree char *archived = g_strdup_printf("%s %s smashed_pumpkin: %s", timestamp, level, message);
   append_log_line(self, archived);
   g_autofree char *console = g_strdup_printf("[SMPK] [%s] %s", level, message);
-  g_signal_emit(self, signals[LOG_LINE], 0, console);
+  g_signal_emit(self, signals[CONSOLE_NOTICE], 0, console);
 }
 
 static void
@@ -1397,7 +1400,7 @@ begin_log_session(PumpkinServer *self)
   /* Reset attached consoles before any output from the new process is delivered. */
   g_signal_emit(self, signals[SESSION_STARTED], 0);
   if (self->log_stream == NULL) {
-    g_signal_emit(self, signals[LOG_LINE], 0,
+    g_signal_emit(self, signals[CONSOLE_NOTICE], 0,
       "[WARN] Session logging is unavailable. Check the logs folder permissions.");
   }
 }
@@ -1769,7 +1772,7 @@ process_wait_cb(GObject *source, GAsyncResult *res, gpointer user_data)
 
   if (!waited) {
     if (error != NULL) {
-      g_signal_emit(self, signals[LOG_LINE], 0, error->message);
+      g_signal_emit(self, signals[CONSOLE_NOTICE], 0, error->message);
     }
   }
   g_signal_emit(self, signals[PROCESS_EXITED], 0);

@@ -161,6 +161,79 @@ test_lifecycle_log_collision(void)
   g_signal_handlers_disconnect_by_data(server, &events);
 }
 
+static void
+collect_console_message(PumpkinServer *server, const char *message, GPtrArray *messages)
+{
+  (void)server;
+  g_ptr_array_add(messages, g_strdup(message));
+}
+
+static void
+assert_separate_channels(GPtrArray *notices, GPtrArray *output)
+{
+  for (guint n = 0; n < notices->len; ++n) {
+    const char *notice = g_ptr_array_index(notices, n);
+    g_assert_nonnull(notice);
+    g_assert_cmpstr(notice, !=, "");
+    for (guint o = 0; o < output->len; ++o) {
+      g_assert_cmpstr(g_ptr_array_index(output, o), !=, notice);
+    }
+  }
+}
+
+static void
+test_application_notice_channels(void)
+{
+  g_autoptr(PumpkinServer) server = create_server("normal");
+  g_autoptr(GPtrArray) notices = g_ptr_array_new_with_free_func(g_free);
+  g_autoptr(GPtrArray) output = g_ptr_array_new_with_free_func(g_free);
+  g_signal_connect(server, "console-notice", G_CALLBACK(collect_console_message), notices);
+  g_signal_connect(server, "log-line", G_CALLBACK(collect_console_message), output);
+  pumpkin_server_stop(server);
+  wait_exit(server);
+  g_assert_cmpuint(notices->len, ==, 1);
+  assert_separate_channels(notices, output);
+
+  /* The archive retains stable diagnostics independently of console wording. */
+  g_autofree char *logs = pumpkin_server_get_logs_dir(server);
+  g_autoptr(GDir) directory = g_dir_open(logs, 0, NULL);
+  g_assert_nonnull(directory);
+  const char *name = g_dir_read_name(directory);
+  g_assert_nonnull(name);
+  g_autofree char *path = g_build_filename(logs, name, NULL);
+  g_autofree char *contents = NULL;
+  g_assert_true(g_file_get_contents(path, &contents, NULL, NULL));
+  g_assert_nonnull(strstr(contents, "smashed_pumpkin: Stopping server: waiting for saved data and process exit."));
+  cleanup_server(server);
+  g_signal_handlers_disconnect_by_data(server, notices);
+  g_signal_handlers_disconnect_by_data(server, output);
+}
+
+static void
+test_failed_restart_notice(void)
+{
+  g_autoptr(PumpkinServer) server = create_server("normal");
+  pumpkin_server_set_auto_restart_delay(server, 500);
+  g_autoptr(GPtrArray) notices = g_ptr_array_new_with_free_func(g_free);
+  g_autoptr(GPtrArray) output = g_ptr_array_new_with_free_func(g_free);
+  g_signal_connect(server, "console-notice", G_CALLBACK(collect_console_message), notices);
+  g_signal_connect(server, "log-line", G_CALLBACK(collect_console_message), output);
+  g_autoptr(GError) error = NULL;
+  g_assert_true(pumpkin_server_send_command(server, "crash", &error));
+  g_assert_no_error(error);
+  wait_exit(server);
+  g_autofree char *binary = pumpkin_server_get_bin_path(server);
+  g_assert_cmpint(g_remove(binary), ==, 0);
+  gint64 deadline = g_get_monotonic_time() + 5 * G_USEC_PER_SEC;
+  while (notices->len == 0 && g_get_monotonic_time() < deadline) spin(5);
+  g_assert_cmpuint(notices->len, ==, 1);
+  assert_separate_channels(notices, output);
+  g_assert_false(pumpkin_server_get_running(server));
+  cleanup_server(server);
+  g_signal_handlers_disconnect_by_data(server, notices);
+  g_signal_handlers_disconnect_by_data(server, output);
+}
+
 typedef struct {
   gboolean exited;
   guint logs_after_exit;
@@ -504,6 +577,8 @@ main(int argc, char **argv)
   g_test_add_func("/maintenance/restart-defaults", test_restart_defaults);
   g_test_add_func("/maintenance/crash-restart", test_crash_restart);
   g_test_add_func("/maintenance/lifecycle-log-collision", test_lifecycle_log_collision);
+  g_test_add_func("/maintenance/application-notice-channels", test_application_notice_channels);
+  g_test_add_func("/maintenance/failed-restart-notice", test_failed_restart_notice);
   g_test_add_func("/maintenance/buffered-exit-output", test_buffered_exit_output);
   g_test_add_func("/maintenance/graceful-stop", test_graceful_stop);
   g_test_add_func("/maintenance/timeout-force", test_timeout_requires_force);

@@ -9,7 +9,10 @@ G_BEGIN_DECLS
 #define PUMPKIN_TYPE_SERVER (pumpkin_server_get_type())
 G_DECLARE_FINAL_TYPE(PumpkinServer, pumpkin_server, PUMPKIN, SERVER, GObject)
 
-/* Lifecycle notifications are independent of human-readable log-line payloads:
+/* log-line(const char *line) carries raw process output only. Application
+ * messages use console-notice(const char *message), a display-only channel
+ * that must not drive lifecycle, player, bridge or polling protocol state.
+ * Lifecycle notifications are independent of either human-readable payload:
  * process-exited() fires after process cleanup, even if waiting reported an
  * error; restart-scheduled(guint delay_ms) fires after scheduling auto-restart.
  * Raw server output may contain any text, including old internal messages.

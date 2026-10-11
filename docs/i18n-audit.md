@@ -55,6 +55,7 @@ Update decisions still prefer build IDs. When comparable IDs are unavailable, th
 Legacy compatibility rules:
 
 - `Build `, `Stable `, and `Nightly ` are stable tokens in legacy stored syntax, not UI messages to translate. Translate independently generated display text in a later phase.
+- Recognize only exact ASCII `YYYY-MM-DD`, `YYYY-MM-DD HH:MM`, or `YYYY-MM-DD HH:MM UTC`, with an optional exact `Build ` prefix and valid calendar/time fields. Variable-width fields, signs, tabs/newlines, extra spaces, lowercase zone suffixes, and seconds extensions remain opaque. Numeric `scanf` conversions are deliberately not used: they accept more than this persisted grammar.
 - Known timestamps explicitly marked `UTC` are parsed as UTC and converted to local time for display.
 - Legacy timestamps without a time zone retain their wall-time components. Do not guess their original time zone or treat date-only and minute-precision values as identical build identities.
 - Preserve legacy DMY/MDY display labels, custom labels, and unrecognized data unchanged. Do not guess date ordering from the user's current preferences or perform destructive migration in this phase.
@@ -75,6 +76,30 @@ The [server model interface](<../src/server.h>) defines separate signals:
 The [server implementation](<../src/server.c>) no longer injects `Server process exited` or `Auto-restart scheduled` into `log-line` to control the UI. The [window](<../src/window.c>) handles the exit signal by clearing the running hint, command tracking, player/statistics state, automatic update countdown, and manual restart state. Ordinary server output remains raw output even when it matches these English messages or their German test equivalents.
 
 Persisted session logs still contain the application's exit diagnostic. Buffered output delivered after exit continues to be written to its original session log, but loses its output-stream identity for the current model. It no longer emits `log-line` for a stopped or subsequently restarted process, preventing the UI from returning to a running state. Linux cleanup now follows the existing Windows stream-identity boundary.
+
+### 5. Application notices cannot drive raw-output protocol state
+
+The follow-up audit found that typed lifecycle events alone were insufficient. Automatic restart failures, session-logging warnings, process-wait errors, stop/force-stop notices, and minimap bridge failures still used `log-line`. A nonempty message on that channel updates the UI running hint and is eligible for startup, player, statistics, polling, and bridge-response parsing. For example, an automatic restart failure after removing the binary could leave the model stopped but revive the UI's running state.
+
+The [server signal contract](<../src/server.h>) now separates origins rather than guessing from message prefixes or language:
+
+| Channel | Payload | Allowed consumers |
+| --- | --- | --- |
+| `log-line(const char *line)` | Raw process stdout/stderr | Console display and upstream protocol parsers |
+| `console-notice(const char *message)` | Application-provided explanation | Console display only; no lifecycle, readiness, player, TPS, polling, or bridge state changes |
+| `process-exited()` / `restart-scheduled(guint delay_ms)` | Typed lifecycle event | Lifecycle state handlers |
+
+The [window](<../src/window.c>) attaches each notice handler once and sends notices directly to console rendering. The [bridge controller](<../src/minimap-bridge-control.c>) also reports failures through the display-only channel while continuing to recognize upstream acknowledgments on `log-line`. Raw output can still legitimately contain any notice-like text; it is not reclassified by wording.
+
+Session archives retain their existing stable diagnostics independently of signal routing. When adding gettext later, keep archived diagnostic text and structural level/marker tokens stable. In particular, [server notices](<../src/server.c>) currently share one message between archive and console formatting: translate the presentation path separately, not the shared value before archive serialization. This phase changes routing, not archive formats or the diagnostic translation policy.
+
+### 6. Cache recovery preserves raw identity and optional candidates
+
+The [cache recovery path](<../src/window.c>) had two nullable-array bugs: a missing first installed URL ended the whole search, and a missing identity was treated as an early URL-only fallback. The latter could choose an older generic cache entry before a valid raw-label or later-ID entry.
+
+Recovery now checks all URL positions in their existing priority order, skipping missing or empty fields. For each URL, it checks all nonempty raw build IDs/labels before a single legacy URL-only fallback. It continues past invalid cache files and preserves the stored raw label. Cache directory hashing and the `URL|identity` key convention are unchanged; formatted or translated labels must never be passed as identities.
+
+This is a targeted candidate-selection fix, not a redesign of cache priority, integrity verification, or latest-release fallback policy. URL-only cache recovery remains supported for legacy entries with no usable build identity.
 
 ## Retained raw-text parsing is not display-text coupling
 
@@ -99,7 +124,8 @@ Do not mechanically wrap raw output syntax in `_()`. If an upstream protocol cha
 5. Tray helpers are separate processes and each needs initialization of the same effective language. The Windows tray also requires UTF-8 to UTF-16 conversion, wide-character drawing, and sizing for longer translations. Do not pass gettext UTF-8 directly to `DrawTextA`.
 6. Substitute project placeholders before merging Desktop/AppStream translations. Define a maintenance source for duplicated About/AppStream release content, preserve current English/German text, and coordinate the bilingual release-note checks in the [release pipeline](<release-pipeline.md>).
 7. Initial language detection, INI language preferences, settings selection, and restart-required notices belong to later phases. This phase does not change these behaviors.
-8. Fix the language for English text assertions and prefer stable widget identities in behavior tests. Future non-English UI tests should specify their locale explicitly; server log fixtures should retain raw protocol text.
+8. Fix the language for English text assertions and prefer stable widget identities, dialog response IDs, typed events, and captured payloads in behavior tests. Future non-English UI tests should specify their locale explicitly; server log fixtures should retain raw protocol text. The notice tests deliberately check state and captured rendering rather than an English error sentence.
+9. Keep the message-origin boundary when extracting strings: application notices are eligible for presentation translation, while `log-line` payloads and parser literals are not. Do not introduce notice handling into protocol parsers or route translated explanations back through raw-output signals. Preserve stable archive diagnostics separately from translated display messages.
 
 ## Regression verification
 
@@ -116,10 +142,11 @@ Local verification for this phase: the full native build succeeded, all 15 Meson
 
 New or extended coverage:
 
-- [Build metadata tests](<../tests/test-build-metadata.c>): raw values remain unchanged across multiple time zones and three date formats; valid legacy syntax is supported without guessing unknown or invalid labels.
+- [Build metadata tests](<../tests/test-build-metadata.c>): raw values remain unchanged across multiple time zones and three date formats; valid legacy syntax is supported without guessing unknown or invalid labels. Twenty-two malformed/custom spelling cases verify that formatting preserves opaque values and comparisons do not equate them with canonical timestamps.
 - [HTTP download tests](<../tests/test-download-http.c>): 401/403/503 responses, successful downloads, cancellation, classification after replacing the error message with German text, rejection of unrelated English message matches, and preservation of existing files on failure.
-- [Server maintenance tests](<../tests/test-server-maintenance.c>) and [fake server](<../tests/fake-managed-server.c>): English/German log collisions, exit and automatic restart signals, and buffered output after exit that cannot restore running state but is fully retained in its original session log.
-- [UI regression](<../tests/test-window-ui.c>): installation state independent of display wording; update decisions stable across date formats; build ID precedence; late-polling and lifecycle isolation; failed or invalid downloads that do not stop existing servers; raw INI metadata retained for direct downloads, cache hits, and shared-cache waits; manual stop taking precedence over post-update restart.
+- [Server maintenance tests](<../tests/test-server-maintenance.c>) and [fake server](<../tests/fake-managed-server.c>): English/German log collisions, exit and automatic restart signals, and buffered output after exit that cannot restore running state but is fully retained in its original session log. Stop notices and automatic restart failures stay out of the raw-output channel; stable stopping diagnostics remain in the archive.
+- [Bridge control tests](<../tests/test-minimap-bridge-control.c>): an unverified local bridge file exercises failure reporting without filesystem-permission assumptions; the explanation uses the notice channel, emits no raw output, and does not modify that file.
+- [UI regression](<../tests/test-window-ui.c>): installation state independent of display wording; update decisions stable across date formats; build ID precedence; late-polling and lifecycle isolation; failed or invalid downloads that do not stop existing servers; raw INI metadata retained for direct downloads, cache hits, and shared-cache waits; manual stop taking precedence over post-update restart. Synthetic readiness/TPS/player-list/German notices display exactly once without changing running or protocol state, and a real automatic restart failure remains visible while the UI stays stopped. Eight cache-recovery cases cover nullable URLs, empty fields, raw-label/latest-ID/latest-label identities, an invalid primary cache, and legacy URL-only fallback.
 - The [isolated test script](<../build-aux/test-window-ui.sh>) uses temporary configuration, private D-Bus/runtime directories, and local download fixtures. It fixes the English assertion environment and checks that the host desktop's document portal mount remains unchanged. A bounded cleanup retry handles temporary-directory writes during private service shutdown without stopping host services.
 
 These results cover only the local Linux native build and the listed tests. They do not constitute acceptance of every UI page, an actual translated UI, Windows, or Flatpak builds. The project's formal platform scope remains defined by the [platform support documentation](<platform-support.md>).

@@ -1,6 +1,7 @@
 #include "window-internal.h"
 #include "window-startup.h"
 #include "window-console.h"
+#include "window-lifecycle.h"
 #include "window-players.h"
 #include "player-heads.h"
 #include "window-dialogs.h"
@@ -202,7 +203,45 @@ static void test_console_polling(PumpkinWindow *window, PumpkinServer *server)
   g_assert_true(pumpkin_command_poll_ready(G_OBJECT(other), "list uuids", g_get_monotonic_time()));
   g_assert_false(pumpkin_command_poll_ready(G_OBJECT(server), "list uuids", g_get_monotonic_time()));
   pumpkin_command_tracking_reset(G_OBJECT(server));
+
+  /* Display-only notices can contain protocol-like or translated text without
+   * changing readiness, players, statistics, or pending poll replies. */
+  ensure_server_log_handler(window, server);
+  ensure_server_log_handler(window, server);
+  pumpkin_command_track(G_OBJECT(server), "list uuids", TRUE, g_get_monotonic_time());
+  pumpkin_command_track(G_OBJECT(server), "tps", TRUE, g_get_monotonic_time());
+  guint player_states = g_hash_table_size(window->player_states);
+  window->ui_state = UI_STATE_STARTING;
+  window->list_snapshot_players = 3;
+  const char *notices[] = {
+    "Listening: application notice only",
+    "[INFO] TPS: 1.0 MSPT: 100.0ms",
+    "[INFO] There are 1 of a max of 20 players online: NoticePlayer",
+    "Serverprozess beendet"
+  };
+  gtk_text_buffer_set_text(buffer, "", 0);
+  for (guint i = 0; i < G_N_ELEMENTS(notices); ++i) {
+    g_signal_emit_by_name(server, "console-notice", notices[i]);
+    g_assert_false(server_is_running_ui(window, server));
+    g_assert_cmpint(window->ui_state, ==, UI_STATE_STARTING);
+    g_assert_false(window->last_tps_valid);
+    g_assert_cmpint(window->list_snapshot_players, ==, 3);
+    g_assert_cmpuint(g_hash_table_size(window->player_states), ==, player_states);
+    g_assert_false(pumpkin_command_poll_ready(G_OBJECT(server), "list uuids", g_get_monotonic_time()));
+    g_assert_false(pumpkin_command_poll_ready(G_OBJECT(server), "tps", g_get_monotonic_time()));
+  }
+  g_clear_pointer(&text, g_free);
+  text = buffer_text(buffer);
+  for (guint i = 0; i < G_N_ELEMENTS(notices); ++i) {
+    g_autofree char *display = format_console_line(window, notices[i], NULL);
+    g_assert_nonnull(strstr(text, display));
+    g_assert_true(strstr(text, display) == g_strrstr(text, display));
+  }
+  window->ui_state = UI_STATE_IDLE;
+  window->list_snapshot_players = 0;
+  pumpkin_command_tracking_reset(G_OBJECT(server));
   g_print("PASS: late polling replies are isolated; lifecycle uses typed events, not raw English or translated logs\n");
+  g_print("PASS: application notices display once without driving server protocol state\n");
 }
 
 static void test_console_layout(PumpkinWindow *window, PumpkinServer *server)
@@ -1106,6 +1145,130 @@ wait_for_test_server_exit(PumpkinServer *server)
 }
 
 static void
+capture_console_notice(PumpkinServer *server, const char *message, char **notice)
+{
+  (void)server;
+  g_free(*notice);
+  *notice = g_strdup(message);
+}
+
+static void
+test_failed_restart_notice(PumpkinWindow *window, const char *binary, gsize size)
+{
+  g_autoptr(GError) error = NULL;
+  g_autoptr(PumpkinServer) server = pumpkin_server_store_add(window->store, "Failed restart", &error);
+  g_assert_no_error(error);
+  g_assert_nonnull(server);
+  g_autofree char *bin = pumpkin_server_get_bin_path(server);
+  g_assert_true(g_file_set_contents(bin, binary, (gssize)size, &error));
+  g_assert_no_error(error);
+  g_assert_cmpint(g_chmod(bin, 0755), ==, 0);
+  pumpkin_server_set_auto_restart_delay(server, 500);
+  g_autofree char *notice = NULL;
+  gulong notice_handler = g_signal_connect(server, "console-notice", G_CALLBACK(capture_console_notice), &notice);
+  pumpkin_window_select_server(window, pumpkin_server_get_id(server));
+  ensure_server_log_handler(window, server);
+  g_setenv("SMASHED_TEST_SERVER_MODE", "normal", TRUE);
+  g_assert_true(pumpkin_server_start(server, &error));
+  g_assert_no_error(error);
+  window->ui_state = UI_STATE_RUNNING;
+  g_assert_true(pumpkin_server_send_command(server, "crash", &error));
+  g_assert_no_error(error);
+  wait_for_test_server_exit(server);
+  g_assert_false(server_is_running_ui(window, server));
+  g_assert_cmpint(g_remove(bin), ==, 0);
+  gint64 deadline = g_get_monotonic_time() + 5 * G_USEC_PER_SEC;
+  while (notice == NULL && g_get_monotonic_time() < deadline) spin(10);
+  g_assert_nonnull(notice);
+  g_assert_cmpstr(notice, !=, "");
+  /* A failed automatic restart is an application notice, not evidence of a
+   * running process. Parsing it as raw server output would revive the hint. */
+  g_assert_false(pumpkin_server_get_running(server));
+  g_assert_false(server_is_running_ui(window, server));
+  g_assert_cmpint(window->ui_state, ==, UI_STATE_IDLE);
+  GtkTextBuffer *buffer = g_hash_table_lookup(window->console_buffers, server);
+  g_assert_nonnull(buffer);
+  g_autofree char *text = buffer_text(buffer);
+  g_autofree char *display = format_console_line(window, notice, NULL);
+  g_assert_nonnull(strstr(text, display));
+  g_signal_handler_disconnect(server, notice_handler);
+  pumpkin_server_set_auto_restart(server, FALSE);
+  pumpkin_server_stop(server);
+  g_print("PASS: automatic restart failures remain visible without reviving a stopped server\n");
+}
+
+static char *
+write_recovery_cache(PumpkinWindow *window, const char *url, const char *identity,
+                     const char *binary, gsize size)
+{
+  g_autofree char *key = identity != NULL ? g_strdup_printf("%s|%s", url, identity) : g_strdup(url);
+  g_autofree char *hash = g_compute_checksum_for_string(G_CHECKSUM_SHA256, key, -1);
+  g_autofree char *dir = g_build_filename(pumpkin_config_get_base_dir(window->config),
+                                         ".pumpkin", "versions", hash, NULL);
+  g_assert_cmpint(g_mkdir_with_parents(dir, 0700), ==, 0);
+  char *path = g_build_filename(dir, "pumpkin", NULL);
+  g_assert_true(g_file_set_contents(path, binary, (gssize)size, NULL));
+  return path;
+}
+
+static void
+test_cache_recovery_candidates(PumpkinWindow *window, const char *binary, gsize size)
+{
+  g_autofree char *previous_url = g_steal_pointer(&window->latest_url);
+  g_autofree char *previous_id = g_steal_pointer(&window->latest_build_id);
+  g_autofree char *previous_label = g_steal_pointer(&window->latest_build_label);
+  g_autofree char *url_only_binary = g_memdup2(binary, size);
+  url_only_binary[size - 1] = 'U';
+  /* Missing URLs, missing/empty identities, invalid primary cache, latest
+   * label identity, and the legacy URL-only fallback are independent cases. */
+  for (guint mode = 0; mode < 8; ++mode) {
+    g_autofree char *name = g_strdup_printf("Cache recovery %u", mode);
+    g_autoptr(PumpkinServer) server = pumpkin_server_store_add(window->store, name, NULL);
+    g_assert_nonnull(server);
+    g_autofree char *bin = pumpkin_server_get_bin_path(server);
+    g_autofree char *installed_url = g_strdup_printf("https://example.org/recovery/%u/installed", mode);
+    g_autofree char *download_url = g_strdup_printf("https://example.org/recovery/%u/download", mode);
+    g_autofree char *latest_url = g_strdup_printf("https://example.org/recovery/%u/latest", mode);
+    const char *raw_label = mode == 3 || mode >= 6 ? NULL : "Benutzerdefinierter Build 2026-1-02";
+    pumpkin_server_set_installed_url(server, mode >= 2 ? (mode == 4 ? "" : installed_url) : NULL);
+    pumpkin_server_set_download_url(server, mode == 0 || mode == 5 ? download_url : NULL);
+    pumpkin_server_set_installed_build_id(server, mode == 4 ? "" : NULL);
+    pumpkin_server_set_installed_build_label(server, raw_label);
+    g_clear_pointer(&window->latest_url, g_free);
+    window->latest_url = mode == 1 || mode == 4 ? g_strdup(latest_url) : NULL;
+    g_clear_pointer(&window->latest_build_id, g_free);
+    window->latest_build_id = mode == 3 ? g_strdup("latest-identity-after-null-fields") : NULL;
+    g_clear_pointer(&window->latest_build_label, g_free);
+    window->latest_build_label = mode == 6 ? g_strdup("Opaque latest build label") : NULL;
+    const char *source_url = mode == 0 || mode == 5 ? download_url :
+                             mode == 1 || mode == 4 ? latest_url : installed_url;
+    const char *identity = mode == 3 ? window->latest_build_id :
+                           mode == 6 ? window->latest_build_label : raw_label;
+    g_autofree char *specific = identity != NULL ?
+      write_recovery_cache(window, source_url, identity, binary, size) : NULL;
+    g_autofree char *url_only = write_recovery_cache(window, source_url, NULL,
+                                                   identity != NULL ? url_only_binary : binary, size);
+    g_autofree char *invalid = mode == 5 ?
+      write_recovery_cache(window, installed_url, identity, "Invalid binary", strlen("Invalid binary")) : NULL;
+    g_assert_false(g_file_test(bin, G_FILE_TEST_EXISTS));
+    g_assert_true(server_has_installation(window, server));
+    g_autofree char *restored = NULL;
+    gsize restored_size = 0;
+    g_assert_true(g_file_get_contents(bin, &restored, &restored_size, NULL));
+    g_assert_cmpmem(restored, restored_size, binary, size);
+    g_assert_cmpstr(pumpkin_server_get_installed_build_label(server), ==, raw_label);
+    if (invalid != NULL) g_assert_false(g_file_test(invalid, G_FILE_TEST_EXISTS));
+  }
+  g_clear_pointer(&window->latest_url, g_free);
+  window->latest_url = g_steal_pointer(&previous_url);
+  g_clear_pointer(&window->latest_build_id, g_free);
+  window->latest_build_id = g_steal_pointer(&previous_id);
+  g_clear_pointer(&window->latest_build_label, g_free);
+  window->latest_build_label = g_steal_pointer(&previous_label);
+  g_print("PASS: cache recovery skips missing URLs and identities before the URL-only fallback\n");
+}
+
+static void
 test_update_pipeline(PumpkinWindow *window)
 {
   g_autofree char *executable = NULL;
@@ -1116,6 +1279,8 @@ test_update_pipeline(PumpkinWindow *window)
   g_autofree char *old_binary = g_malloc0(size);
   memcpy(old_binary, executable, executable_size);
   old_binary[size - 1] = '0';
+  test_failed_restart_notice(window, old_binary, size);
+  test_cache_recovery_candidates(window, old_binary, size);
   g_autofree char *new_binary = g_memdup2(old_binary, size);
   new_binary[size - 1] = '1';
   UpdateFixture fixture = { .binary = g_bytes_new(new_binary, size) };

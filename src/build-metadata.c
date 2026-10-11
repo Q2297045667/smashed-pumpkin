@@ -1,7 +1,12 @@
 #include "build-metadata.h"
 
-#include <stdio.h>
 #include <string.h>
+
+static int
+decimal_pair(const char *text)
+{
+  return (text[0] - '0') * 10 + text[1] - '0';
+}
 
 /* Only parse the old, locale-independent YMD metadata grammar. DMY/MDY labels
  * saved by older versions are opaque: inferring their timezone or date order
@@ -13,25 +18,34 @@ parse_build_time(const char *metadata, gboolean *is_utc, gboolean *has_time)
 {
   if (metadata == NULL || *metadata == '\0') return NULL;
   const char *text = g_str_has_prefix(metadata, "Build ") ? metadata + 6 : metadata;
-  int year = 0, month = 0, day = 0, hour = 0, minute = 0, end = 0;
-  *is_utc = FALSE;
-  *has_time = TRUE;
+  gsize length = strlen(text);
+  if (length != 10 && length != 16 && length != 20) return NULL;
 
-  if (sscanf(text, "%4d-%2d-%2d %2d:%2d UTC%n", &year, &month, &day, &hour, &minute, &end) == 5 &&
-      end > 0 && text[end] == '\0') {
-    *is_utc = TRUE;
-  } else {
-    end = 0;
-    if (!(sscanf(text, "%4d-%2d-%2d %2d:%2d%n", &year, &month, &day, &hour, &minute, &end) == 5 &&
-          end > 0 && text[end] == '\0')) {
-      end = 0;
-      hour = minute = 0;
-      if (!(sscanf(text, "%4d-%2d-%2d%n", &year, &month, &day, &end) == 3 &&
-            end > 0 && text[end] == '\0')) return NULL;
-      *has_time = FALSE;
+  /* Numeric scanf conversions also accept signs, short fields and whitespace.
+   * Only the exact ASCII grammar is comparable; everything else stays opaque. */
+  for (gsize i = 0; i < 10; ++i) {
+    if (i == 4 || i == 7) {
+      if (text[i] != '-') return NULL;
+    } else if (!g_ascii_isdigit(text[i])) return NULL;
+  }
+  *has_time = length != 10;
+  *is_utc = length == 20;
+  if (*has_time) {
+    for (gsize i = 10; i < 16; ++i) {
+      if (i == 10) {
+        if (text[i] != ' ') return NULL;
+      } else if (i == 13) {
+        if (text[i] != ':') return NULL;
+      } else if (!g_ascii_isdigit(text[i])) return NULL;
     }
   }
-  if (!g_date_valid_dmy(day, month, year) || hour < 0 || hour > 23 || minute < 0 || minute > 59) {
+  if (*is_utc && memcmp(text + 16, " UTC", 4) != 0) return NULL;
+
+  int year = decimal_pair(text) * 100 + decimal_pair(text + 2);
+  int month = decimal_pair(text + 5), day = decimal_pair(text + 8);
+  int hour = *has_time ? decimal_pair(text + 11) : 0;
+  int minute = *has_time ? decimal_pair(text + 14) : 0;
+  if (!g_date_valid_dmy(day, month, year) || hour > 23 || minute > 59) {
     return NULL;
   }
   return g_date_time_new_utc(year, month, day, hour, minute, 0.0);

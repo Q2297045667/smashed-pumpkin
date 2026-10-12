@@ -91,9 +91,10 @@ meson test -C buildDir --print-errorlogs
 ```
 
 Language selection is in General settings → Display and time and takes effect on
-the next launch without restarting servers. Complete production catalogs are still
-pending; untranslated messages use English. See the [internationalization guide](docs/i18n.md)
-for configuration, uninstalled-build locale paths and translation tests.
+the next launch without restarting servers. The first production Simplified Chinese
+catalog covers core interface text; untranslated messages use English. See the
+[internationalization guide](docs/i18n.md) for configuration, catalog updates,
+uninstalled-build locale paths and translation tests.
 
 If Meson reports that an existing build directory uses an incompatible version,
 run `meson setup --reconfigure buildDir` before compiling again.

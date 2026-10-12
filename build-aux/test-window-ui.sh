@@ -9,13 +9,16 @@ fi
 root=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
 build=${1:-"$root/buildDir"}
 scope=${2:-all}
-case "$scope" in all|minimap|worlds-map-access|releases|i18n-boundaries|i18n-loading|language-settings) ;; *) printf 'Unknown UI test scope: %s\n' "$scope" >&2; exit 2 ;; esac
+case "$scope" in all|minimap|worlds-map-access|releases|i18n-boundaries|i18n-loading|i18n-chinese|language-settings) ;; *) printf 'Unknown UI test scope: %s\n' "$scope" >&2; exit 2 ;; esac
 if [[ "$build" != /* ]]; then
   build="$PWD/$build"
 fi
 meson compile -C "$build" smashed-pumpkin
 # Every scope discovers its language selector from this isolated catalog root.
 meson compile -C "$build" i18n-test-catalog i18n-simplified-fixture i18n-traditional-fixture
+if [[ "$scope" == i18n-chinese ]]; then
+  meson compile -C "$build" smashed-pumpkin-gmo
+fi
 
 profile=$(mktemp -d /tmp/smashed-pumpkin-ui-check-XXXXXX)
 cleanup_profile() {
@@ -137,20 +140,26 @@ objects+=("$profile/server.o")
   -o "$profile/test-window-ui"
 
 # Never use the developer's servers, credentials, config or autostart entries.
-# Existing wording assertions retain an explicit English baseline. The focused
-# translation test uses a non-C UTF-8 locale and a non-installed test catalog.
+# Existing wording assertions retain an explicit English baseline. Translation
+# scopes use a non-C UTF-8 locale and catalog roots in the isolated build tree.
 test_locale=C
 test_language=en
-if [[ "$scope" == i18n-loading ]]; then
+test_catalog_root="$build/tests/i18n"
+if [[ "$scope" == i18n-loading || "$scope" == i18n-chinese ]]; then
   test_locale=en_US.UTF-8
-  test_language=de
+  if [[ "$scope" == i18n-chinese ]]; then
+    test_language=zh_CN
+    test_catalog_root="$build/po"
+  else
+    test_language=de
+  fi
   if [[ "$(LC_ALL="$test_locale" locale charmap 2>/dev/null)" != UTF-8 ]]; then
-    printf '%s\n' 'The translated UI test requires en_US.UTF-8 (not a German locale).' >&2
+    printf '%s\n' 'The translated UI test requires en_US.UTF-8 (not a translated system locale).' >&2
     exit 77
   fi
 fi
 env LC_ALL="$test_locale" LANGUAGE="$test_language" TZ=UTC \
-  SMASHED_PUMPKIN_LOCALEDIR="$build/tests/i18n" \
+  SMASHED_PUMPKIN_LOCALEDIR="$test_catalog_root" \
   SMASHED_PUMPKIN_MESSAGE_LOCALEDIR="$build/src/message-locales" \
   XDG_RUNTIME_DIR="$profile/runtime" WAYLAND_DISPLAY="$wayland_display" \
   HOME="$profile" XDG_DATA_HOME="$profile/data" \
@@ -175,6 +184,10 @@ if [[ "$scope" == language-settings ]]; then
 fi
 if [[ "$scope" == i18n-loading ]]; then
   printf '%s\n' 'Only translation loading was exercised, using an isolated test catalog; no server was started.'
+  exit 0
+fi
+if [[ "$scope" == i18n-chinese ]]; then
+  printf '%s\n' 'The production Simplified Chinese catalog, dynamic UI and raw-log/typed-event boundaries were exercised; no server was started.'
   exit 0
 fi
 if [[ "$scope" == i18n-boundaries ]]; then

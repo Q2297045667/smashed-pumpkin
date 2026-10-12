@@ -79,10 +79,33 @@ class I18nSourcesTest(unittest.TestCase):
         self.assertIn("#, c-format", self.pot)
         self.assertIn("Translators: %s is a display date/time", self.pot)
 
+    def test_full_dynamic_messages_and_plural_extraction(self):
+        for message in ("Share your feedback", "World and dimension", "Kick %s?",
+                        "Ban %s?", "by %s", "Granted ADMIN to %s", "Removed ADMIN from %s",
+                        "%llud %lluh", "%lluh %llum", "%llum %llus", "%llus",
+                        "%llus ago", "%llum ago", "%lluh ago", "%llud ago", "%lluy ago",
+                        "%llds ago", "%lldm %02llds ago"):
+            with self.subTest(message=message):
+                self.assertIn(f'msgid "{message}"', self.pot)
+        for singular, plural in (("Page %u · %u result", "Page %u · %u results"),
+                                 ("Terrain / %u chunk", "Terrain / %u chunks"),
+                                 ("%.0f block", "%.0f blocks"),
+                                 ("%u online  ·  %u known player", "%u online  ·  %u known players")):
+            with self.subTest(singular=singular):
+                self.assertIn(f'msgid "{singular}"\nmsgid_plural "{plural}"', self.pot)
+        # GLib's adjacent G_GUINT64_FORMAT macro is not understood by xgettext:
+        # visible formats use complete literal C99 formats and explicit casts.
+        self.assertNotIn('msgid "%"\n', self.pot)
+
     def test_machine_tokens_are_not_catalog_entries(self):
         for message in ("Smashed Pumpkin", "Server process exited",
                         "Auto-restart scheduled", "HTTP status 401",
-                        "minecraft:overworld", "session-%Y-%m-%d_%H-%M-%S.log"):
+                        "minecraft:overworld", "session-%Y-%m-%d_%H-%M-%S.log",
+                        "Permission denied", "approved: false", "Failed to load plugin",
+                        "different iteration of the API", "Server is now running",
+                        "Plugin %s %s successfully", "Plugin %s is %sloaded",
+                        "Failed to %s plugin %s:", "fs.write.data", "default_level_name",
+                        "list uuids", "tps", "ban", "kick", "op", "deop"):
             with self.subTest(message=message):
                 self.assertNotIn(f'msgid "{message}"', self.pot)
 

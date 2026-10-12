@@ -166,11 +166,11 @@ present_review_prompt(PumpkinApp *self, GtkWindow *win)
   gboolean is_de = g_strcmp0(pumpkin_i18n_get_language(), "de") == 0;
 
   AdwAlertDialog *alert = ADW_ALERT_DIALOG(adw_alert_dialog_new(
-    is_de ? "Gib uns Feedback" : "Share your feedback",
+    is_de ? "Gib uns Feedback" : _("Share your feedback"),
     is_de ? "Du kannst die App in GNOME Software oder KDE Discover bewerten."
-          : "You can rate the app in GNOME Software or KDE Discover."
+          : _("You can rate the app in GNOME Software or KDE Discover.")
   ));
-  adw_alert_dialog_add_response(alert, "close", is_de ? "Schließen" : "Close");
+  adw_alert_dialog_add_response(alert, "close", is_de ? "Schließen" : _("Close"));
   adw_alert_dialog_set_default_response(alert, "close");
   adw_alert_dialog_set_close_response(alert, "close");
 
@@ -459,25 +459,26 @@ pumpkin_app_about_action(GSimpleAction *action,
   } else {
     adw_about_dialog_set_release_notes(
       about,
-      "<ul>"
-      "<li>Interactive minimap with player markers, viewing direction, player tracking and world switching.</li>"
-      "<li>Pumpkin Marketplace: browse, install and update plugins.</li>"
-      "</ul>");
+      /* Translators: Keep the <ul> and <li> markup in these release notes. */
+      _("<ul>"
+        "<li>Interactive minimap with player markers, viewing direction, player tracking and world switching.</li>"
+        "<li>Pumpkin Marketplace: browse, install and update plugins.</li>"
+        "</ul>"));
   }
   adw_about_dialog_set_developer_name(about, "Rotstein");
   adw_about_dialog_set_comments(about,
                                 is_de
                                   ? "Dies ist ein unabhängiges Tool und steht nicht in Verbindung mit PumpkinMC. "
                                     "Die folgenden Links führen zum PumpkinMC-Projekt."
-                                  : "This is an independend tool and is not related to PumpkinMC. "
-                                    "The following links lead to the PumpkinMC project.");
+                                  : _("This is an independend tool and is not related to PumpkinMC. "
+                                      "The following links lead to the PumpkinMC project."));
   adw_about_dialog_set_support_url(about, "https://github.com/Rotstein007/smashed-pumpkin");
   adw_about_dialog_set_issue_url(about, "https://github.com/Rotstein007/smashed-pumpkin/issues");
   adw_about_dialog_set_license_type(about, GTK_LICENSE_GPL_3_0);
-  adw_about_dialog_add_link(about, is_de ? "Webseite" : "Website", "https://pumpkinmc.org/");
-  adw_about_dialog_add_link(about, is_de ? "Mitwirken" : "Contribute",
+  adw_about_dialog_add_link(about, is_de ? "Webseite" : _("Website"), "https://pumpkinmc.org/");
+  adw_about_dialog_add_link(about, is_de ? "Mitwirken" : _("Contribute"),
                             "https://docs.pumpkinmc.org/developer/contributing");
-  adw_about_dialog_add_link(about, "Issues", "https://github.com/Pumpkin-MC/Pumpkin/issues");
+  adw_about_dialog_add_link(about, is_de ? "Issues" : _("Issues"), "https://github.com/Pumpkin-MC/Pumpkin/issues");
   adw_dialog_present(ADW_DIALOG(about), GTK_WIDGET(win));
 }
 

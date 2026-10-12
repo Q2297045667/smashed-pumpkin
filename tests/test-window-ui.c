@@ -220,7 +220,8 @@ static void test_console_polling(PumpkinWindow *window, PumpkinServer *server)
     "Listening: application notice only",
     "[INFO] TPS: 1.0 MSPT: 100.0ms",
     "[INFO] There are 1 of a max of 20 players online: NoticePlayer",
-    "Serverprozess beendet"
+    "Serverprozess beendet",
+    "[SMPK] 服务器已停止；Done / TPS: 1.0 / 玩家 NoticePlayer"
   };
   gtk_text_buffer_set_text(buffer, "", 0);
   for (guint i = 0; i < G_N_ELEMENTS(notices); ++i) {
@@ -2126,6 +2127,110 @@ static void test_i18n_loading_only(PumpkinWindow *window)
   g_print("PASS: GTK template and dynamic C translations load; raw build identities, branding and numeric wire formats stay stable\n");
 }
 
+static void test_i18n_chinese_only(PumpkinWindow *window)
+{
+  /* This exercises the installed-catalog discovery path, not the test fixture. */
+  ++window->latest_resolve_generation;
+  if (window->latest_resolve_cancellable != NULL) g_cancellable_cancel(window->latest_resolve_cancellable);
+  g_clear_object(&window->latest_resolve_cancellable);
+  window->latest_resolve_in_flight = FALSE;
+  if (window->latest_poll_id != 0) {
+    g_source_remove(window->latest_poll_id);
+    window->latest_poll_id = 0;
+  }
+  g_clear_pointer(&window->latest_error, g_free);
+  g_clear_pointer(&window->latest_url, g_free);
+  g_clear_pointer(&window->latest_build_id, g_free);
+  g_clear_pointer(&window->latest_build_label, g_free);
+  window->latest_url = g_strdup("https://example.org/test-managed-build");
+  window->latest_build_label = g_strdup("Build 2026-10-12 03:04 UTC");
+
+  g_assert_true(pumpkin_language_is_valid("zh_CN"));
+  g_assert_cmpstr(pumpkin_language_name(pumpkin_language_index("zh_CN")), ==, "简体中文");
+  g_assert_cmpstr(pumpkin_config_get_language(window->config), ==, "zh_CN");
+  g_assert_cmpstr(pumpkin_i18n_get_language(), ==, "zh_CN");
+  g_assert_cmpuint(adw_combo_row_get_selected(window->row_language), ==, pumpkin_language_index("zh_CN"));
+
+  GtkWidget *overview = adw_view_stack_get_child_by_name(window->view_stack, "overview");
+  g_assert_nonnull(overview);
+  AdwViewStackPage *page = adw_view_stack_get_page(window->view_stack, overview);
+  g_assert_cmpstr(adw_view_stack_page_get_title(page), ==, "总览");
+  g_assert_cmpstr(gtk_window_get_title(GTK_WINDOW(window)), ==, "Smashed Pumpkin");
+  g_assert_cmpstr(gtk_button_get_label(window->btn_details_install), ==, "安装");
+  g_assert_cmpstr(adw_preferences_row_get_title(ADW_PREFERENCES_ROW(window->row_language)), ==, "语言");
+  g_assert_cmpstr(gtk_string_list_get_string(GTK_STRING_LIST(adw_combo_row_get_model(window->row_language)),
+                  pumpkin_language_index("system")), ==, "跟随系统");
+  g_assert_cmpstr(setlocale(LC_NUMERIC, NULL), ==, "C");
+  g_assert_cmpstr(localeconv()->decimal_point, ==, ".");
+
+  pumpkin_config_set_detailed_overview_cards(window->config, TRUE);
+  g_autoptr(PumpkinServer) server = pumpkin_server_store_add(window->store, "I18n loading", NULL);
+  pumpkin_window_select_server(window, pumpkin_server_get_id(server));
+  g_assert_nonnull(find_label_containing(overview_row_for(window, server), "尚未安装"));
+  pumpkin_window_update_server_actions(window, FALSE, FALSE, FALSE, FALSE);
+  g_assert_cmpstr(gtk_button_get_label(window->btn_details_stop), ==, "停止");
+  g_assert_cmpstr(gtk_widget_get_tooltip_text(GTK_WIDGET(window->btn_details_stop)), ==,
+                  "保存数据并停止服务器");
+  GtkWidget *console = adw_view_stack_get_child_by_name(window->details_stack, "console");
+  g_assert_nonnull(console);
+  g_assert_cmpstr(adw_view_stack_page_get_title(adw_view_stack_get_page(window->details_stack, console)),
+                  ==, "控制台");
+
+  /* Exercise real count forms and long-long printf formats in the production
+   * catalog, including zero. These display formats must not be truncated by
+   * extraction at an adjacent GLib integer-format macro. */
+  for (gulong count = 0; count <= 2; count++) {
+    const char *format = g_dngettext(GETTEXT_PACKAGE, "Terrain / %u chunk", "Terrain / %u chunks", count);
+    g_assert_cmpstr(format, !=, "Terrain / %u chunk");
+    g_assert_cmpstr(format, !=, "Terrain / %u chunks");
+    g_assert_cmpstr(format, ==, g_dngettext(GETTEXT_PACKAGE, "Terrain / %u chunk", "Terrain / %u chunks", 0));
+    g_autofree char *summary = g_strdup_printf(format, (guint)count);
+    g_autofree char *number = g_strdup_printf("%lu", count);
+    g_assert_nonnull(strstr(summary, number));
+  }
+  g_assert_cmpstr(_("%llud %lluh"), !=, "%llud %lluh");
+  g_autofree char *duration = g_strdup_printf(_("%llud %lluh"), 42ULL, 7ULL);
+  g_assert_nonnull(strstr(duration, "42"));
+  g_assert_nonnull(strstr(duration, "7"));
+
+  /* A fake executable tests dynamic metadata presentation without starting a server. */
+  g_autofree char *bin = pumpkin_server_get_bin_path(server);
+  g_autofree char *executable = NULL;
+  gsize executable_size = 0;
+  g_assert_true(g_file_get_contents(g_getenv("FAKE_MANAGED_PUMPKIN_BINARY"),
+                                   &executable, &executable_size, NULL));
+  gsize size = MAX(executable_size, (gsize)MIN_VALID_PUMPKIN_BINARY_BYTES);
+  g_autofree char *binary = g_malloc0(size);
+  memcpy(binary, executable, executable_size);
+  g_assert_true(g_file_set_contents(bin, binary, (gssize)size, NULL));
+  g_assert_cmpint(g_chmod(bin, 0755), ==, 0);
+  pumpkin_server_set_installed_build_label(server, "Build 2026-10-12 03:04 UTC");
+  pumpkin_server_set_installed_build_id(server, "old-build");
+  pumpkin_config_set_date_format(window->config, PUMPKIN_DATE_FORMAT_YMD);
+  pumpkin_config_set_time_format(window->config, PUMPKIN_TIME_FORMAT_24H);
+  g_assert_nonnull(find_label_containing(overview_row_for(window, server), "构建版本"));
+  g_assert_cmpstr(pumpkin_server_get_installed_build_label(server), ==,
+                  "Build 2026-10-12 03:04 UTC");
+  window->latest_build_id = g_strdup("new-build");
+  g_assert_nonnull(find_css_class(overview_row_for(window, server), "update-button"));
+  g_assert_false(pumpkin_server_get_running(server));
+
+  /* Run the raw-log/typed-event regressions in the Chinese session as well as
+   * the English baseline. Signals are fixtures; no real process is started. */
+  test_console_polling(window, server);
+  g_assert_cmpstr(pumpkin_server_get_name(server), ==, "I18n loading");
+  g_assert_cmpstr(pumpkin_server_get_installed_build_label(server), ==,
+                  "Build 2026-10-12 03:04 UTC");
+  g_assert_cmpstr(pumpkin_server_get_installed_build_id(server), ==, "old-build");
+  g_assert_cmpstr(pumpkin_i18n_get_language(), ==, "zh_CN");
+  g_assert_cmpstr(setlocale(LC_NUMERIC, NULL), ==, "C");
+  g_assert_false(pumpkin_server_get_running(server));
+
+  gtk_window_destroy(GTK_WINDOW(window));
+  spin(650);
+  g_print("PASS: production Simplified Chinese catalog translates dynamic UI, counts and duration formats without changing raw metadata, branding, numeric formats or log/event handling\n");
+}
+
 static void test_language_settings_only(PumpkinWindow *window)
 {
   ++window->latest_resolve_generation;
@@ -2285,6 +2390,9 @@ int main(void)
   }
   if (g_strcmp0(g_getenv("SMASHED_UI_TEST_SCOPE"), "i18n-loading") == 0) {
     test_i18n_loading_only(window); return 0;
+  }
+  if (g_strcmp0(g_getenv("SMASHED_UI_TEST_SCOPE"), "i18n-chinese") == 0) {
+    test_i18n_chinese_only(window); return 0;
   }
   if (g_strcmp0(g_getenv("SMASHED_UI_TEST_SCOPE"), "i18n-boundaries") == 0) {
     test_i18n_boundaries_only(window); return 0;

@@ -153,6 +153,23 @@ destroy_tray_control_window(void)
 }
 #endif
 
+/* The hand-translated German Feedback/About branches predate gettext and stay
+ * until a German catalog replaces them. A session that already resolves to
+ * German always uses them; an English session keeps them for German systems
+ * so the legacy content is not lost before the gettext migration. */
+static gboolean
+prefers_german_legacy(void)
+{
+  const char *language = pumpkin_i18n_get_language();
+  if (language != NULL && g_str_has_prefix(language, "de")) return TRUE;
+  if (language == NULL || !g_str_equal(language, "en")) return FALSE;
+  const gchar *const *names = g_get_language_names();
+  for (guint i = 0; names != NULL && names[i] != NULL; i++) {
+    if (g_str_has_prefix(names[i], "de")) return TRUE;
+  }
+  return FALSE;
+}
+
 static void
 present_review_prompt(PumpkinApp *self, GtkWindow *win)
 {
@@ -163,7 +180,7 @@ present_review_prompt(PumpkinApp *self, GtkWindow *win)
   self->review_prompt_shown = TRUE;
 
   /* Keep the existing German content, but respect the startup preference. */
-  gboolean is_de = g_strcmp0(pumpkin_i18n_get_language(), "de") == 0;
+  gboolean is_de = prefers_german_legacy();
 
   AdwAlertDialog *alert = ADW_ALERT_DIALOG(adw_alert_dialog_new(
     is_de ? "Gib uns Feedback" : _("Share your feedback"),
@@ -444,7 +461,7 @@ pumpkin_app_about_action(GSimpleAction *action,
   GtkWindow *win = gtk_application_get_active_window(GTK_APPLICATION(app));
 
   AdwAboutDialog *about = ADW_ABOUT_DIALOG(adw_about_dialog_new());
-  gboolean is_de = g_strcmp0(pumpkin_i18n_get_language(), "de") == 0;
+  gboolean is_de = prefers_german_legacy();
   adw_about_dialog_set_application_name(about, APP_NAME);
   adw_about_dialog_set_application_icon(about, APP_ID);
   adw_about_dialog_set_version(about, APP_VERSION);

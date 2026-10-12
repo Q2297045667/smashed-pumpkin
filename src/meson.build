@@ -48,6 +48,11 @@ conf.set_quoted('APP_NAME', 'Smashed Pumpkin')
 conf.set_quoted('APP_VERSION', meson.project_version())
 conf.set_quoted('GETTEXT_PACKAGE', gettext_package)
 conf.set_quoted('LOCALEDIR', gettext_locale_dir)
+# Uninstalled development builds fall back to build-tree catalogs so running
+# ./buildDir/src/smashed-pumpkin discovers translations without meson install.
+# Installed catalogs always win when present; the fallback is only consulted
+# when the configured LOCALEDIR has no catalog for this domain.
+conf.set_quoted('BUILD_LOCALEDIR', meson.project_build_root() / 'po')
 
 # glibc suppresses gettext in C-family locales. Ship a messages-only UTF-8
 # locale so explicit language choices do not require a matching system locale.
@@ -66,6 +71,9 @@ if host_machine.system() == 'linux' and not meson.is_cross_build() and cc.compil
   private_message_locale = true
   conf.set('HAVE_PRIVATE_MESSAGE_LOCALE', 1)
   conf.set_quoted('MESSAGE_LOCALE_ROOT', message_locale_root)
+  # The locale script mirrors the installed hierarchy under the build tree for
+  # uninstalled runs; use it when the installed private locale is absent.
+  conf.set_quoted('BUILD_MESSAGE_LOCALE_ROOT', meson.current_build_dir() / 'message-locales')
 endif
 
 startup_deps = []
@@ -157,6 +165,8 @@ sources = [
   'minimap-terrain.h',
   'minimap-cache.c',
   'minimap-cache.h',
+  'minimap-memory-cache.c',
+  'minimap-memory-cache.h',
   'minimap-motion.c',
   'minimap-motion.h',
   'minimap-render.c',
@@ -288,6 +298,11 @@ if not meson.is_cross_build()
     include_directories: inc,
     dependencies: [dependency('gio-2.0'), dependency('cairo'), math_dep], install: false)
   test('minimap-terrain', terrain_tests)
+  memory_cache_tests = executable('test-minimap-memory-cache',
+    ['../tests/test-minimap-memory-cache.c', 'minimap-memory-cache.c'],
+    include_directories: inc,
+    dependencies: [dependency('glib-2.0')], install: false)
+  test('minimap-memory-cache', memory_cache_tests)
   world_store_tests = executable('test-world-store',
     ['../tests/test-world-store.c', 'world-store.c', 'vendor/tomlc17/tomlc17.c'],
     include_directories: inc,
@@ -299,6 +314,11 @@ if not meson.is_cross_build()
     dependencies: [dependency('gio-2.0'), cjson_dep],
     install: false)
   test('player-protocol', player_protocol_tests)
+  player_heads_tests = executable('test-player-heads',
+    ['../tests/test-player-heads.c', 'player-heads.c'],
+    include_directories: inc,
+    dependencies: [Gtk_dep, soup_dep, cjson_dep], install: false)
+  test('player-heads', player_heads_tests)
   startup_config_tests = executable('test-startup-config',
     ['../tests/test-startup-config.c', 'app-config.c', 'release-channel.c', 'language.c'],
     include_directories: inc,
@@ -334,6 +354,12 @@ if not meson.is_cross_build()
     dependencies: [dependency('gobject-2.0')], install: false)
   test('server-command-tracker', command_tracker_tests)
   if host_machine.system() == 'linux'
+    server_store_tests = executable('test-server-store',
+      ['../tests/test-server-store.c', 'server-store.c', 'server.c', 'server-command-tracker.c',
+       'app-config.c', 'language.c', 'release-channel.c'],
+      include_directories: inc,
+      dependencies: [dependency('gio-2.0')], install: false)
+    test('server-store', server_store_tests)
     managed_server_fixture = executable('fake-managed-server',
       '../tests/fake-managed-server.c',
       dependencies: [dependency('glib-2.0')], install: false)
@@ -354,6 +380,7 @@ if not meson.is_cross_build()
 endif
 
 appindicator_dep = dependency('ayatana-appindicator3-0.1', required: false)
+tray_c_args = appindicator_dep.found() ? ['-DHAVE_AYATANA_APPINDICATOR'] : []
 if not appindicator_dep.found()
   appindicator_dep = dependency('appindicator3-0.1', required: false)
 endif
@@ -364,6 +391,7 @@ if host_machine.system() == 'linux' and gtk3_dep.found() and appindicator_dep.fo
     ['tray.c', 'i18n.c', 'i18n.h', 'language.c', 'language.h', 'app-config.c', 'app-config.h', 'release-channel.c', config_h, resources],
     include_directories: inc,
     dependencies: [gtk3_dep, appindicator_dep, intl_dep],
+    c_args: tray_c_args,
     link_depends: message_locale,
     install: true
   )

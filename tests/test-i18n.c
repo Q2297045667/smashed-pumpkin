@@ -1,4 +1,5 @@
 #include "i18n.h"
+#include "language.h"
 #include "build-metadata.h"
 #include "vendor/cjson/cJSON.h"
 
@@ -14,9 +15,7 @@ test_catalog_loading(void)
   g_assert_cmpstr(_("Overview"), ==, translated ? "Übersicht" : "Overview");
   g_assert_true(g_utf8_validate(_("Overview"), -1, NULL));
   g_assert_cmpstr(bind_textdomain_codeset(GETTEXT_PACKAGE, NULL), ==, "UTF-8");
-  const char *override = g_getenv("SMASHED_PUMPKIN_LOCALEDIR");
-  const char *expected = override != NULL && g_path_is_absolute(override) ? override : LOCALEDIR;
-  g_assert_cmpstr(bindtextdomain(GETTEXT_PACKAGE, NULL), ==, expected);
+  g_assert_cmpstr(bindtextdomain(GETTEXT_PACKAGE, NULL), ==, pumpkin_language_catalog_root());
   g_assert_cmpstr(_("Untranslated test message"), ==, "Untranslated test message");
 }
 

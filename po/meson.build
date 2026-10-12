@@ -26,8 +26,13 @@ endforeach
 # Do not use newer msgfmt_args here: the project still supports Meson 1.3.2.
 # Keep the compatibility LINGUAS file empty: Meson reads it only when no PO
 # files exist. Every nonempty catalog set is supplied explicitly by the scan.
-i18n.gettext(gettext_package,
+# The returned targets build the compiled catalogs; the dev-fallback language
+# tests depend on the production MO files present under the build-tree po dir.
+# i18n.gettext returns [gmo targets, pot target, update-po target]; keep only
+# the gmo list for build dependencies.
+smashed_pumpkin_translation_targets = i18n.gettext(gettext_package,
   languages: translation_languages,
   preset: 'glib',
   args: ['--add-comments=Translators:', '--keyword=ngettext:1,2'],
   install: true)
+smashed_pumpkin_gmo = smashed_pumpkin_translation_targets[0]

@@ -1884,7 +1884,7 @@ msgstr "运行中"
 #: src/window.c:7525
 #, c-format
 msgid "Build: %s · Players: %d · Size: %s"
-msgstr "构建版本：%s · 玩家：%d · 大小：%s"
+msgstr "%s · 玩家：%d · 大小：%s"
 
 #: src/window.c:7541
 #, c-format

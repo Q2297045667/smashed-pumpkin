@@ -106,8 +106,9 @@ static void search_changed(GtkSearchEntry *entry, PumpkinWindow *self)
     if (filter_world(GTK_LIST_BOX_ROW(row), page)) matching++;
   }
   g_autofree char *summary = matching == total ?
-    g_strdup_printf(total == 1 ? _("%u world") : _("%u worlds"), total) :
-    g_strdup_printf(_("%u of %u worlds"), matching, total);
+    g_strdup_printf(g_dngettext(GETTEXT_PACKAGE, "%u world", "%u worlds", total), total) :
+    g_strdup_printf(g_dngettext(GETTEXT_PACKAGE, "%u of %u worlds", "%u of %u worlds", total),
+                    matching, total);
   gtk_label_set_text(page->summary, summary);
 }
 

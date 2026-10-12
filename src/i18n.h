@@ -18,4 +18,9 @@ void pumpkin_i18n_startup(void);
 void pumpkin_i18n_init_language(const char *language);
 const char *pumpkin_i18n_get_language(void);
 
+/* The resolved private messages-only locale root (NULL without one): an
+ * absolute SMASHED_PUMPKIN_MESSAGE_LOCALEDIR wins, then the installed
+ * category, then the build-tree mirror for uninstalled development runs. */
+const char *pumpkin_i18n_message_locale_root(void);
+
 G_END_DECLS

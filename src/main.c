@@ -1,5 +1,6 @@
 #include "app.h"
 #include "i18n.h"
+#include "language.h"
 #include "smashed-pumpkin-resources.h"
 
 #if defined(G_OS_WIN32)
@@ -103,8 +104,12 @@ init_windows_runtime(void)
 
   g_autofree gchar *share_dir = g_build_filename(prefix, "share", NULL);
   g_autofree gchar *locale_dir = g_build_filename(share_dir, "locale", NULL);
+  /* Only adopt the relocatable catalog directory when it really holds a
+   * catalog for this domain; otherwise keep the configured LOCALEDIR so a
+   * custom -Dlocaledir build is not silently overridden with an empty path. */
   if (g_getenv("SMASHED_PUMPKIN_LOCALEDIR") == NULL &&
-      g_file_test(locale_dir, G_FILE_TEST_IS_DIR)) {
+      g_file_test(locale_dir, G_FILE_TEST_IS_DIR) &&
+      pumpkin_language_catalog_available(locale_dir)) {
     g_setenv("SMASHED_PUMPKIN_LOCALEDIR", locale_dir, TRUE);
   }
   if (g_file_test(share_dir, G_FILE_TEST_IS_DIR)) {

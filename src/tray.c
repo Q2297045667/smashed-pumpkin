@@ -1,7 +1,11 @@
 #include "i18n.h"
 
 #include <gtk/gtk.h>
+#ifdef HAVE_AYATANA_APPINDICATOR
 #include <libayatana-appindicator/app-indicator.h>
+#else
+#include <libappindicator/app-indicator.h>
+#endif
 #include "smashed-pumpkin-resources.h"
 
 #include <errno.h>
@@ -232,8 +236,11 @@ main(int argc, char *argv[])
   g_log_set_handler("libappindicator", G_LOG_LEVEL_WARNING, on_appindicator_log, NULL);
   gtk_disable_setlocale();
   const char *language = g_getenv("SMASHED_PUMPKIN_SESSION_LANGUAGE");
-  if (language != NULL) pumpkin_i18n_init_language(language);
-  else pumpkin_i18n_startup();
+  if (language != NULL) {
+    pumpkin_i18n_init_language(language);
+  } else {
+    pumpkin_i18n_startup();
+  }
   gtk_init(&argc, &argv);
   smashed_pumpkin_register_resource();
 
@@ -247,7 +254,10 @@ main(int argc, char *argv[])
     }
   }
 
+  /* The optional GTK3 tray helper intentionally uses the legacy AppIndicator API. */
+  G_GNUC_BEGIN_IGNORE_DEPRECATIONS
   AppIndicator *indicator = app_indicator_new(APP_ID, APP_ID, APP_INDICATOR_CATEGORY_APPLICATION_STATUS);
+  G_GNUC_END_IGNORE_DEPRECATIONS
   app_indicator_set_status(indicator, APP_INDICATOR_STATUS_ACTIVE);
 
   g_autofree char *icon_theme_path = resolve_icon_theme_path();

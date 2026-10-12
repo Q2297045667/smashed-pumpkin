@@ -3,6 +3,16 @@ i18n_discovery_catalogs = [i18n_test_catalog]
 subdir('zh_CN/LC_MESSAGES')
 subdir('zh_TW/LC_MESSAGES')
 
+# Discovery edge cases: a truncated catalog, one with an invalid UTF-8 header
+# and a valid big-endian catalog. The first two must be skipped silently, the
+# third must be discovered and usable for lookups.
+i18n_synthetic_catalogs = custom_target('i18n-synthetic-catalogs',
+  output: ['xx_TRUNC', 'xx_BADHDR', 'xx_BE'],
+  command: [translation_python, files('make-synthetic-catalogs.py'), meson.current_build_dir()],
+  depend_files: files('make-synthetic-catalogs.py'),
+  build_by_default: true)
+i18n_discovery_catalogs += [i18n_synthetic_catalogs]
+
 i18n_tests = executable('test-i18n',
   ['../test-i18n.c', '../../src/i18n.c', '../../src/language.c', '../../src/build-metadata.c'],
   include_directories: inc,
@@ -55,14 +65,38 @@ foreach scenario : [
   ['unsupported', 'unsupported-id', 'C', 'de', 'en', 'Overview', 'normal'],
   ['system-posix', 'system', 'C', 'de', 'en', 'Overview', 'normal'],
   ['first-unsupported', 'absent', 'C.UTF-8', 'fr', 'en', 'Overview', 'normal'],
+  # Uninstalled development builds must resolve the build-tree fallbacks
+  # without SMASHED_PUMPKIN_*_LOCALEDIR overrides: the compiled production
+  # catalog under the build-tree po directory and the mirrored private
+  # messages-only locale. A "-" label expectation skips translation content
+  # so the scenario stays independent of catalog text and stale installs.
+  ['dev-fallback-first', 'absent', 'C.UTF-8', 'zh_CN.UTF-8', 'zh_CN', '-', 'private'],
+  ['dev-fallback-manual', 'zh_CN', 'C', 'en', 'zh_CN', '-', 'private'],
+  # LANGUAGE entries that match nothing fall back to the locale language
+  # instead of persisting an English detection (gettext semantics).
+  ['fallback-to-locale', 'absent', 'de_DE.UTF-8', 'it_IT', 'de', 'Übersicht', 'normal'],
+  # C/empty LANGUAGE entries are skipped, not terminal; whitespace is tolerated.
+  ['language-list-c-entry', 'absent', 'C.UTF-8', 'C:de', 'de', 'Übersicht', 'private'],
+  ['language-list-spaces', 'absent', 'C.UTF-8', 'fr: de', 'de', 'Übersicht', 'private'],
+  # Malformed catalogs must be skipped by discovery without crashing.
+  ['corrupt-catalog-skip', 'absent', 'C.UTF-8', 'xx_TRUNC', 'en', 'Overview', 'normal'],
+  ['bad-header-catalog-skip', 'absent', 'C.UTF-8', 'xx_BADHDR', 'en', 'Overview', 'normal'],
+  # A big-endian catalog is discovered and its translations are used.
+  ['big-endian-catalog', 'absent', 'C.UTF-8', 'xx_BE', 'xx_BE', 'BE-Übersicht', 'private'],
 ]
   if scenario[6] != 'private' or private_message_locale
+    scenario_env = {'LC_ALL': scenario[2], 'LANGUAGE': scenario[3]}
+    scenario_deps = i18n_discovery_catalogs + [message_locale]
+    if scenario[0].startswith('dev-fallback')
+      scenario_deps += smashed_pumpkin_gmo
+    else
+      scenario_env += {'SMASHED_PUMPKIN_LOCALEDIR': meson.current_build_dir(),
+                       'SMASHED_PUMPKIN_MESSAGE_LOCALEDIR': meson.project_build_root() / 'src/message-locales'}
+    endif
     test('language-startup-' + scenario[0], language_startup_tests,
       args: [scenario[1], scenario[4], scenario[5], scenario[6]],
-      env: {'LC_ALL': scenario[2], 'LANGUAGE': scenario[3],
-            'SMASHED_PUMPKIN_LOCALEDIR': meson.current_build_dir(),
-            'SMASHED_PUMPKIN_MESSAGE_LOCALEDIR': meson.project_build_root() / 'src/message-locales'},
-      depends: i18n_discovery_catalogs + [message_locale])
+      env: scenario_env,
+      depends: scenario_deps)
   endif
 endforeach
 

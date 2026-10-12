@@ -1870,7 +1870,11 @@ static void test_minimap_only(PumpkinWindow *window)
   g_assert_true(pumpkin_config_get_minimap_consent(saved_settings));
   g_assert_cmpuint(pumpkin_config_get_minimap_refresh_hz(saved_settings), ==, 20);
   pumpkin_config_free(saved_settings);
-  if (sample == NULL) g_assert_false(gtk_widget_get_visible(find_label(map, "Terrain / 1 chunks")));
+  if (sample == NULL) {
+    GtkWidget *terrain_status = find_label(map, "Terrain / 1 chunk");
+    g_assert_nonnull(terrain_status);
+    g_assert_false(gtk_widget_get_visible(terrain_status));
+  }
   pumpkin_server_stop(server); wait_for_test_server_exit(server);
   gtk_window_destroy(GTK_WINDOW(window)); spin(100);
   g_print("PASS: explicit/cancelled bridge approval, fast discovery, terrain retention, nonce handshake, player selection, tracking and cleanup\n");

@@ -4,6 +4,7 @@
 #include "minimap-bridge-control.h"
 #include "minimap-terrain.h"
 #include "minimap-cache.h"
+#include "minimap-memory-cache.h"
 #include "minimap-motion.h"
 #include "minimap-render.h"
 #include "vendor/cjson/cJSON.h"
@@ -449,6 +450,12 @@ static void terrain_tile_free(gpointer data)
   if (tile->surface != NULL) cairo_surface_destroy(tile->surface);
   g_free(tile->region); g_free(tile);
 }
+static gint64 terrain_tile_used(gconstpointer data, gpointer user_data)
+{
+  (void)user_data;
+  const TerrainTile *tile = data;
+  return tile->used;
+}
 static void terrain_task_free(gpointer data)
 {
   TerrainTask *task = data;
@@ -508,14 +515,11 @@ static void terrain_finished(GObject *source, GAsyncResult *result, gpointer dat
     g_ptr_array_index(task->tiles, i) = NULL;
     g_hash_table_replace(page->terrain, g_steal_pointer(&key), tile);
   }
-  while (g_hash_table_size(page->terrain) > 32768) {
-    GHashTableIter iter; gpointer key, value, oldest = NULL; gint64 time = G_MAXINT64;
-    g_hash_table_iter_init(&iter, page->terrain);
-    while (g_hash_table_iter_next(&iter, &key, &value)) {
-      TerrainTile *tile = value; if (tile->used < time) { oldest = key; time = tile->used; }
-    }
-    if (oldest == NULL) break;
-    g_hash_table_remove(page->terrain, oldest);
+  /* Hysteresis: a full snapshot + sort costs a few milliseconds and most
+   * batches only overshoot by a few tiles. Trim only when the cache exceeds
+   * the limit by a whole batch, then bring it back down to the limit. */
+  if (g_hash_table_size(page->terrain) > 32768 + 1024) {
+    pumpkin_map_memory_cache_trim(page->terrain, 32768, terrain_tile_used, NULL);
   }
   gtk_widget_set_tooltip_text(GTK_WIDGET(page->terrain_status), task->error);
   gtk_widget_queue_draw(GTK_WIDGET(page->canvas));
@@ -960,10 +964,15 @@ static void install_worker(GTask *result, gpointer source, gpointer data, GCance
   g_autofree char *path = g_build_filename(folder, PUMPKIN_MAP_BRIDGE_FILENAME, NULL);
   g_autofree char *data_dir = pumpkin_server_get_data_dir(task->server);
   if (pumpkin_map_bridge_present(data_dir)) {
-    g_task_return_new_error(result, G_IO_ERROR, G_IO_ERROR_EXISTS, _("Map Bridge is already installed; it has not been overwritten")); return;
+    /* Error messages stay in source English; user-facing prefixes translate. */
+    g_task_return_new_error(result, G_IO_ERROR, G_IO_ERROR_EXISTS,
+                            "Map Bridge is already installed; it has not been overwritten");
+    return;
   }
   if (g_file_test(folder, G_FILE_TEST_IS_SYMLINK) || !g_file_test(folder, G_FILE_TEST_IS_DIR)) {
-    g_task_return_new_error(result, G_IO_ERROR, G_IO_ERROR_PERMISSION_DENIED, _("Plugin folder must be an ordinary local directory")); return;
+    g_task_return_new_error(result, G_IO_ERROR, G_IO_ERROR_PERMISSION_DENIED,
+                            "Plugin folder must be an ordinary local directory");
+    return;
   }
   g_autofree char *uuid = g_uuid_string_random();
   g_autofree char *temporary = g_strdup_printf("%s/.map-bridge-%s.tmp", folder, uuid);

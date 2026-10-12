@@ -90,6 +90,9 @@ meson compile -C buildDir
 meson test -C buildDir --print-errorlogs
 ```
 
+Uninstalled builds automatically discover translations from the build tree;
+`SMASHED_PUMPKIN_LOCALEDIR` can point at another absolute catalog directory.
+
 Language selection is in General settings → Display and time and takes effect on
 the next launch without restarting servers. The first production Simplified Chinese
 catalog covers core interface text; untranslated messages use English. See the

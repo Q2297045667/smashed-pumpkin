@@ -86,6 +86,7 @@ PY
       printf '%s\n' 'PASS: isolated UI test profile and private helpers were cleaned up'
       return "$test_status"
     fi
+    printf 'Retrying isolated profile cleanup (%s/3)\n' "$attempt" >&2
   done
   printf 'Failed to clean isolated test profile: %s\n' "$profile" >&2
   return 1
@@ -121,23 +122,44 @@ if pkg-config --exists x11; then
   packages+=(x11)
 fi
 read -r -a flags <<< "$(pkg-config --cflags --libs "${packages[@]}")"
-# Use the build's compiler; PATH's cc may be an incompatible wrapper.
-mapfile -t compiler < <(meson introspect --compilers "$build" | python3 -c \
-  'import json, sys; print("\n".join(json.load(sys.stdin)["host"]["c"]["exelist"]))')
-[[ ${#compiler[@]} -gt 0 ]]
+# Reuse the application's compiler and flags, including C standard, sanitizers
+# and link options. A failed introspection must fail the test, not a subshell.
+meson introspect --targets "$build" > "$profile/targets.json"
+python3 - "$profile/targets.json" "$profile" "$build" <<'PY'
+import json
+from pathlib import Path
+import sys
+
+metadata, profile, build = map(Path, sys.argv[1:])
+target = next(item for item in json.loads(metadata.read_text())
+              if item['name'] == 'smashed-pumpkin')
+compile_source = next(item for item in target['target_sources']
+                      if item.get('language') == 'c')
+link_source = next(item for item in target['target_sources'] if 'linker' in item)
+link_flags = [str(build / flag) if not flag.startswith('-') and not Path(flag).is_absolute()
+              else flag for flag in link_source['parameters']]
+for name, values in [('compiler', compile_source['compiler']),
+                     ('compile-flags', compile_source['parameters']),
+                     ('link-flags', link_flags)]:
+    if not values or any('\n' in value for value in values):
+        raise ValueError(f'Invalid {name} in Meson introspection')
+    (profile / name).write_text('\n'.join(values) + '\n')
+PY
+mapfile -t compiler < "$profile/compiler"
+mapfile -t compile_flags < "$profile/compile-flags"
+mapfile -t link_flags < "$profile/link-flags"
 "${compiler[@]}" -Wall -Wextra -Werror "$root/tests/fake-pumpkin.c" -o "$profile/fake-pumpkin"
 read -r -a glib_flags <<< "$(pkg-config --cflags --libs glib-2.0)"
 "${compiler[@]}" -Wall -Wextra -Werror "$root/tests/fake-managed-server.c" \
   "${glib_flags[@]}" -o "$profile/fake-managed-server"
 # Exercise the production shutdown logic with a shorter test-only deadline.
 read -r -a gio_flags <<< "$(pkg-config --cflags gio-2.0)"
-"${compiler[@]}" -Wall -Wextra -Werror -DPUMPKIN_STOP_TIMEOUT_SECONDS=1 \
-  -I "$root/src" "${gio_flags[@]}" -c "$root/src/server.c" -o "$profile/server.o"
+"${compiler[@]}" "${compile_flags[@]}" -DPUMPKIN_STOP_TIMEOUT_SECONDS=1 \
+  "${gio_flags[@]}" -c "$root/src/server.c" -o "$profile/server.o"
 objects+=("$profile/server.o")
-"${compiler[@]}" -Wall -Wextra -Werror -I "$root/src" -I "$build/src" \
-  "${test_defines[@]}" "$root/tests/test-window-ui.c" "${objects[@]}" \
-  "$build/src/libsmashed-pumpkin-json.a" "${flags[@]}" -lm \
-  -o "$profile/test-window-ui"
+"${compiler[@]}" "${compile_flags[@]}" "${test_defines[@]}" \
+  "$root/tests/test-window-ui.c" "${objects[@]}" \
+  "${link_flags[@]}" "${flags[@]}" -o "$profile/test-window-ui"
 
 # Never use the developer's servers, credentials, config or autostart entries.
 # Existing wording assertions retain an explicit English baseline. Translation

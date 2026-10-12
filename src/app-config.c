@@ -260,7 +260,9 @@ pumpkin_config_save(PumpkinConfig *config, GError **error)
 
   g_autofree char *data = g_key_file_to_data(key, NULL, NULL);
   g_autofree char *dir = g_path_get_dirname(config->path);
-  g_mkdir_with_parents(dir, 0755);
+  /* Match the language preparation path: the config directory holds private
+   * settings and is created 0700; the file itself is always 0600. */
+  g_mkdir_with_parents(dir, 0700);
 
   g_file_set_contents_full(config->path, data, -1,
                            G_FILE_SET_CONTENTS_CONSISTENT | G_FILE_SET_CONTENTS_DURABLE, 0600, error);
@@ -411,6 +413,7 @@ pumpkin_config_get_language(PumpkinConfig *config)
 void
 pumpkin_config_set_language(PumpkinConfig *config, const char *language)
 {
+  if (language == NULL) return;
   char *copy = g_strdup(pumpkin_language_is_valid(language) ? language : "en");
   g_free(config->language);
   config->language = copy;

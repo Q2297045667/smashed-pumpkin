@@ -34,6 +34,9 @@
 #include <gdk-pixbuf/gdk-pixbuf.h>
 #include <glib/gstdio.h>
 #include <libsoup/soup.h>
+#if !defined(G_OS_WIN32)
+#include <utime.h>
+#endif
 #if defined(G_OS_WIN32)
 #include <dwmapi.h>
 #include <gdk/win32/gdkwin32.h>
@@ -141,6 +144,7 @@ typedef struct DownloadContext {
   gboolean use_cache;
   gboolean restart_after_download;
   gboolean maintenance_acquired;
+  gint64 last_lock_touch; /* Monotonic time of the last lock-file mtime refresh. */
 } DownloadContext;
 
 static const char *ANDROID_PREVIEW_TITLE = N_("Android preview");
@@ -2035,7 +2039,10 @@ static gboolean
 on_window_close_request(GtkWindow *window, gpointer user_data)
 {
   PumpkinWindow *self = PUMPKIN_WINDOW(user_data);
-  if (self != NULL && any_download_active(self) && !self->close_while_download_confirmed) {
+  /* The signal always delivers the connect data, but guard defensively so the
+   * rest of the handler can rely on a non-NULL window. */
+  if (self == NULL) return FALSE;
+  if (any_download_active(self) && !self->close_while_download_confirmed) {
     AdwDialog *dialog = adw_alert_dialog_new(
       _("Update in progress"),
       _("A server update is currently running. Closing now may interrupt the installation."));
@@ -2048,7 +2055,7 @@ on_window_close_request(GtkWindow *window, gpointer user_data)
     adw_alert_dialog_choose(alert, GTK_WIDGET(self), NULL, on_close_during_update_confirmed, self);
     return TRUE;
   }
-  if (self != NULL && self->close_while_download_confirmed) {
+  if (self->close_while_download_confirmed) {
     self->close_while_download_confirmed = FALSE;
   }
 
@@ -2302,6 +2309,16 @@ on_download_progress(goffset current, goffset total, gpointer user_data)
   DownloadContext *ctx = user_data;
   if (ctx == NULL || ctx->self->disposing) {
     return;
+  }
+  /* Downloads write to a UUID staging file now, so the lock file's mtime no
+   * longer moves on its own. Refresh it once per second so concurrent
+   * downloaders cannot mistake an active download for a stale lock. */
+  if (ctx->tmp_path != NULL) {
+    gint64 now = g_get_monotonic_time();
+    if (ctx->last_lock_touch == 0 || now - ctx->last_lock_touch >= G_USEC_PER_SEC) {
+      ctx->last_lock_touch = now;
+      g_utime(ctx->tmp_path, NULL);
+    }
   }
   DownloadProgressState *state = get_download_progress_state(ctx->self, ctx->server, TRUE);
   if (state != NULL) {
@@ -5207,14 +5224,14 @@ marketplace_replace_download(const char *tmp_path, const char *dest_path, GError
 
   /* Windows cannot always replace an existing open file with rename(). Keep a rollback copy. */
   if (!g_file_test(dest_path, G_FILE_TEST_EXISTS)) {
-    g_set_error(error, G_IO_ERROR, G_IO_ERROR_FAILED, _("Failed to install plugin: %s"), g_strerror(errno));
+    g_set_error(error, G_IO_ERROR, G_IO_ERROR_FAILED, "Failed to install plugin: %s", g_strerror(errno));
     return FALSE;
   }
 
   g_autofree char *uuid = g_uuid_string_random();
   g_autofree char *backup_path = g_strdup_printf("%s.%s.previous", dest_path, uuid);
   if (g_rename(dest_path, backup_path) != 0) {
-    g_set_error(error, G_IO_ERROR, G_IO_ERROR_FAILED, _("Failed to prepare plugin update: %s"), g_strerror(errno));
+    g_set_error(error, G_IO_ERROR, G_IO_ERROR_FAILED, "Failed to prepare plugin update: %s", g_strerror(errno));
     return FALSE;
   }
   if (g_rename(tmp_path, dest_path) == 0) {
@@ -5225,7 +5242,7 @@ marketplace_replace_download(const char *tmp_path, const char *dest_path, GError
   int install_errno = errno;
   g_rename(backup_path, dest_path);
   g_set_error(error, G_IO_ERROR, G_IO_ERROR_FAILED,
-              _("Failed to install plugin; the previous file was restored: %s"), g_strerror(install_errno));
+              "Failed to install plugin; the previous file was restored: %s", g_strerror(install_errno));
   return FALSE;
 }
 
@@ -11386,13 +11403,13 @@ ddns_http_send_text(SoupSession *session,
     *out_status = 0;
   }
   if (session == NULL || method == NULL || url == NULL) {
-    g_set_error(error, G_IO_ERROR, G_IO_ERROR_INVALID_ARGUMENT, _("Invalid HTTP request."));
+    g_set_error(error, G_IO_ERROR, G_IO_ERROR_INVALID_ARGUMENT, "Invalid HTTP request.");
     return NULL;
   }
 
   g_autoptr(SoupMessage) msg = soup_message_new(method, url);
   if (msg == NULL) {
-    g_set_error(error, G_IO_ERROR, G_IO_ERROR_FAILED, _("Failed to create HTTP request."));
+    g_set_error(error, G_IO_ERROR, G_IO_ERROR_FAILED, "Failed to create HTTP request.");
     return NULL;
   }
 
@@ -11554,21 +11571,21 @@ ddns_sync_worker(GTask *task, gpointer source_object, gpointer task_data, GCance
                                                  &error);
   if (ip_text == NULL) {
     g_task_return_new_error(task, G_IO_ERROR, G_IO_ERROR_FAILED,
-                            _("DDNS failed to get public IP: %s"),
-                            error != NULL ? error->message : _("request error"));
+                            "DDNS failed to get public IP: %s",
+                            error != NULL ? error->message : "request error");
     ddns_sync_result_free(result);
     return;
   }
   if (status < 200 || status >= 300) {
     g_task_return_new_error(task, G_IO_ERROR, G_IO_ERROR_FAILED,
-                            _("DDNS failed to get public IP (HTTP %u)."), status);
+                            "DDNS failed to get public IP (HTTP %u).", status);
     ddns_sync_result_free(result);
     return;
   }
 
   if (!parse_ipv4_text(ip_text, &result->public_ipv4)) {
     g_task_return_new_error(task, G_IO_ERROR, G_IO_ERROR_FAILED,
-                            _("DDNS failed: invalid public IPv4 response."));
+                            "DDNS failed: invalid public IPv4 response.");
     ddns_sync_result_free(result);
     return;
   }
@@ -12426,13 +12443,13 @@ static gboolean
 copy_tree(const char *src, const char *dest, GError **error)
 {
   if (!g_file_test(src, G_FILE_TEST_IS_DIR)) {
-    g_set_error(error, G_IO_ERROR, G_IO_ERROR_NOT_DIRECTORY, _("Source is not a directory"));
+    g_set_error(error, G_IO_ERROR, G_IO_ERROR_NOT_DIRECTORY, "Source is not a directory");
     return FALSE;
   }
 
   if (g_mkdir_with_parents(dest, 0755) != 0) {
     g_set_error(error, G_IO_ERROR, g_io_error_from_errno(errno),
-                _("Failed to create directory %s"), dest);
+                "Failed to create directory %s", dest);
     return FALSE;
   }
 
@@ -13415,7 +13432,11 @@ on_overview_remove_confirmed(GObject *dialog, GAsyncResult *res, gpointer user_d
 
   g_autofree char *removed_id = g_strdup(pumpkin_server_get_id(server));
   pumpkin_server_store_set_selected(self->store, server);
-  pumpkin_server_store_remove_selected(self->store);
+  g_autoptr(GError) error = NULL;
+  if (!pumpkin_server_store_remove_selected(self->store, &error)) {
+    set_details_status(self, error->message, 5);
+    return;
+  }
   if (removed_id != NULL && *removed_id != '\0') {
     if (networks_prune_server(self, removed_id)) {
       refresh_overview_network_list(self);

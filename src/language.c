@@ -121,13 +121,46 @@ compare_languages(gconstpointer left, gconstpointer right)
   return g_strcmp0(a->id, b->id);
 }
 
+/* Does the root contain a catalog for our domain? Only well-formed directory
+ * IDs are probed; discovery re-validates the matching files. */
+gboolean
+pumpkin_language_catalog_available(const char *root)
+{
+  g_autoptr(GDir) dir = g_dir_open(root, 0, NULL);
+  if (dir == NULL) return FALSE;
+  const char *id;
+  while ((id = g_dir_read_name(dir)) != NULL) {
+    if (!catalog_id_is_safe(id) || g_str_equal(id, "system") || g_str_equal(id, "en")) continue;
+    g_autofree char *tag = normalize_tag(id);
+    if (g_str_equal(tag, "c") || g_str_equal(tag, "posix")) continue;
+    g_autofree char *path = g_build_filename(root, id, "LC_MESSAGES", GETTEXT_PACKAGE ".mo", NULL);
+    if (g_file_test(path, G_FILE_TEST_IS_REGULAR)) return TRUE;
+  }
+  return FALSE;
+}
+
+/* Resolve the gettext root shared by catalog discovery and binding: an
+ * absolute SMASHED_PUMPKIN_LOCALEDIR always wins, then the configured
+ * LOCALEDIR when it holds a catalog for this domain, then the build tree
+ * for uninstalled development runs, then LOCALEDIR itself. */
+const char *
+pumpkin_language_catalog_root(void)
+{
+  const char *override = g_getenv("SMASHED_PUMPKIN_LOCALEDIR");
+  if (override != NULL && g_path_is_absolute(override)) return override;
+  if (pumpkin_language_catalog_available(LOCALEDIR)) return LOCALEDIR;
+#ifdef BUILD_LOCALEDIR
+  if (pumpkin_language_catalog_available(BUILD_LOCALEDIR)) return BUILD_LOCALEDIR;
+#endif
+  return LOCALEDIR;
+}
+
 static void
 ensure_languages(void)
 {
   if (g_once_init_enter(&languages_initialized)) {
     languages = g_ptr_array_new();
-    const char *root = g_getenv("SMASHED_PUMPKIN_LOCALEDIR");
-    if (root == NULL || !g_path_is_absolute(root)) root = LOCALEDIR;
+    const char *root = pumpkin_language_catalog_root();
     g_autoptr(GDir) dir = g_dir_open(root, 0, NULL);
     const char *id;
     while (dir != NULL && (id = g_dir_read_name(dir)) != NULL) {
@@ -210,13 +243,17 @@ match_tag(const char *tag)
   return NULL;
 }
 
-const char *
-pumpkin_language_detect(const char *const *preferences)
+/* Try every preference and return the first matching catalog ID, or NULL when
+ * nothing matches. C/POSIX and empty entries are skipped like gettext skips
+ * them inside LANGUAGE lists; the caller decides the final fallback. */
+static const char *
+try_match_preferences(const char *const *preferences)
 {
   ensure_languages();
   for (const char *const *p = preferences; p != NULL && *p != NULL; p++) {
+    if (**p == '\0') continue;
     g_autofree char *tag = normalize_tag(*p);
-    if (g_str_equal(tag, "c") || g_str_equal(tag, "posix")) return "en";
+    if (g_str_equal(tag, "c") || g_str_equal(tag, "posix")) continue;
     const char *match = match_tag(tag);
     if (match != NULL) return match;
     /* Fall back to a less specific installed catalog, never a different region
@@ -231,7 +268,15 @@ pumpkin_language_detect(const char *const *preferences)
       *separator = '\0';
     }
   }
-  return "en";
+  return NULL;
+}
+
+const char *
+pumpkin_language_detect(const char *const *preferences)
+{
+  ensure_languages();
+  const char *match = try_match_preferences(preferences);
+  return match != NULL ? match : "en";
 }
 
 static const char *
@@ -246,18 +291,24 @@ detect_environment(void)
   const char *language = g_getenv("LANGUAGE");
   if (language != NULL && *language != '\0') {
     g_auto(GStrv) preferences = g_strsplit(language, ":", -1);
-    return pumpkin_language_detect((const char *const *)preferences);
+    for (guint i = 0; preferences[i] != NULL; i++) g_strstrip(preferences[i]);
+    /* Like gettext, fall back to the locale language when no LANGUAGE entry
+     * matches, instead of persisting an English detection. */
+    const char *match = try_match_preferences((const char *const *)preferences);
+    if (match != NULL) return match;
   }
   if (messages != NULL && *messages != '\0') {
     const char *preferences[] = { messages, NULL };
-    return pumpkin_language_detect(preferences);
+    const char *match = try_match_preferences(preferences);
+    if (match != NULL) return match;
   }
 #ifdef G_OS_WIN32
   WCHAR name[LOCALE_NAME_MAX_LENGTH];
   if (GetUserDefaultLocaleName(name, G_N_ELEMENTS(name)) > 0) {
     g_autofree char *tag = g_utf16_to_utf8((const gunichar2 *)name, -1, NULL, NULL, NULL);
     const char *preferences[] = { tag, NULL };
-    return pumpkin_language_detect(preferences);
+    const char *match = try_match_preferences(preferences);
+    if (match != NULL) return match;
   }
 #endif
   return "en";

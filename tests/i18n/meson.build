@@ -1,7 +1,7 @@
 subdir('de/LC_MESSAGES')
 
 i18n_tests = executable('test-i18n',
-  ['../test-i18n.c', '../../src/i18n.c', '../../src/build-metadata.c'],
+  ['../test-i18n.c', '../../src/i18n.c', '../../src/language.c', '../../src/build-metadata.c'],
   include_directories: inc,
   dependencies: [dependency('glib-2.0'), intl_dep, cjson_dep],
   install: false)
@@ -34,6 +34,31 @@ test('i18n-relative-path', i18n_tests,
   args: ['english'],
   env: {'LC_ALL': 'C', 'LANGUAGE': 'de', 'TZ': 'UTC',
         'SMASHED_PUMPKIN_LOCALEDIR': 'relative-catalog-directory'})
+
+language_startup_tests = executable('test-language-startup',
+  ['../test-language-startup.c', '../../src/i18n.c', '../../src/language.c'],
+  include_directories: inc, dependencies: [dependency('gio-2.0'), intl_dep], install: false)
+foreach scenario : [
+  ['first-launch', 'absent', 'C.UTF-8', 'de', 'de', 'Übersicht', 'private'],
+  ['system', 'system', 'C.UTF-8', 'de', 'de', 'Übersicht', 'private'],
+  ['manual-c', 'de', 'C', 'en', 'de', 'Übersicht', 'private'],
+  ['manual-posix', 'de', 'POSIX', 'en', 'de', 'Übersicht', 'private'],
+  ['manual-invalid-locale', 'de', 'smashed_invalid_locale', 'en', 'de', 'Übersicht', 'private'],
+  ['manual-en', 'en', 'en_US.UTF-8', 'de', 'en', 'Overview', 'normal'],
+  ['manual-zh', 'zh_CN', 'C', 'de', 'zh_CN', 'Overview', 'private'],
+  ['unsupported', 'unsupported-id', 'C', 'de', 'en', 'Overview', 'normal'],
+  ['system-posix', 'system', 'C', 'de', 'en', 'Overview', 'normal'],
+  ['first-unsupported', 'absent', 'C.UTF-8', 'fr', 'en', 'Overview', 'normal'],
+]
+  if scenario[6] != 'private' or private_message_locale
+    test('language-startup-' + scenario[0], language_startup_tests,
+      args: [scenario[1], scenario[4], scenario[5], scenario[6]],
+      env: {'LC_ALL': scenario[2], 'LANGUAGE': scenario[3],
+            'SMASHED_PUMPKIN_LOCALEDIR': meson.current_build_dir(),
+            'SMASHED_PUMPKIN_MESSAGE_LOCALEDIR': meson.project_build_root() / 'src/message-locales'},
+      depends: [i18n_test_catalog, message_locale])
+  endif
+endforeach
 
 xgettext = find_program('xgettext', native: true)
 test('i18n-sources', find_program('python3'),

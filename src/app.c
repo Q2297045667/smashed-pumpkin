@@ -1,6 +1,7 @@
 #include "app.h"
 #include "app-config.h"
 #include "config.h"
+#include "i18n.h"
 #include "platform.h"
 #include "window.h"
 #include "window-startup.h"
@@ -161,14 +162,8 @@ present_review_prompt(PumpkinApp *self, GtkWindow *win)
 
   self->review_prompt_shown = TRUE;
 
-  gboolean is_de = FALSE;
-  const char *const *langs = g_get_language_names();
-  for (const char *const *lang = langs; lang != NULL && *lang != NULL; lang++) {
-    if (g_str_has_prefix(*lang, "de")) {
-      is_de = TRUE;
-      break;
-    }
-  }
+  /* Keep the existing German content, but respect the startup preference. */
+  gboolean is_de = g_strcmp0(pumpkin_i18n_get_language(), "de") == 0;
 
   AdwAlertDialog *alert = ADW_ALERT_DIALOG(adw_alert_dialog_new(
     is_de ? "Gib uns Feedback" : "Share your feedback",
@@ -316,7 +311,12 @@ spawn_tray_helper(void)
   char *arg = g_strdup_printf("--parent-pid=%d", parent_pid);
   gchar *argv[] = { tray_path, arg, NULL };
   GError *error = NULL;
-  if (!g_spawn_async(NULL, argv, NULL, G_SPAWN_SEARCH_PATH | G_SPAWN_DO_NOT_REAP_CHILD,
+  g_auto(GStrv) environment = g_get_environ();
+  const char *language = pumpkin_i18n_get_language();
+  if (language != NULL) {
+    environment = g_environ_setenv(environment, "SMASHED_PUMPKIN_SESSION_LANGUAGE", language, TRUE);
+  }
+  if (!g_spawn_async(NULL, argv, environment, G_SPAWN_SEARCH_PATH | G_SPAWN_DO_NOT_REAP_CHILD,
                      NULL, NULL, &tray_pid, &error)) {
     g_warning("Failed to start tray helper: %s", error->message);
     g_clear_error(&error);
@@ -444,17 +444,7 @@ pumpkin_app_about_action(GSimpleAction *action,
   GtkWindow *win = gtk_application_get_active_window(GTK_APPLICATION(app));
 
   AdwAboutDialog *about = ADW_ABOUT_DIALOG(adw_about_dialog_new());
-  gboolean is_de = FALSE;
-  const char *const *langs = g_get_language_names();
-  for (const char *const *lang = langs; lang != NULL && *lang != NULL; lang++) {
-    if (g_str_has_prefix(*lang, "de")) {
-      is_de = TRUE;
-      break;
-    }
-    if (g_str_has_prefix(*lang, "en") || g_str_equal(*lang, "C")) {
-      break;
-    }
-  }
+  gboolean is_de = g_strcmp0(pumpkin_i18n_get_language(), "de") == 0;
   adw_about_dialog_set_application_name(about, APP_NAME);
   adw_about_dialog_set_application_icon(about, APP_ID);
   adw_about_dialog_set_version(about, APP_VERSION);

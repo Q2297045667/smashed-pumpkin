@@ -21,6 +21,15 @@ msgstr "Übersicht"
 msgid "Install"
 msgstr "Installieren"
 
+msgid "Language"
+msgstr "Sprache"
+
+msgid "System language"
+msgstr "Systemsprache"
+
+msgid "Language change saved"
+msgstr "Sprachänderung gespeichert"
+
 msgid "Stop"
 msgstr "Anhalten"
 

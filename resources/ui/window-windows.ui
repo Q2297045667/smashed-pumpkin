@@ -1317,6 +1317,29 @@
                                       <object class="AdwPreferencesGroup">
                                         <property name="title" translatable="yes">Display and time</property>
                                         <child>
+                                          <object class="AdwComboRow" id="row_language">
+                                            <property name="title" translatable="yes">Language</property>
+                                            <property name="subtitle" translatable="yes">Save to apply on the next application launch. Missing translations use English.</property>
+                                            <property name="model">
+                                              <object class="GtkStringList">
+                                                <items>
+                                                  <item translatable="yes">System language</item>
+                                                  <item>English</item>
+                                                  <item>Chinese (Simplified)</item>
+                                                  <item>Deutsch</item>
+                                                </items>
+                                              </object>
+                                            </property>
+                                          </object>
+                                        </child>
+                                        <child>
+                                          <object class="AdwActionRow" id="row_language_restart">
+                                            <property name="visible">false</property>
+                                            <property name="title" translatable="yes">Language change saved</property>
+                                            <property name="subtitle" translatable="yes">The new language will be used next time you launch the application. Running servers are not restarted.</property>
+                                          </object>
+                                        </child>
+                                        <child>
                                           <object class="AdwActionRow">
                                             <property name="title" translatable="yes">Date format</property>
                                             <property name="subtitle" translatable="yes">Used in logs, player information and build labels.</property>

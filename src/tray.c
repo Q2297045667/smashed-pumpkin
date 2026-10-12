@@ -231,7 +231,9 @@ main(int argc, char *argv[])
   g_log_set_handler("libayatana-appindicator", G_LOG_LEVEL_WARNING, on_appindicator_log, NULL);
   g_log_set_handler("libappindicator", G_LOG_LEVEL_WARNING, on_appindicator_log, NULL);
   gtk_disable_setlocale();
-  pumpkin_i18n_init();
+  const char *language = g_getenv("SMASHED_PUMPKIN_SESSION_LANGUAGE");
+  if (language != NULL) pumpkin_i18n_init_language(language);
+  else pumpkin_i18n_startup();
   gtk_init(&argc, &argv);
   smashed_pumpkin_register_resource();
 

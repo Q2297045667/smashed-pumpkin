@@ -4,6 +4,7 @@
 #include "download.h"
 #include "build-metadata.h"
 #include "i18n.h"
+#include "language.h"
 #include "refresh-button.h"
 #include "server-maintenance.h"
 #include "window-worlds.h"
@@ -789,6 +790,36 @@ update_autostart_sensitivity(PumpkinWindow *self)
   }
 }
 
+/* Save the shared preference from either settings entry point. */
+static gboolean
+save_language_preference(PumpkinWindow *self)
+{
+  g_autofree char *previous = g_strdup(pumpkin_config_get_language(self->config));
+  g_autoptr(GError) error = NULL;
+  guint selected = adw_combo_row_get_selected(self->row_language);
+  if (selected == pumpkin_language_index(previous)) {
+    /* Keep an unsupported raw ID when its fallback selection is unchanged. */
+    pumpkin_config_save(self->config, &error);
+  } else {
+    pumpkin_config_save_language(self->config, pumpkin_language_from_index(selected), &error);
+  }
+  if (error != NULL) {
+    append_log(self, error->message);
+    set_details_status(self, _("Failed to save general settings"), 5);
+    adw_toast_overlay_add_toast(self->notifications_overlay,
+                                adw_toast_new(_("Failed to save general settings")));
+    mark_settings_dirty(self);
+    return FALSE;
+  }
+  gtk_widget_set_visible(GTK_WIDGET(self->row_language_restart),
+                         pumpkin_language_index(pumpkin_config_get_language(self->config)) != self->initial_language_index);
+  if (g_strcmp0(previous, pumpkin_config_get_language(self->config)) != 0) {
+    adw_toast_overlay_add_toast(self->notifications_overlay,
+                                adw_toast_new(_("Language saved. It will take effect on the next application launch.")));
+  }
+  return TRUE;
+}
+
 /* ---- Save General Settings ---- */
 static void
 on_save_general_settings(GtkButton *button, PumpkinWindow *self)
@@ -842,7 +873,9 @@ on_save_general_settings(GtkButton *button, PumpkinWindow *self)
       }
     }
   }
-  pumpkin_config_save(self->config, NULL);
+  if (!save_language_preference(self)) {
+    return;
+  }
   pumpkin_config_manage_autostart_desktop(pumpkin_config_get_autostart_on_boot(self->config));
   if (self->switch_run_in_background != NULL) {
     GApplication *app = g_application_get_default();
@@ -851,10 +884,9 @@ on_save_general_settings(GtkButton *button, PumpkinWindow *self)
                                    gtk_switch_get_active(self->switch_run_in_background));
     }
   }
-  append_log(self, "General settings saved");
-  set_details_status(self, "General settings saved", 3);
-  self->settings_dirty = FALSE;
-  update_save_button(self);
+  append_log(self, _("General settings saved"));
+  set_details_status(self, _("General settings saved"), 3);
+  mark_settings_dirty(self);
   refresh_overview_list(self);
   refresh_player_list(self);
   refresh_log_files(self);
@@ -882,6 +914,7 @@ on_reset_general_response(AdwAlertDialog *dialog, const char *response, PumpkinW
   adw_combo_row_set_selected(self->row_start_mode, PUMPKIN_START_MAXIMIZED);
   adw_combo_row_set_selected(self->row_release_channel, PUMPKIN_RELEASE_NIGHTLY);
   adw_combo_row_set_selected(self->row_start_monitor, 0);
+  adw_combo_row_set_selected(self->row_language, pumpkin_language_index("system"));
   if (self->switch_auto_start_servers != NULL) {
     gtk_switch_set_active(self->switch_auto_start_servers, FALSE);
   }
@@ -1131,6 +1164,9 @@ global_switches_match(PumpkinWindow *self)
   if (self->config == NULL) {
     return TRUE;
   }
+  if (pumpkin_language_index(pumpkin_config_get_language(self->config)) != adw_combo_row_get_selected(self->row_language)) {
+    return FALSE;
+  }
   if (pumpkin_config_get_start_expanded(self->config) != adw_switch_row_get_active(self->row_start_expanded) ||
       (guint)pumpkin_config_get_release_channel(self->config) != adw_combo_row_get_selected(self->row_release_channel) ||
       (guint)pumpkin_config_get_start_mode(self->config) != adw_combo_row_get_selected(self->row_start_mode) ||
@@ -1252,10 +1288,7 @@ settings_match_config(PumpkinWindow *self)
   if (self->config == NULL) {
     return TRUE;
   }
-  if (self->entry_download_url != NULL &&
-      !pumpkin_entry_matches_string(self->entry_download_url, pumpkin_config_get_default_download_url(self->config))) {
-    return FALSE;
-  }
+  /* Without a selected server, the server form is intentionally empty. */
   return global_switches_match(self);
 }
 
@@ -8275,7 +8308,6 @@ cache_path_for_download(PumpkinWindow *self, const char *url, const char *build_
   }
   g_autofree char *hash = g_compute_checksum_for_string(G_CHECKSUM_SHA256, cache_key, -1);
   g_autofree char *version_dir = g_build_filename(cache_dir, hash, NULL);
-  g_mkdir_with_parents(version_dir, 0755);
   return g_build_filename(version_dir, "pumpkin", NULL);
 }
 
@@ -11928,6 +11960,7 @@ update_settings_form(PumpkinWindow *self)
   self->settings_invalid = FALSE;
   if (self->config != NULL) {
     adw_combo_row_set_selected(self->row_release_channel, (guint)pumpkin_config_get_release_channel(self->config));
+    adw_combo_row_set_selected(self->row_language, pumpkin_language_index(pumpkin_config_get_language(self->config)));
   }
   if (self->config != NULL && self->drop_date_format != NULL) {
     gtk_drop_down_set_selected(self->drop_date_format, (guint)pumpkin_config_get_date_format(self->config));
@@ -13093,6 +13126,9 @@ start_download_for_server(PumpkinWindow *self,
   }
 
   if (cache_path != NULL && !g_file_test(cache_path, G_FILE_TEST_EXISTS)) {
+    /* Cache probes are read-only; create the bucket only for an actual download. */
+    g_autofree char *cache_parent = g_path_get_dirname(cache_path);
+    g_mkdir_with_parents(cache_parent, 0755);
     g_file_set_contents(tmp, "", 0, NULL);
   }
 
@@ -14036,6 +14072,16 @@ save_settings_impl(PumpkinWindow *self, gboolean restart_server)
       pumpkin_config_set_auto_start_servers_enabled(self->config, gtk_switch_get_active(self->switch_auto_start_servers));
     }
     save_startup_preferences(self);
+    if (self->switch_detailed_overview_cards != NULL) {
+      pumpkin_config_set_detailed_overview_cards(self->config,
+                                                 gtk_switch_get_active(self->switch_detailed_overview_cards));
+    }
+    if (self->drop_date_format != NULL) {
+      pumpkin_config_set_date_format(self->config, (PumpkinDateFormat)gtk_drop_down_get_selected(self->drop_date_format));
+    }
+    if (self->drop_time_format != NULL) {
+      pumpkin_config_set_time_format(self->config, (PumpkinTimeFormat)gtk_drop_down_get_selected(self->drop_time_format));
+    }
     /* Save per-server auto-start settings from list */
     if (self->autostart_server_list != NULL && self->store != NULL) {
       GListModel *model = get_server_model(self);
@@ -14048,7 +14094,9 @@ save_settings_impl(PumpkinWindow *self, gboolean restart_server)
         }
       }
     }
-    pumpkin_config_save(self->config, NULL);
+    if (!save_language_preference(self)) {
+      return;
+    }
     pumpkin_config_manage_autostart_desktop(pumpkin_config_get_autostart_on_boot(self->config));
     if (self->switch_run_in_background != NULL) {
       GApplication *app = g_application_get_default();
@@ -14595,6 +14643,7 @@ pumpkin_window_init(PumpkinWindow *self)
   }
   g_signal_connect(self->row_start_expanded, "notify::active", G_CALLBACK(on_settings_switch_changed), self);
   g_signal_connect(self->row_start_mode, "notify::selected", G_CALLBACK(on_settings_switch_changed), self);
+  g_signal_connect(self->row_language, "notify::selected", G_CALLBACK(on_settings_switch_changed), self);
   g_signal_connect(self->row_release_channel, "notify::selected", G_CALLBACK(on_release_channel_changed), self);
   g_signal_connect(self->row_start_monitor, "notify::selected", G_CALLBACK(on_settings_switch_changed), self);
   if (self->switch_auto_start_servers != NULL) {
@@ -14694,7 +14743,9 @@ pumpkin_window_init(PumpkinWindow *self)
   }
 
   self->config = pumpkin_config_load(NULL);
+  self->initial_language_index = pumpkin_language_index(pumpkin_config_get_language(self->config));
   self->settings_loading = TRUE;
+  adw_combo_row_set_selected(self->row_language, self->initial_language_index);
   adw_combo_row_set_selected(self->row_release_channel, (guint)pumpkin_config_get_release_channel(self->config));
   self->settings_loading = FALSE;
   adw_switch_row_set_active(self->row_start_expanded, pumpkin_config_get_start_expanded(self->config));
@@ -15218,6 +15269,8 @@ pumpkin_window_class_init(PumpkinWindowClass *class)
   gtk_widget_class_bind_template_child(widget_class, PumpkinWindow, row_release_channel);
   gtk_widget_class_bind_template_child(widget_class, PumpkinWindow, row_start_monitor);
   gtk_widget_class_bind_template_child(widget_class, PumpkinWindow, switch_auto_start_servers);
+  gtk_widget_class_bind_template_child(widget_class, PumpkinWindow, row_language);
+  gtk_widget_class_bind_template_child(widget_class, PumpkinWindow, row_language_restart);
   gtk_widget_class_bind_template_child(widget_class, PumpkinWindow, drop_date_format);
   gtk_widget_class_bind_template_child(widget_class, PumpkinWindow, drop_time_format);
   gtk_widget_class_bind_template_child(widget_class, PumpkinWindow, autostart_server_list);

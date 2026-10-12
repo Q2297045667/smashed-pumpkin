@@ -414,6 +414,9 @@ struct _PumpkinWindow {
   AdwComboRow *row_start_monitor;
   GPtrArray *startup_monitor_ids;
   GtkSwitch *switch_auto_start_servers;
+  AdwComboRow *row_language;
+  AdwActionRow *row_language_restart;
+  guint initial_language_index;
   GtkDropDown *drop_date_format;
   GtkDropDown *drop_time_format;
   GtkListBox *autostart_server_list;

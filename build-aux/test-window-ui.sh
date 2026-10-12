@@ -9,7 +9,7 @@ fi
 root=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
 build=${1:-"$root/buildDir"}
 scope=${2:-all}
-case "$scope" in all|minimap|worlds-map-access|releases|i18n-boundaries|i18n-loading) ;; *) printf 'Unknown UI test scope: %s\n' "$scope" >&2; exit 2 ;; esac
+case "$scope" in all|minimap|worlds-map-access|releases|i18n-boundaries|i18n-loading|language-settings) ;; *) printf 'Unknown UI test scope: %s\n' "$scope" >&2; exit 2 ;; esac
 if [[ "$build" != /* ]]; then
   build="$PWD/$build"
 fi
@@ -152,6 +152,7 @@ if [[ "$scope" == i18n-loading ]]; then
 fi
 env LC_ALL="$test_locale" LANGUAGE="$test_language" TZ=UTC \
   SMASHED_PUMPKIN_LOCALEDIR="$build/tests/i18n" \
+  SMASHED_PUMPKIN_MESSAGE_LOCALEDIR="$build/src/message-locales" \
   XDG_RUNTIME_DIR="$profile/runtime" WAYLAND_DISPLAY="$wayland_display" \
   HOME="$profile" XDG_DATA_HOME="$profile/data" \
   XDG_CONFIG_HOME="$profile/config" XDG_CACHE_HOME="$profile/cache" \
@@ -168,6 +169,10 @@ if [[ -n "$desktop_doc_mount" ]]; then
     exit 1
   fi
   printf '%s\n' 'PASS: the desktop document portal mount is unchanged'
+fi
+if [[ "$scope" == language-settings ]]; then
+  printf '%s\n' 'Only language settings were exercised, using an isolated profile and a fake local server.'
+  exit 0
 fi
 if [[ "$scope" == i18n-loading ]]; then
   printf '%s\n' 'Only translation loading was exercised, using an isolated test catalog; no server was started.'

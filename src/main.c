@@ -161,7 +161,7 @@ main(int argc, char *argv[])
   init_windows_runtime();
 #endif
   gtk_disable_setlocale();
-  pumpkin_i18n_init();
+  pumpkin_i18n_startup();
   smashed_pumpkin_register_resource();
   return g_application_run(G_APPLICATION(pumpkin_app_new()), argc, argv);
 }

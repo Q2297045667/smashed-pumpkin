@@ -49,6 +49,25 @@ conf.set_quoted('APP_VERSION', meson.project_version())
 conf.set_quoted('GETTEXT_PACKAGE', gettext_package)
 conf.set_quoted('LOCALEDIR', gettext_locale_dir)
 
+# glibc suppresses gettext in C-family locales. Ship a messages-only UTF-8
+# locale so explicit language choices do not require a matching system locale.
+message_locale = []
+private_message_locale = false
+message_locale_root = get_option('prefix') / get_option('datadir') / 'smashed-pumpkin/locales'
+if host_machine.system() == 'linux' and not meson.is_cross_build() and cc.compiles('#include <features.h>\n#ifndef __GLIBC__\n#error not glibc\n#endif\nint main(void) { return 0; }')
+  message_locale = custom_target('message-locale',
+    output: 'SYS_LC_MESSAGES',
+    command: [find_program('python3'), meson.project_source_root() / 'build-aux/build-message-locale.py',
+              find_program('localedef', native: true).full_path(), '@OUTPUT@'],
+    depend_files: '../build-aux/build-message-locale.py',
+    build_by_default: true,
+    install: true,
+    install_dir: message_locale_root / 'smashed.UTF-8/LC_MESSAGES')
+  private_message_locale = true
+  conf.set('HAVE_PRIVATE_MESSAGE_LOCALE', 1)
+  conf.set_quoted('MESSAGE_LOCALE_ROOT', message_locale_root)
+endif
+
 startup_deps = []
 if host_machine.system() == 'linux'
   startup_x11_dep = dependency('x11', required: false)
@@ -120,6 +139,8 @@ endif
 sources = [
   'i18n.c',
   'i18n.h',
+  'language.c',
+  'language.h',
   'release-channel.c',
   'release-channel.h',
   'release-metadata.c',
@@ -222,6 +243,7 @@ if android_host
     include_directories: inc,
     dependencies: [adw_dep, Gtk_dep, soup_dep, psapi_dep, math_dep, shell32_dep, user32_dep, dwmapi_dep, crypt32_dep, gmodule_dep, cjson_dep, intl_dep] + platform_credential_deps + startup_deps,
     android_exe_type: 'application',
+    link_depends: message_locale,
     install: true
   )
 else
@@ -231,6 +253,7 @@ else
     include_directories: inc,
     dependencies: [adw_dep, Gtk_dep, soup_dep, psapi_dep, math_dep, shell32_dep, user32_dep, dwmapi_dep, crypt32_dep, gmodule_dep, cjson_dep, intl_dep] + platform_credential_deps + startup_deps,
     win_subsystem: host_machine.system() == 'windows' ? 'windows' : 'console',
+    link_depends: message_locale,
     install: true
   )
 endif
@@ -277,11 +300,15 @@ if not meson.is_cross_build()
     install: false)
   test('player-protocol', player_protocol_tests)
   startup_config_tests = executable('test-startup-config',
-    ['../tests/test-startup-config.c', 'app-config.c', 'release-channel.c'],
+    ['../tests/test-startup-config.c', 'app-config.c', 'release-channel.c', 'language.c'],
     include_directories: inc,
     dependencies: [dependency('gio-2.0')],
     install: false)
   test('startup-config', startup_config_tests)
+  language_tests = executable('test-language',
+    ['../tests/test-language.c', 'language.c', 'app-config.c', 'release-channel.c'],
+    include_directories: inc, dependencies: [dependency('gio-2.0')], install: false)
+  test('language', language_tests)
   plugin_store_tests = executable('test-plugin-store',
     ['../tests/test-plugin-store.c', 'plugin-store.c', 'marketplace-auth.c',
      'vendor/tomlc17/tomlc17.c'],
@@ -334,9 +361,10 @@ endif
 if host_machine.system() == 'linux' and gtk3_dep.found() and appindicator_dep.found()
   executable(
     'smashed-pumpkin-tray',
-    ['tray.c', 'i18n.c', 'i18n.h', 'app-config.c', 'app-config.h', 'release-channel.c', config_h, resources],
+    ['tray.c', 'i18n.c', 'i18n.h', 'language.c', 'language.h', 'app-config.c', 'app-config.h', 'release-channel.c', config_h, resources],
     include_directories: inc,
     dependencies: [gtk3_dep, appindicator_dep, intl_dep],
+    link_depends: message_locale,
     install: true
   )
 elif host_machine.system() == 'linux'
@@ -348,6 +376,7 @@ elif host_machine.system() == 'windows'
     include_directories: inc,
     dependencies: [shell32_dep, user32_dep],
     win_subsystem: 'windows',
+    link_depends: message_locale,
     install: true
   )
 endif

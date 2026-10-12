@@ -77,7 +77,10 @@ More views are available on the [website](https://smashed-pumpkin.rotstein.dev/)
 
 Requires a C compiler, Meson 1.3.2 or newer, Ninja, pkg-config, GNU gettext tools,
 and development headers for GTK 4.12 or newer, libadwaita 1.5 or newer and
-libsoup 3.4 or newer.
+libsoup 3.4 or newer. Native glibc builds also require `localedef`, the `en_US`
+locale source and the UTF-8 charmap (typically provided by a locale-source package).
+These generate a bundled messages-only locale; users do not need matching German
+or Chinese system locales.
 GTK 3 and Ayatana AppIndicator are optional dependencies for the tray helper.
 
 ```bash
@@ -86,6 +89,11 @@ meson compile -C buildDir
 ./buildDir/src/smashed-pumpkin
 meson test -C buildDir --print-errorlogs
 ```
+
+Language selection is in General settings → Display and time and takes effect on
+the next launch without restarting servers. Complete production catalogs are still
+pending; untranslated messages use English. See the [internationalization guide](docs/i18n.md)
+for configuration, uninstalled-build locale paths and translation tests.
 
 If Meson reports that an existing build directory uses an incompatible version,
 run `meson setup --reconfigure buildDir` before compiling again.

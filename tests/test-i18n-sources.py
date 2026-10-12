@@ -44,6 +44,25 @@ class I18nSourcesTest(unittest.TestCase):
                 self.assertNotEqual(brand.attrib.get("translatable"), "yes")
                 self.assertIn(relative, self.pot)
 
+    def test_language_selector_structure(self):
+        for relative in ("resources/ui/window.ui", "resources/ui/window-windows.ui"):
+            with self.subTest(template=relative):
+                root = ET.parse(ROOT / relative).getroot()
+                row = root.find(".//object[@id='row_language']")
+                self.assertIsNotNone(row)
+                title = row.find("./property[@name='title']")
+                self.assertEqual(title.text, "Language")
+                self.assertEqual(title.attrib.get("translatable"), "yes")
+                items = row.findall(".//items/item")
+                self.assertEqual([item.text for item in items],
+                                 ["System language", "English", "Chinese (Simplified)", "Deutsch"])
+                self.assertEqual(items[0].attrib.get("translatable"), "yes")
+                for item in items[1:]:
+                    self.assertNotEqual(item.attrib.get("translatable"), "yes")
+                notice = root.find(".//object[@id='row_language_restart']")
+                self.assertIsNotNone(notice)
+                self.assertEqual(notice.find("./property[@name='visible']").text.lower(), "false")
+
     def test_real_sources_only(self):
         self.assertEqual(len(self.paths), len(set(self.paths)))
         for relative in self.paths:
@@ -56,7 +75,8 @@ class I18nSourcesTest(unittest.TestCase):
 
     def test_static_and_dynamic_extraction(self):
         for message in ("Overview", "Install", "Stop", "Force Stop...",
-                        "Not installed", "Build %s", "Open", "Quit"):
+                        "Not installed", "Build %s", "Open", "Quit", "Language",
+                        "System language", "Language change saved", "General settings saved"):
             with self.subTest(message=message):
                 self.assertIn(f'msgid "{message}"', self.pot)
         self.assertIn("#, c-format", self.pot)

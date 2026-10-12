@@ -14,9 +14,8 @@ if [[ "$build" != /* ]]; then
   build="$PWD/$build"
 fi
 meson compile -C "$build" smashed-pumpkin
-if [[ "$scope" == i18n-loading ]]; then
-  meson compile -C "$build" i18n-test-catalog
-fi
+# Every scope discovers its language selector from this isolated catalog root.
+meson compile -C "$build" i18n-test-catalog i18n-simplified-fixture i18n-traditional-fixture
 
 profile=$(mktemp -d /tmp/smashed-pumpkin-ui-check-XXXXXX)
 cleanup_profile() {

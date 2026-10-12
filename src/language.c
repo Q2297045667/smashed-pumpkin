@@ -1,4 +1,5 @@
 #include "language.h"
+#include "config.h"
 
 #include <errno.h>
 #include <glib/gstdio.h>
@@ -7,13 +8,162 @@
 #include <windows.h>
 #endif
 
-static const char *const language_ids[] = { "system", "en", "zh_CN", "de" };
+typedef struct {
+  char *id;
+  char *name;
+  char *tag;
+  char **aliases;
+} Language;
+
+static GPtrArray *languages;
+static gsize languages_initialized;
+
+/* Only the source-language fallback and the preference sentinel are built in.
+ * All other languages and optional locale aliases come from installed catalogs. */
+static char *
+normalize_tag(const char *id)
+{
+  char *tag = g_ascii_strdown(id, -1);
+  char *encoding = strchr(tag, '.');
+  if (encoding != NULL) {
+    char *modifier = strchr(encoding, '@');
+    if (modifier != NULL) memmove(encoding, modifier, strlen(modifier) + 1);
+    else *encoding = '\0';
+  }
+  for (char *p = tag; *p != '\0'; p++) if (*p == '-') *p = '_';
+  return tag;
+}
+
+static gboolean
+catalog_id_is_safe(const char *id)
+{
+  if (id == NULL || !g_ascii_isalpha(*id)) return FALSE;
+  for (const char *p = id; *p != '\0'; p++) {
+    if (!g_ascii_isalnum(*p) && *p != '_' && *p != '-' && *p != '@') return FALSE;
+  }
+  return TRUE;
+}
+
+static guint32
+mo_word(const guint8 *data, gsize offset, gboolean little_endian)
+{
+  guint32 value;
+  memcpy(&value, data + offset, sizeof value);
+  return little_endian ? GUINT32_FROM_LE(value) : GUINT32_FROM_BE(value);
+}
+
+/* Read only the metadata entry, without changing gettext's current language.
+ * Check every offset before touching data from a possibly damaged catalog. */
+static char *
+catalog_header(const char *path)
+{
+  g_autoptr(GMappedFile) file = g_mapped_file_new(path, FALSE, NULL);
+  if (file == NULL) return NULL;
+  gsize size = g_mapped_file_get_length(file);
+  const guint8 *data = (const guint8 *)g_mapped_file_get_contents(file);
+  if (size < 28) return NULL;
+  guint32 magic = mo_word(data, 0, TRUE);
+  gboolean little_endian = magic == 0x950412de;
+  if (!little_endian && magic != 0xde120495) return NULL;
+  if ((mo_word(data, 4, little_endian) >> 16) > 1) return NULL;
+  guint32 count = mo_word(data, 8, little_endian);
+  guint32 originals = mo_word(data, 12, little_endian);
+  guint32 translations = mo_word(data, 16, little_endian);
+  if (originals > size || translations > size ||
+      count > (size - originals) / 8 || count > (size - translations) / 8) return NULL;
+  for (guint32 i = 0; i < count; i++) {
+    if (mo_word(data, originals + (gsize)i * 8, little_endian) != 0) continue;
+    guint32 original_offset = mo_word(data, originals + (gsize)i * 8 + 4, little_endian);
+    if (original_offset >= size || data[original_offset] != '\0') return NULL;
+    guint32 length = mo_word(data, translations + (gsize)i * 8, little_endian);
+    guint32 offset = mo_word(data, translations + (gsize)i * 8 + 4, little_endian);
+    if (offset >= size || length >= size - offset || data[offset + length] != '\0' ||
+        !g_utf8_validate((const char *)data + offset, length, NULL)) return NULL;
+    return g_strndup((const char *)data + offset, length);
+  }
+  return NULL;
+}
+
+static char *
+header_value(const char *header, const char *field)
+{
+  g_auto(GStrv) lines = g_strsplit(header, "\n", -1);
+  gsize length = strlen(field);
+  for (guint i = 0; lines[i] != NULL; i++) {
+    if (g_ascii_strncasecmp(lines[i], field, length) == 0 && lines[i][length] == ':') {
+      return g_strdup(g_strstrip(lines[i] + length + 1));
+    }
+  }
+  return NULL;
+}
+
+static void
+add_language(const char *id, const char *name, const char *aliases)
+{
+  Language *language = g_new0(Language, 1);
+  language->id = g_strdup(id);
+  language->name = g_strdup(name != NULL && *name != '\0' ? name : id);
+  language->tag = normalize_tag(id);
+  language->aliases = g_strsplit(aliases != NULL ? aliases : "", ";", -1);
+  for (guint i = 0; language->aliases[i] != NULL; i++) {
+    char *tag = normalize_tag(g_strstrip(language->aliases[i]));
+    g_free(language->aliases[i]);
+    language->aliases[i] = tag;
+  }
+  g_ptr_array_add(languages, language);
+}
+
+static gint
+compare_languages(gconstpointer left, gconstpointer right)
+{
+  const Language *a = *(Language *const *)left;
+  const Language *b = *(Language *const *)right;
+  return g_strcmp0(a->id, b->id);
+}
+
+static void
+ensure_languages(void)
+{
+  if (g_once_init_enter(&languages_initialized)) {
+    languages = g_ptr_array_new();
+    const char *root = g_getenv("SMASHED_PUMPKIN_LOCALEDIR");
+    if (root == NULL || !g_path_is_absolute(root)) root = LOCALEDIR;
+    g_autoptr(GDir) dir = g_dir_open(root, 0, NULL);
+    const char *id;
+    while (dir != NULL && (id = g_dir_read_name(dir)) != NULL) {
+      if (!catalog_id_is_safe(id) || g_str_equal(id, "system") || g_str_equal(id, "en")) continue;
+      g_autofree char *tag = normalize_tag(id);
+      if (g_str_equal(tag, "c") || g_str_equal(tag, "posix")) continue;
+      g_autofree char *path = g_build_filename(root, id, "LC_MESSAGES", GETTEXT_PACKAGE ".mo", NULL);
+      g_autofree char *header = catalog_header(path);
+      if (header == NULL) continue;
+      g_autofree char *name = header_value(header, "X-Language-Name");
+      g_autofree char *aliases = header_value(header, "X-Language-Aliases");
+      add_language(id, name, aliases);
+    }
+    g_ptr_array_sort(languages, compare_languages);
+    add_language("en", "English", NULL);
+    g_ptr_array_insert(languages, 0, g_ptr_array_steal_index(languages, languages->len - 1));
+    add_language("system", "System language", NULL);
+    g_ptr_array_insert(languages, 0, g_ptr_array_steal_index(languages, languages->len - 1));
+    g_once_init_leave(&languages_initialized, 1);
+  }
+}
+
+guint
+pumpkin_language_count(void)
+{
+  ensure_languages();
+  return languages->len;
+}
 
 gboolean
 pumpkin_language_is_valid(const char *id)
 {
-  for (guint i = 0; i < G_N_ELEMENTS(language_ids); i++) {
-    if (g_strcmp0(id, language_ids[i]) == 0) return TRUE;
+  ensure_languages();
+  for (guint i = 0; i < languages->len; i++) {
+    Language *language = g_ptr_array_index(languages, i);
+    if (g_strcmp0(id, language->id) == 0) return TRUE;
   }
   return FALSE;
 }
@@ -21,8 +171,10 @@ pumpkin_language_is_valid(const char *id)
 guint
 pumpkin_language_index(const char *id)
 {
-  for (guint i = 0; i < G_N_ELEMENTS(language_ids); i++) {
-    if (g_strcmp0(id, language_ids[i]) == 0) return i;
+  ensure_languages();
+  for (guint i = 0; i < languages->len; i++) {
+    Language *language = g_ptr_array_index(languages, i);
+    if (g_strcmp0(id, language->id) == 0) return i;
   }
   return 1; /* Unknown persisted values display the safe English fallback. */
 }
@@ -30,24 +182,54 @@ pumpkin_language_index(const char *id)
 const char *
 pumpkin_language_from_index(guint index)
 {
-  return index < G_N_ELEMENTS(language_ids) ? language_ids[index] : "en";
+  ensure_languages();
+  return ((Language *)g_ptr_array_index(languages, index < languages->len ? index : 1))->id;
+}
+
+const char *
+pumpkin_language_name(guint index)
+{
+  ensure_languages();
+  return ((Language *)g_ptr_array_index(languages, index < languages->len ? index : 1))->name;
+}
+
+static const char *
+match_tag(const char *tag)
+{
+  /* A real catalog ID wins over an alias declared by another catalog. */
+  for (guint i = 1; i < languages->len; i++) {
+    Language *language = g_ptr_array_index(languages, i);
+    if (g_str_equal(tag, language->tag)) return language->id;
+  }
+  for (guint i = 2; i < languages->len; i++) {
+    Language *language = g_ptr_array_index(languages, i);
+    for (guint a = 0; language->aliases[a] != NULL; a++) {
+      if (*language->aliases[a] != '\0' && g_str_equal(tag, language->aliases[a])) return language->id;
+    }
+  }
+  return NULL;
 }
 
 const char *
 pumpkin_language_detect(const char *const *preferences)
 {
+  ensure_languages();
   for (const char *const *p = preferences; p != NULL && *p != NULL; p++) {
-    g_autofree char *tag = g_ascii_strdown(*p, -1);
-    for (char *c = tag; *c != '\0'; c++) {
-      if (*c == '-') *c = '_';
-      if (*c == '.' || *c == '@') { *c = '\0'; break; }
-    }
+    g_autofree char *tag = normalize_tag(*p);
     if (g_str_equal(tag, "c") || g_str_equal(tag, "posix")) return "en";
-    if (g_str_equal(tag, "en") || g_str_has_prefix(tag, "en_")) return "en";
-    if (g_str_equal(tag, "de") || g_str_has_prefix(tag, "de_")) return "de";
-    /* Do not silently treat Traditional Chinese as Simplified Chinese. */
-    if (g_str_equal(tag, "zh_cn") || g_str_equal(tag, "zh_sg") ||
-        g_str_equal(tag, "zh_hans") || g_str_has_prefix(tag, "zh_hans_")) return "zh_CN";
+    const char *match = match_tag(tag);
+    if (match != NULL) return match;
+    /* Fall back to a less specific installed catalog, never a different region
+     * or script. Explicit cross-region equivalents belong in catalog metadata. */
+    char *modifier = strchr(tag, '@');
+    if (modifier != NULL) *modifier = '\0';
+    while (TRUE) {
+      match = match_tag(tag);
+      if (match != NULL) return match;
+      char *separator = strrchr(tag, '_');
+      if (separator == NULL) break;
+      *separator = '\0';
+    }
   }
   return "en";
 }

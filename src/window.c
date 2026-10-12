@@ -14643,6 +14643,11 @@ pumpkin_window_init(PumpkinWindow *self)
   }
   g_signal_connect(self->row_start_expanded, "notify::active", G_CALLBACK(on_settings_switch_changed), self);
   g_signal_connect(self->row_start_mode, "notify::selected", G_CALLBACK(on_settings_switch_changed), self);
+  g_autoptr(GtkStringList) language_names = gtk_string_list_new(NULL);
+  for (guint i = 0; i < pumpkin_language_count(); i++) {
+    gtk_string_list_append(language_names, i == 0 ? _("System language") : pumpkin_language_name(i));
+  }
+  adw_combo_row_set_model(self->row_language, G_LIST_MODEL(language_names));
   g_signal_connect(self->row_language, "notify::selected", G_CALLBACK(on_settings_switch_changed), self);
   g_signal_connect(self->row_release_channel, "notify::selected", G_CALLBACK(on_release_channel_changed), self);
   g_signal_connect(self->row_start_monitor, "notify::selected", G_CALLBACK(on_settings_switch_changed), self);

@@ -2136,7 +2136,10 @@ static void test_language_settings_only(PumpkinWindow *window)
   g_assert_cmpstr(pumpkin_i18n_get_language(), ==, "en");
   g_assert_cmpuint(adw_combo_row_get_selected(window->row_language), ==, pumpkin_language_index("en"));
   g_assert_false(gtk_widget_get_visible(GTK_WIDGET(window->row_language_restart)));
-  g_assert_cmpuint(g_list_model_get_n_items(adw_combo_row_get_model(window->row_language)), ==, 4);
+  g_assert_cmpuint(g_list_model_get_n_items(adw_combo_row_get_model(window->row_language)), ==, pumpkin_language_count());
+  g_assert_true(pumpkin_language_is_valid("zh_TW"));
+  g_assert_cmpstr(gtk_string_list_get_string(GTK_STRING_LIST(adw_combo_row_get_model(window->row_language)),
+                  pumpkin_language_index("zh_TW")), ==, "Chinese (Traditional)");
   adw_combo_row_set_selected(window->row_language, pumpkin_language_index("de"));
   g_assert_true(window->settings_dirty);
   adw_combo_row_set_selected(window->row_language, pumpkin_language_index("en"));
@@ -2153,10 +2156,10 @@ static void test_language_settings_only(PumpkinWindow *window)
   pumpkin_window_select_server(window, pumpkin_server_get_id(server));
   g_assert_true(pumpkin_server_start(server, NULL));
   spin(200);
-  adw_combo_row_set_selected(window->row_language, pumpkin_language_index("zh_CN"));
+  adw_combo_row_set_selected(window->row_language, pumpkin_language_index("zh_TW"));
   g_signal_emit_by_name(window->btn_save_general_settings, "clicked");
   PumpkinConfig *saved = pumpkin_config_load(NULL);
-  g_assert_cmpstr(pumpkin_config_get_language(saved), ==, "zh_CN");
+  g_assert_cmpstr(pumpkin_config_get_language(saved), ==, "zh_TW");
   pumpkin_config_free(saved);
   g_assert_true(gtk_widget_get_visible(GTK_WIDGET(window->row_language_restart)));
   g_assert_false(window->settings_dirty);
@@ -2165,7 +2168,7 @@ static void test_language_settings_only(PumpkinWindow *window)
   g_assert_cmpstr(_("Overview"), ==, "Overview");
   g_assert_cmpstr(setlocale(LC_NUMERIC, NULL), ==, "C");
   update_settings_form(window);
-  g_assert_cmpuint(adw_combo_row_get_selected(window->row_language), ==, pumpkin_language_index("zh_CN"));
+  g_assert_cmpuint(adw_combo_row_get_selected(window->row_language), ==, pumpkin_language_index("zh_TW"));
   adw_combo_row_set_selected(window->row_language, pumpkin_language_index("system"));
   gtk_drop_down_set_selected(window->drop_date_format, PUMPKIN_DATE_FORMAT_YMD);
   PumpkinTimeFormat time_format = pumpkin_config_get_time_format(window->config) == PUMPKIN_TIME_FORMAT_24H ?

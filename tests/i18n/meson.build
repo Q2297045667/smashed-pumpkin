@@ -1,4 +1,7 @@
 subdir('de/LC_MESSAGES')
+i18n_discovery_catalogs = [i18n_test_catalog]
+subdir('zh_CN/LC_MESSAGES')
+subdir('zh_TW/LC_MESSAGES')
 
 i18n_tests = executable('test-i18n',
   ['../test-i18n.c', '../../src/i18n.c', '../../src/language.c', '../../src/build-metadata.c'],
@@ -46,6 +49,9 @@ foreach scenario : [
   ['manual-invalid-locale', 'de', 'smashed_invalid_locale', 'en', 'de', 'Übersicht', 'private'],
   ['manual-en', 'en', 'en_US.UTF-8', 'de', 'en', 'Overview', 'normal'],
   ['manual-zh', 'zh_CN', 'C', 'de', 'zh_CN', 'Overview', 'private'],
+  ['first-traditional', 'absent', 'C.UTF-8', 'zh_TW.UTF-8', 'zh_TW', 'Traditional catalog fixture', 'private'],
+  ['system-traditional', 'system', 'C.UTF-8', 'zh-Hant-TW', 'zh_TW', 'Traditional catalog fixture', 'private'],
+  ['manual-traditional', 'zh_TW', 'C', 'en', 'zh_TW', 'Traditional catalog fixture', 'private'],
   ['unsupported', 'unsupported-id', 'C', 'de', 'en', 'Overview', 'normal'],
   ['system-posix', 'system', 'C', 'de', 'en', 'Overview', 'normal'],
   ['first-unsupported', 'absent', 'C.UTF-8', 'fr', 'en', 'Overview', 'normal'],
@@ -56,9 +62,13 @@ foreach scenario : [
       env: {'LC_ALL': scenario[2], 'LANGUAGE': scenario[3],
             'SMASHED_PUMPKIN_LOCALEDIR': meson.current_build_dir(),
             'SMASHED_PUMPKIN_MESSAGE_LOCALEDIR': meson.project_build_root() / 'src/message-locales'},
-      depends: [i18n_test_catalog, message_locale])
+      depends: i18n_discovery_catalogs + [message_locale])
   endif
 endforeach
+
+test('list-translations', translation_python,
+  args: files('../test-list-translations.py'),
+  env: {'PYTHONDONTWRITEBYTECODE': '1'})
 
 xgettext = find_program('xgettext', native: true)
 test('i18n-sources', find_program('python3'),

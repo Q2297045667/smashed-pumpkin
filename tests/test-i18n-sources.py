@@ -53,12 +53,9 @@ class I18nSourcesTest(unittest.TestCase):
                 title = row.find("./property[@name='title']")
                 self.assertEqual(title.text, "Language")
                 self.assertEqual(title.attrib.get("translatable"), "yes")
-                items = row.findall(".//items/item")
-                self.assertEqual([item.text for item in items],
-                                 ["System language", "English", "Chinese (Simplified)", "Deutsch"])
-                self.assertEqual(items[0].attrib.get("translatable"), "yes")
-                for item in items[1:]:
-                    self.assertNotEqual(item.attrib.get("translatable"), "yes")
+                # The model is populated from catalogs at runtime, not template IDs.
+                self.assertIsNone(row.find("./property[@name='model']"))
+                self.assertEqual(row.findall(".//items/item"), [])
                 notice = root.find(".//object[@id='row_language_restart']")
                 self.assertIsNotNone(notice)
                 self.assertEqual(notice.find("./property[@name='visible']").text.lower(), "false")

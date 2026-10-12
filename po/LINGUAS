@@ -1,2 +1,3 @@
-# Production catalogs will be added during the full translation phase.
-# The small German catalog under tests/i18n is a test fixture, not a release.
+# Keep this compatibility file empty; po/meson.build discovers *.po automatically.
+# Meson reads it only when the catalog scan is empty. Do not add language IDs here.
+# Catalogs under tests/i18n are isolated fixtures, never release translations.

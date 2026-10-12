@@ -1323,16 +1323,6 @@
                                           <object class="AdwComboRow" id="row_language">
                                             <property name="title" translatable="yes">Language</property>
                                             <property name="subtitle" translatable="yes">Save to apply on the next application launch. Missing translations use English.</property>
-                                            <property name="model">
-                                              <object class="GtkStringList">
-                                                <items>
-                                                  <item translatable="yes">System language</item>
-                                                  <item>English</item>
-                                                  <item>Chinese (Simplified)</item>
-                                                  <item>Deutsch</item>
-                                                </items>
-                                              </object>
-                                            </property>
                                           </object>
                                         </child>
                                         <child>

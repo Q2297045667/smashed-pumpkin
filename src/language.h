@@ -4,7 +4,11 @@
 
 G_BEGIN_DECLS
 
-/* Stable persisted IDs, independent of translated labels and catalog presence. */
+/* Catalog discovery is cached for the process lifetime. IDs and optional display
+ * names/locale aliases come from the active gettext directory, not a fixed list.
+ * Returned strings are borrowed; system and source English are always available. */
+guint pumpkin_language_count(void);
+const char *pumpkin_language_name(guint index);
 gboolean pumpkin_language_is_valid(const char *id);
 guint pumpkin_language_index(const char *id);
 const char *pumpkin_language_from_index(guint index);

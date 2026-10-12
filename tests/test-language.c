@@ -9,6 +9,44 @@
 
 static char *profile;
 static char *path;
+static char *catalog_root;
+static void write_config(const char *text);
+static void expect_prepare(const char *id);
+
+static void
+write_catalog(const char *id, const char *header)
+{
+  g_autofree char *dir = g_build_filename(catalog_root, id, "LC_MESSAGES", NULL);
+  g_assert_cmpint(g_mkdir_with_parents(dir, 0700), ==, 0);
+  g_autofree char *file = g_build_filename(dir, "smashed-pumpkin.mo", NULL);
+  gsize length = strlen(header);
+  g_autofree guint8 *data = g_malloc0(46 + length);
+  const guint32 words[] = { 0x950412de, 0, 1, 28, 36, 0, 0, 0, 44, (guint32)length, 45 };
+  for (guint i = 0; i < G_N_ELEMENTS(words); i++) {
+    guint32 value = GUINT32_TO_LE(words[i]);
+    memcpy(data + i * 4, &value, 4);
+  }
+  memcpy(data + 45, header, length);
+  g_assert_true(g_file_set_contents(file, (const char *)data, 46 + length, NULL));
+}
+
+static void
+test_catalog_fallback(void)
+{
+  if (!g_test_subprocess()) {
+    g_test_trap_subprocess(NULL, 5000000, 0);
+    g_test_trap_assert_passed();
+    return;
+  }
+  g_autofree char *missing = g_build_filename(profile, "empty", NULL);
+  g_setenv("SMASHED_PUMPKIN_LOCALEDIR", missing, TRUE);
+  g_assert_cmpuint(pumpkin_language_count(), ==, 2);
+  g_assert_false(pumpkin_language_is_valid("zh_TW"));
+  const char *preferences[] = { "zh_TW.UTF-8", NULL };
+  g_assert_cmpstr(pumpkin_language_detect(preferences), ==, "en");
+  write_config("[behavior]\nlanguage=zh_TW\n");
+  expect_prepare("en");
+}
 
 static void
 write_config(const char *text)
@@ -34,8 +72,10 @@ test_detection(void)
   const struct { const char *tag; const char *id; } cases[] = {
     {"de_DE.UTF-8", "de"}, {"DE-ch", "de"}, {"en_GB", "en"},
     {"zh_CN.UTF-8", "zh_CN"}, {"zh-SG", "zh_CN"}, {"zh-Hans-CN", "zh_CN"},
-    {"zh-Hans", "zh_CN"}, {"zh_TW", "en"}, {"zh-Hant", "en"},
-    {"zh_HK", "en"}, {"fr_FR", "en"}, {"C", "en"}, {"POSIX", "en"},
+    {"zh-Hans", "zh_CN"}, {"zh_TW", "zh_TW"}, {"zh-Hant", "zh_TW"},
+    {"zh_HK", "zh_TW"}, {"zh-Hant-TW", "zh_TW"}, {"zh_TW.UTF-8", "zh_TW"},
+    {"zh", "en"}, {"eo_XX", "eo"}, {"sr_RS@latin", "sr@latin"},
+    {"fr_FR", "en"}, {"C", "en"}, {"POSIX", "en"},
     {"C.UTF-8", "en"}, {"deceptive", "en"}, {"english", "en"}, {"", "en"}
   };
   for (guint i = 0; i < G_N_ELEMENTS(cases); i++) {
@@ -43,14 +83,19 @@ test_detection(void)
     g_assert_cmpstr(pumpkin_language_detect(preferences), ==, cases[i].id);
   }
   const char *chain[] = { "fr_FR", "zh_TW", "de_AT", "en", NULL };
-  g_assert_cmpstr(pumpkin_language_detect(chain), ==, "de");
+  g_assert_cmpstr(pumpkin_language_detect(chain), ==, "zh_TW");
   g_assert_cmpstr(pumpkin_language_detect(NULL), ==, "en");
-  const char *ids[] = { "system", "en", "zh_CN", "de" };
+  const char *ids[] = { "system", "en", "de", "eo", "sr@latin", "zh_CN", "zh_TW" };
+  g_assert_cmpuint(pumpkin_language_count(), ==, G_N_ELEMENTS(ids));
   for (guint i = 0; i < G_N_ELEMENTS(ids); i++) {
     g_assert_true(pumpkin_language_is_valid(ids[i]));
     g_assert_cmpuint(pumpkin_language_index(ids[i]), ==, i);
     g_assert_cmpstr(pumpkin_language_from_index(i), ==, ids[i]);
   }
+  g_assert_cmpstr(pumpkin_language_name(pumpkin_language_index("de")), ==, "Deutsch");
+  g_assert_cmpstr(pumpkin_language_name(pumpkin_language_index("eo")), ==, "eo");
+  g_assert_false(pumpkin_language_is_valid("broken"));
+  g_assert_false(pumpkin_language_is_valid("unrelated"));
   g_assert_false(pumpkin_language_is_valid(NULL));
   g_assert_false(pumpkin_language_is_valid("Deutsch"));
   g_assert_cmpstr(pumpkin_language_from_index(G_MAXUINT), ==, "en");
@@ -231,7 +276,20 @@ main(int argc, char **argv)
   g_setenv("XDG_CONFIG_HOME", profile, TRUE);
   g_setenv("XDG_DATA_HOME", profile, TRUE);
   path = g_build_filename(profile, "smashed-pumpkin", "config.ini", NULL);
+  catalog_root = g_build_filename(profile, "catalogs", NULL);
+  g_setenv("SMASHED_PUMPKIN_LOCALEDIR", catalog_root, TRUE);
+  write_catalog("de", "X-Language-Name: Deutsch\n");
+  write_catalog("eo", "Content-Type: text/plain; charset=UTF-8\n");
+  write_catalog("sr@latin", "X-Language-Aliases: sr_RS@latin\n");
+  write_catalog("zh_CN", "X-Language-Name: Chinese (Simplified)\nX-Language-Aliases: zh_SG;zh_Hans;zh_Hans_CN\n");
+  write_catalog("zh_TW", "X-Language-Name: Chinese (Traditional)\nX-Language-Aliases: zh_Hant;zh_HK;zh_MO\n");
+  write_catalog("broken", "valid before truncation\n");
+  g_autofree char *broken = g_build_filename(catalog_root, "broken", "LC_MESSAGES", "smashed-pumpkin.mo", NULL);
+  g_assert_true(g_file_set_contents(broken, "invalid", -1, NULL));
+  g_autofree char *unrelated = g_build_filename(catalog_root, "unrelated", NULL);
+  g_assert_cmpint(g_mkdir_with_parents(unrelated, 0700), ==, 0);
   g_test_init(&argc, &argv, NULL);
+  g_test_add_func("/language/empty-catalogs", test_catalog_fallback);
   g_test_add_func("/language/detection", test_detection);
   g_test_add_func("/language/first-launch", test_first_launch);
   g_test_add_func("/language/system-and-fallback", test_system_and_fallback);
@@ -247,6 +305,18 @@ main(int argc, char **argv)
   g_autofree char *servers = g_build_filename(dir, "servers", NULL);
   g_rmdir(servers);
   g_rmdir(dir);
+  const char *catalogs[] = { "de", "eo", "sr@latin", "zh_CN", "zh_TW", "broken" };
+  for (guint i = 0; i < G_N_ELEMENTS(catalogs); i++) {
+    g_autofree char *dir = g_build_filename(catalog_root, catalogs[i], "LC_MESSAGES", NULL);
+    g_autofree char *file = g_build_filename(dir, "smashed-pumpkin.mo", NULL);
+    g_remove(file);
+    g_rmdir(dir);
+    g_autofree char *parent = g_path_get_dirname(dir);
+    g_rmdir(parent);
+  }
+  g_rmdir(unrelated);
+  g_rmdir(catalog_root);
+  g_free(catalog_root);
   g_rmdir(profile);
   g_free(path);
   g_free(profile);

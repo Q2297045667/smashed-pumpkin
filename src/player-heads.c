@@ -83,6 +83,36 @@ png_uint32(const guchar *data)
     ((guint32)data[2] << 8) | (guint32)data[3];
 }
 
+static guint32
+png_crc32(const guchar *data, gsize size)
+{
+  guint32 crc = 0xffffffff;
+  for (gsize i = 0; i < size; i++) {
+    crc ^= data[i];
+    for (int bit = 0; bit < 8; bit++)
+      crc = (crc >> 1) ^ ((crc & 1) ? 0xedb88320 : 0);
+  }
+  return crc ^ 0xffffffff;
+}
+
+/* Walk the chunk structure and verify every chunk CRC up to IEND. Image
+ * decoders differ in how much they validate (some accept corrupt CRCs), so
+ * the app-side gate must be deterministic across decoder versions. */
+static gboolean
+png_chunks_valid(const guchar *data, gsize size)
+{
+  gsize offset = 8;
+  while (offset + 12 <= size) {
+    guint32 length = png_uint32(data + offset);
+    if (length > size - offset - 12) return FALSE;
+    guint32 stored = png_uint32(data + offset + 8 + length);
+    if (png_crc32(data + offset + 4, length + 4) != stored) return FALSE;
+    if (memcmp(data + offset + 4, "IEND", 4) == 0) return TRUE;
+    offset += 12 + length;
+  }
+  return FALSE;
+}
+
 static GdkPixbuf *
 decode_head_png(GBytes *bytes, gboolean allow_legacy)
 {
@@ -97,8 +127,15 @@ decode_head_png(GBytes *bytes, gboolean allow_legacy)
   guint32 height = png_uint32(data + 20);
   /* Validate the mandatory first PNG chunk before giving any data to a
    * decoder: a small compressed response can otherwise allocate a huge image.
-   * Never downscale an invalid size into an accepted skin or cached avatar. */
-  if (width != 64 || (height != 64 && !(allow_legacy && height == 32))) return NULL;
+   * Never downscale an invalid size into an accepted skin or cached avatar.
+   * Only 8-bit truecolor PNGs (RGB or RGBA, no interlacing) are accepted;
+   * the texture wrapper assumes exactly that layout. */
+  if (width != 64 || (height != 64 && !(allow_legacy && height == 32)) ||
+      data[24] != 8 || (data[25] != 2 && data[25] != 6) ||
+      data[26] != 0 || data[27] != 0 || data[28] != 0) return NULL;
+  /* Decoders disagree on how much of the rest they validate: verify every
+   * chunk CRC ourselves so malformed input is rejected on every platform. */
+  if (!png_chunks_valid(data, size)) return NULL;
   g_autoptr(GdkPixbufLoader) loader = gdk_pixbuf_loader_new_with_type("png", NULL);
   if (loader == NULL) return NULL;
   g_autoptr(GError) loader_error = NULL;

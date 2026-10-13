@@ -138,7 +138,7 @@
       "name": "prepare-locale-directories",
       "buildsystem": "simple",
       "build-commands": [
-        "sh -c 'for dir in /app/share/locale/*/; do entry=${dir%/}; [ -L \"$entry\" ] && rm -f \"$entry\"; done'"
+        "sh -c 'find /app/share/locale -maxdepth 1 -type l -exec rm -f {} +; exit 0'"
       ],
       "sources": []
     },

@@ -30,6 +30,21 @@
 
 void smashed_pumpkin_register_resource(void);
 
+static char *
+notice_display_payload(PumpkinWindow *window, const char *notice)
+{
+  g_autofree char *display = format_console_line(window, notice, NULL);
+  g_assert_nonnull(display);
+  g_assert_cmpint(display[0], ==, '[');
+  g_assert_true(g_ascii_isdigit(display[1]));
+  const char *timestamp_end = strstr(display, "] ");
+  g_assert_nonnull(timestamp_end);
+  g_assert_cmpstr(timestamp_end + 2, !=, "");
+  /* Compare normalized severity and message text without a newly generated
+   * receipt time. Timestamp formatting has its own fixed-clock assertion. */
+  return g_strdup(timestamp_end + 2);
+}
+
 static void spin(int milliseconds)
 {
   gint64 end = g_get_monotonic_time() + milliseconds * 1000;
@@ -234,10 +249,13 @@ static void test_console_polling(PumpkinWindow *window, PumpkinServer *server)
     g_assert_false(pumpkin_command_poll_ready(G_OBJECT(server), "list uuids", g_get_monotonic_time()));
     g_assert_false(pumpkin_command_poll_ready(G_OBJECT(server), "tps", g_get_monotonic_time()));
   }
+  /* Reading later must still find each notice exactly once, regardless of
+   * the timestamp assigned when it was received. */
+  spin(1100);
   g_clear_pointer(&text, g_free);
   text = buffer_text(buffer);
   for (guint i = 0; i < G_N_ELEMENTS(notices); ++i) {
-    g_autofree char *display = format_console_line(window, notices[i], NULL);
+    g_autofree char *display = notice_display_payload(window, notices[i]);
     g_assert_nonnull(strstr(text, display));
     g_assert_true(strstr(text, display) == g_strrstr(text, display));
   }
@@ -1185,6 +1203,9 @@ test_failed_restart_notice(PumpkinWindow *window, const char *binary, gsize size
   while (notice == NULL && g_get_monotonic_time() < deadline) spin(10);
   g_assert_nonnull(notice);
   g_assert_cmpstr(notice, !=, "");
+  /* Inspect after a clock-second boundary: the assertion must not recreate
+   * the receipt timestamp with a later call to the live formatter. */
+  spin(1100);
   /* A failed automatic restart is an application notice, not evidence of a
    * running process. Parsing it as raw server output would revive the hint. */
   g_assert_false(pumpkin_server_get_running(server));
@@ -1193,8 +1214,9 @@ test_failed_restart_notice(PumpkinWindow *window, const char *binary, gsize size
   GtkTextBuffer *buffer = g_hash_table_lookup(window->console_buffers, server);
   g_assert_nonnull(buffer);
   g_autofree char *text = buffer_text(buffer);
-  g_autofree char *display = format_console_line(window, notice, NULL);
+  g_autofree char *display = notice_display_payload(window, notice);
   g_assert_nonnull(strstr(text, display));
+  g_assert_true(strstr(text, display) == g_strrstr(text, display));
   g_signal_handler_disconnect(server, notice_handler);
   pumpkin_server_set_auto_restart(server, FALSE);
   pumpkin_server_stop(server);

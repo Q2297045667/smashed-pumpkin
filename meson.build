@@ -7,6 +7,13 @@ project('smashed-pumpkin', 'c',
   ]
 )
 
+# Local fixtures must not load the desktop's proxy, VFS or settings services.
+add_test_setup('isolated', is_default: true, env: {
+  'GIO_USE_VFS': 'local',
+  'GIO_USE_PROXY_RESOLVER': 'dummy',
+  'GSETTINGS_BACKEND': 'memory',
+})
+
 gnome = import('gnome')
 i18n = import('i18n')
 gettext_package = 'smashed-pumpkin'

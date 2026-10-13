@@ -157,8 +157,11 @@ read -r -a gio_flags <<< "$(pkg-config --cflags gio-2.0)"
 "${compiler[@]}" "${compile_flags[@]}" -DPUMPKIN_STOP_TIMEOUT_SECONDS=1 \
   "${gio_flags[@]}" -c "$root/src/server.c" -o "$profile/server.o"
 objects+=("$profile/server.o")
+"${compiler[@]}" "${compile_flags[@]}" "$root/tests/test-gtk-frames.c" \
+  "${flags[@]}" -o "$profile/test-gtk-frames"
 "${compiler[@]}" "${compile_flags[@]}" "${test_defines[@]}" \
-  "$root/tests/test-window-ui.c" "${objects[@]}" \
+  -I"$root/src" "$root/tests/test-window-ui.c" "$root/tests/ui-marketplace-fixture.c" "${objects[@]}" \
+  -Wl,--wrap=pumpkin_marketplace_request_async \
   "${link_flags[@]}" "${flags[@]}" -o "$profile/test-window-ui"
 
 # Never use the developer's servers, credentials, config or autostart entries.
@@ -180,17 +183,25 @@ if [[ "$scope" == i18n-loading || "$scope" == i18n-chinese ]]; then
     exit 77
   fi
 fi
-env LC_ALL="$test_locale" LANGUAGE="$test_language" TZ=UTC \
+test_environment=(env -u G_DEBUG LC_ALL="$test_locale" LANGUAGE="$test_language" TZ=UTC \
+  GIO_USE_VFS=local GIO_USE_PROXY_RESOLVER=dummy GSETTINGS_BACKEND=memory \
+  GTK_A11Y=none GSK_RENDERER="${SMASHED_UI_TEST_RENDERER:-cairo}" \
   SMASHED_PUMPKIN_LOCALEDIR="$test_catalog_root" \
   SMASHED_PUMPKIN_MESSAGE_LOCALEDIR="$build/src/message-locales" \
   XDG_RUNTIME_DIR="$profile/runtime" WAYLAND_DISPLAY="$wayland_display" \
   HOME="$profile" XDG_DATA_HOME="$profile/data" \
-  XDG_CONFIG_HOME="$profile/config" XDG_CACHE_HOME="$profile/cache" \
+  XDG_CONFIG_HOME="$profile/config" XDG_CACHE_HOME="$profile/cache")
+if ! "${test_environment[@]}" dbus-run-session -- timeout 10s env \
+  G_DEBUG=fatal-warnings "$profile/test-gtk-frames"; then
+  printf '%s\n' 'FAIL: GTK frame preflight failed before application tests. Check the GTK/libadwaita runtime pair; GTK 4.24.1 has a reproducible popover frame regression. See the UI test instructions in README.md.' >&2
+  exit 1
+fi
+"${test_environment[@]}" \
   dbus-run-session -- timeout 90s env \
   FAKE_PUMPKIN_BINARY="$profile/fake-pumpkin" \
   FAKE_MANAGED_PUMPKIN_BINARY="$profile/fake-managed-server" \
   SMASHED_UI_TEST_SCOPE="$scope" \
-  GTK_A11Y=none GSK_RENDERER="${SMASHED_UI_TEST_RENDERER:-cairo}" G_DEBUG=fatal-warnings \
+  G_DEBUG=fatal-warnings \
   "$profile/test-window-ui"
 if [[ -n "$desktop_doc_mount" ]]; then
   current_doc_mount=$(findmnt -rn -M "$desktop_runtime/doc" -o ID || true)

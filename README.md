@@ -90,14 +90,27 @@ meson compile -C buildDir
 meson test -C buildDir --print-errorlogs
 ```
 
+UI regressions additionally require Xvfb, Openbox, xauth, xprop and XTest
+development files (`xvfb openbox xauth x11-utils libxtst-dev` on Debian/Ubuntu).
+They use a private display, configuration and local Marketplace fixtures:
+
+```bash
+bash build-aux/test-window-ui-headless.sh buildDir all
+bash build-aux/test-window-ui-headless.sh buildDir minimap
+```
+
+The harness keeps GTK warnings fatal and checks the toolkit before testing the
+app. GTK 4.24.1 has a reproducible window/popover frame regression; the tested
+GTK 4.22.5 / libadwaita 1.9.4 pair passes. Use compatible headers and libraries
+in an isolated environment when system packages are affected. CI runs all eight
+UI scopes; Meson's default test environment isolates desktop proxy/VFS/settings.
+
 Uninstalled builds automatically discover translations from the build tree;
 `SMASHED_PUMPKIN_LOCALEDIR` can point at another absolute catalog directory.
 
 Language selection is in General settings → Display and time and takes effect on
 the next launch without restarting servers. The first production Simplified Chinese
-catalog covers core interface text; untranslated messages use English. See the
-[internationalization guide](docs/i18n.md) for configuration, catalog updates,
-uninstalled-build locale paths and translation tests.
+catalog covers core interface text; untranslated messages use English.
 
 If Meson reports that an existing build directory uses an incompatible version,
 run `meson setup --reconfigure buildDir` before compiling again.
@@ -124,10 +137,8 @@ access or changing the bundled binary in the source tree.
 
 Report bugs or suggest improvements through
 [GitHub Issues](https://github.com/Rotstein007/smashed-pumpkin/issues).
-See [platform support](docs/platform-support.md),
-[the release pipeline](docs/release-pipeline.md), and
-[internationalization infrastructure](docs/i18n.md) for build, publishing, and
-translation maintenance details.
+See [platform support](docs/platform-support.md) and
+[the release pipeline](docs/release-pipeline.md) for build and publishing details.
 The [website](https://smashed-pumpkin.rotstein.dev/) is maintained in its own
 [repository](https://github.com/Rotstein007/smashed-website).
 

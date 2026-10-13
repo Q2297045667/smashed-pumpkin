@@ -2467,8 +2467,6 @@ int main(void)
   test_players(window, server);
   if (g_getenv("SMASHED_PRIVATE_X11_POINTER") != NULL) {
     g_print("PASS: real XTest pointer clicks traverse GTK's modal event boundary and cancel safely\n");
-    gtk_window_destroy(GTK_WINDOW(window));
-    return 0;
   }
   test_worlds(window, server);
   test_reload_controls(window);
@@ -2563,6 +2561,7 @@ int main(void)
   g_assert_false(window->marketplace_loading);
   g_assert_false(window->marketplace_load_failed);
   row = GTK_WIDGET(gtk_list_box_get_row_at_index(window->marketplace_list, 0));
+  g_assert_nonnull(find_label(row, "UI Fixture Plugin"));
   GtkWidget *open = find_widget(row, GTK_TYPE_BUTTON);
   g_assert_nonnull(open);
   g_signal_emit_by_name(open, "clicked");
@@ -2575,7 +2574,7 @@ int main(void)
   g_assert_cmpint(min_height, >=, 280);
   screenshot(GTK_WIDGET(window), "/tmp/smashed-plugin-details.png");
   adw_dialog_close(dialog);
-  g_print("PASS: live Marketplace details have explicit minimum size\n");
+  g_print("PASS: local Marketplace fixture details have explicit minimum size\n");
 
   pumpkin_config_set_start_expanded(window->config, TRUE);
   pumpkin_config_set_autostart_on_boot(window->config, FALSE);

@@ -130,7 +130,7 @@ sweep_stale_staging_files(GFile *parent)
     if (info == NULL) break;
     const char *name = g_file_info_get_name(info);
     if (!g_str_has_prefix(name, ".smashed-pumpkin-download-")) continue;
-    GDateTime *modified = g_file_info_get_modification_date_time(info);
+    g_autoptr(GDateTime) modified = g_file_info_get_modification_date_time(info);
     if (modified == NULL || g_date_time_to_unix(modified) >= cutoff) continue;
     g_autoptr(GFile) stale = g_file_get_child(parent, name);
     g_file_delete(stale, NULL, NULL);

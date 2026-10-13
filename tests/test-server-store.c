@@ -124,7 +124,7 @@ test_invalid_path(Fixture *fixture, gconstpointer user_data)
 }
 
 static void
-test_remove_selected_already_gone(void)
+test_remove_selected_already_gone(gconstpointer user_data)
 {
   g_autoptr(PumpkinServerStore) store = pumpkin_server_store_new();
   GListModel *model = pumpkin_server_store_get_model(store);
@@ -141,7 +141,8 @@ test_remove_selected_already_gone(void)
   g_assert_no_error(error);
   /* An already vanished directory must not leave a dead row that could never
    * be removed again: the entry is dropped without an error. */
-  g_assert_true(pumpkin_server_store_remove_selected(store, &error));
+  g_assert_true(pumpkin_server_store_remove_selected(store,
+    GPOINTER_TO_INT(user_data) ? &error : NULL));
   g_assert_no_error(error);
   g_assert_cmpuint(g_list_model_get_n_items(model), ==, count - 1);
   g_assert_null(pumpkin_server_store_get_selected(store));
@@ -221,7 +222,10 @@ main(int argc, char **argv)
   g_test_add("/server-store/child-links", Fixture, NULL, fixture_setup, test_child_links, fixture_teardown);
   g_test_add("/server-store/root-link", Fixture, NULL, fixture_setup, test_root_link, fixture_teardown);
   g_test_add("/server-store/invalid-path", Fixture, NULL, fixture_setup, test_invalid_path, fixture_teardown);
-  g_test_add_func("/server-store/selected-already-gone", test_remove_selected_already_gone);
+  g_test_add_data_func("/server-store/selected-already-gone", GINT_TO_POINTER(TRUE),
+    test_remove_selected_already_gone);
+  g_test_add_data_func("/server-store/selected-already-gone-no-error-output", GINT_TO_POINTER(FALSE),
+    test_remove_selected_already_gone);
   g_test_add_func("/server-store/selected-success", test_remove_selected_success);
   g_test_add_func("/server-store/unknown-selection", test_unknown_selection);
   int result = g_test_run();

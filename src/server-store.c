@@ -278,14 +278,13 @@ pumpkin_server_store_remove_selected(PumpkinServerStore *self, GError **error)
     if (server == self->selected) {
       const char *root = pumpkin_server_get_root_dir(server);
       if (root != NULL && *root != '\0') {
-        if (!pumpkin_server_store_remove_tree(root, error)) {
+        g_autoptr(GError) rm_error = NULL;
+        if (!pumpkin_server_store_remove_tree(root, &rm_error)) {
           /* An already vanished directory must not block removing the list
            * entry: retrying would report NOT_FOUND forever and leave a dead
            * row that can neither run nor be removed. */
-          if (error != NULL && *error != NULL &&
-              g_error_matches(*error, G_IO_ERROR, G_IO_ERROR_NOT_FOUND)) {
-            g_clear_error(error);
-          } else {
+          if (!g_error_matches(rm_error, G_IO_ERROR, G_IO_ERROR_NOT_FOUND)) {
+            g_propagate_error(error, g_steal_pointer(&rm_error));
             return FALSE;
           }
         }

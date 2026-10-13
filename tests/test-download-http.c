@@ -175,6 +175,48 @@ test_success(Fixture *fixture, gconstpointer user_data)
 }
 
 static void
+test_staging_cleanup(Fixture *fixture, gconstpointer user_data)
+{
+  (void)user_data;
+  g_autofree char *old_path = g_build_filename(fixture->directory,
+    ".smashed-pumpkin-download-00000000-0000-4000-8000-000000000001", NULL);
+  g_autofree char *recent_path = g_build_filename(fixture->directory,
+    ".smashed-pumpkin-download-00000000-0000-4000-8000-000000000002", NULL);
+  g_autofree char *unrelated_path = g_build_filename(fixture->directory, "unrelated.wasm", NULL);
+  g_assert_true(g_file_set_contents(old_path, "abandoned download", -1, NULL));
+  g_assert_true(g_file_set_contents(recent_path, "active download", -1, NULL));
+  g_assert_true(g_file_set_contents(unrelated_path, "unrelated file", -1, NULL));
+
+  const char *aged_paths[] = {old_path, unrelated_path};
+  guint64 old_time = (guint64)(g_get_real_time() / G_USEC_PER_SEC) - 2 * 24 * 60 * 60;
+  for (guint i = 0; i < G_N_ELEMENTS(aged_paths); ++i) {
+    g_autoptr(GFile) file = g_file_new_for_path(aged_paths[i]);
+    g_autoptr(GError) error = NULL;
+    g_assert_true(g_file_set_attribute_uint64(file, G_FILE_ATTRIBUTE_TIME_MODIFIED,
+      old_time, G_FILE_QUERY_INFO_NOFOLLOW_SYMLINKS, NULL, &error));
+    g_assert_no_error(error);
+  }
+
+  /* Cover both deletion and the recent-file skip, including another sweep of
+   * the retained file. Sanitizer runs must release every modification date. */
+  for (guint i = 0; i < 2; ++i) {
+    Result result = {0};
+    run_download(fixture, "ok", NULL, &result);
+    g_assert_true(result.ok);
+    g_assert_no_error(result.error);
+    g_assert_false(g_file_test(old_path, G_FILE_TEST_EXISTS));
+    g_autofree char *recent_contents = NULL;
+    g_assert_true(g_file_get_contents(recent_path, &recent_contents, NULL, NULL));
+    g_assert_cmpstr(recent_contents, ==, "active download");
+    g_autofree char *unrelated_contents = NULL;
+    g_assert_true(g_file_get_contents(unrelated_path, &unrelated_contents, NULL, NULL));
+    g_assert_cmpstr(unrelated_contents, ==, "unrelated file");
+  }
+  g_assert_cmpint(g_remove(recent_path), ==, 0);
+  g_assert_cmpint(g_remove(unrelated_path), ==, 0);
+}
+
+static void
 test_cancel(Fixture *fixture, gconstpointer user_data)
 {
   (void)user_data;
@@ -296,6 +338,8 @@ main(int argc, char **argv)
   g_test_add("/download-http/403", Fixture, GUINT_TO_POINTER(403), fixture_setup, test_http_status, fixture_teardown);
   g_test_add("/download-http/503", Fixture, GUINT_TO_POINTER(503), fixture_setup, test_http_status, fixture_teardown);
   g_test_add("/download-http/success", Fixture, NULL, fixture_setup, test_success, fixture_teardown);
+  g_test_add("/download-http/staging-cleanup", Fixture, NULL,
+    fixture_setup, test_staging_cleanup, fixture_teardown);
   g_test_add("/download-http/cancel", Fixture, NULL, fixture_setup, test_cancel, fixture_teardown);
   g_test_add("/download-http/cancel-midstream-existing", Fixture, GINT_TO_POINTER(TRUE),
     fixture_setup, test_cancel_midstream, fixture_teardown);

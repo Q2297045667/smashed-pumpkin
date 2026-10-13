@@ -135,6 +135,14 @@
       ]
     },
     {
+      "name": "prepare-locale-directories",
+      "buildsystem": "simple",
+      "build-commands": [
+        "sh -c 'for dir in /app/share/locale/*/; do entry=${dir%/}; [ -L \"$entry\" ] && rm -f \"$entry\"; done'"
+      ],
+      "sources": []
+    },
+    {
       "name": "smashed-pumpkin",
       "buildsystem": "meson",
       "builddir": true,

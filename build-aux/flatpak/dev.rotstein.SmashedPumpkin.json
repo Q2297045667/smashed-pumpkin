@@ -135,19 +135,14 @@
       ]
     },
     {
-      "name": "prepare-locale-directories",
-      "buildsystem": "simple",
-      "build-commands": [
-        "sh -c 'find /app/share/locale -maxdepth 1 -type l -exec rm -f {} +; exit 0'"
-      ],
-      "sources": []
-    },
-    {
       "name": "smashed-pumpkin",
       "buildsystem": "meson",
       "builddir": true,
       "license-files": [
         "LICENSE"
+      ],
+      "config-opts": [
+        "-Dlocaledir=share/smashed-pumpkin/translations"
       ],
       "sources": [
         {
